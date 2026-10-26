@@ -40,6 +40,12 @@ export interface Env {
   GH_CODESPACE_PAT?: string; // secret：fine-grained PAT，仅需 Codespaces 用户权限
   GH_CODESPACE_NAME?: string; // var：codespace 名称，默认 24h-jwp7vwxvx6hpp7
 
+  // 省额度看门狗（vars）
+  CS_WATCH_REMIND_MIN?: string; // 空闲提醒阈值（分钟，默认 25）
+  CS_WATCH_AUTOSTOP_MIN?: string; // 自动关机阈值（分钟，默认 55）
+  CS_WATCH_AUTOSTOP?: string; // "0" = 只提醒不自动关（默认开）
+  CS_MONTHLY_BUDGET_HOURS?: string; // 月免费额度小时数（默认 60；2 核 = 120 core-h ÷ 2）
+
   // 部署身份标识（var）：主 bot 不设（显示 main）；devbot 部署设为 "devbot"
   BOT_IDENTITY?: string;
 

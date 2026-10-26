@@ -22,6 +22,7 @@ import { chatChain, loadProviders, type ChatResult } from "./router/providers";
 import { chunkText, transcribeBytes } from "./asr";
 import { CodespaceClient, beginBoot, checkBoot, stopCodespace, describeState } from "./codespace";
 import { isVerified, isAnswerMatch, nextExpiry, CHALLENGE_TEXT, type VerifyState } from "./verify";
+import { evalWatch, fmtDur, pushAlarm, drainAlarms, type AlarmStore, type AlarmTask } from "./watch";
 
 // 构建标记：每次改动后递增，方便确认线上跑的是不是最新包（curl /healthz 看 build 字段）。
 // v2：Gemini 思考档位控制（reasoning_effort）+ 模型级降级 fallback + 分层超时。
@@ -51,7 +52,13 @@ import { isVerified, isAnswerMatch, nextExpiry, CHALLENGE_TEXT, type VerifyState
 // v17：Codespace 开发机远程开关——「开始开发/停止开发/开发机状态」指令
 //     （含 /boot /halt /cs 别名）。两次查询开机协议（30s 间隔、不循环、幂等停机），
 //     GitHub REST 薄客户端见 src/codespace.ts；凭证 GH_CODESPACE_PAT（secret）。
-const BUILD = "devbot-20261026-v0";
+// v1（devbot 独立版本线）：省额度看门狗——
+//     ① 空闲提醒+自动关机（evalWatch 两层保险：25min 提醒 / 55min 自动关，可配）；
+//     ② 互动即续命（白名单消息 touchWatchActivity），origin=bot 才自动关、observed 只提醒；
+//     ③ DO alarm 软排队（boot 二查与看门狗共存）；
+//     ④ 「用量」指令：本月累计运行时长 vs 免费额度（cs_runtime 表按日累计）；
+//     ⑤ patrol 巡检（cron 半小时 + /patrol 手动）：发现漏网的运行中机器。
+const BUILD = "devbot-20261026-v1";
 
 const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能手表语音接收编程需求。
 输出要求：
@@ -96,6 +103,9 @@ export class AssistantDO extends DurableObject<Env> {
             return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
           }
         }
+        case "/patrol":
+          // 看门狗巡检（cron 半小时触发 / 手动 ?key= 触发）：查机器状态并跑 evalWatch
+          return Response.json(await this.patrol());
         case "/webhook":
           return await this.handleWebhook(request);
         case "/send": {
@@ -117,14 +127,18 @@ export class AssistantDO extends DurableObject<Env> {
   // ---------------------------------------------------------------- Webhook
 
   /**
-   * DO alarm 回调：开机协议的 30 秒二次确认。
+   * DO alarm 回调：任务队列分发器（boot 二查 + 看门狗共用单一 alarm 槽位）。
    * setAlarm 持久化——即使 DO 在两次唤醒之间被驱逐，闹钟也会准时叫醒。
    */
   async alarm(): Promise<void> {
     try {
-      await this.onBootCheckAlarm();
+      const tasks = await drainAlarms(this.alarmStore());
+      for (const t of tasks) {
+        if (t.kind === "boot_check") await this.onBootCheckAlarm();
+        else if (t.kind === "watch") await this.onWatchAlarm();
+      }
     } catch (e) {
-      console.error("[cs] alarm 二查失败", e);
+      console.error("[alarm] 队列处理失败", e);
     }
   }
 
@@ -176,6 +190,10 @@ export class AssistantDO extends DurableObject<Env> {
       }
       return;
     }
+
+    // 2.5) 看门狗互动刷新：白名单用户发的任何消息都算「你在用开发机」
+    //      （放在验证之前——即使验证会话过期，你的出现本身就说明在场）
+    await this.touchWatchActivity(m.chatId);
 
     // 3) 限流
     if (!(await this.allowRate(m.chatId))) {
@@ -238,9 +256,10 @@ export class AssistantDO extends DurableObject<Env> {
     }
 
     // 6.6) Codespace 开发机指令（正则先匹配，避免语音转写把「开始开发」识别歪）：
-    //   开始开发 / /boot   → 两次查询开机协议（alarm 30s 二查，不循环）
-    //   停止开发 / /halt   → 幂等停机
-    //   开发机状态 / /cs   → 查询当前状态
+    //   开始开发 / /boot   → 两次查询开机协议（alarm 30s 二查，不循环）+ 启动看门狗
+    //   停止开发 / /halt   → 幂等停机 + 关闭看门狗窗口
+    //   开发机状态 / /cs   → 查询当前状态（也算互动，续命）
+    //   用量 / /usage      → 本月累计运行时长 vs 免费额度
     const trimmed = text.trim();
     if (/^(开始开发|\/boot)[，。!！\s]*$/i.test(trimmed)) {
       const reply = await this.handleBootDev(m.chatId);
@@ -248,11 +267,16 @@ export class AssistantDO extends DurableObject<Env> {
       return;
     }
     if (/^(停止开发|关掉开发机|\/halt)[，。!！\s]*$/i.test(trimmed)) {
+      await this.closeEpisode();
       await this.reply(m.chatId, await this.handleStopDev());
       return;
     }
     if (/^(开发机状态|\/cs)[，。!！\s]*$/i.test(trimmed)) {
       await this.reply(m.chatId, await this.handleDevStatus());
+      return;
+    }
+    if (/^(用量|额度|\/usage)[，。!！\s]*$/i.test(trimmed)) {
+      await this.reply(m.chatId, await this.handleUsage());
       return;
     }
 
@@ -289,9 +313,8 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /**
-   * 「开始开发」阶段 1：同步检查 + 触发启动 + 即时回复。
-   * 需要二查时用 DO alarm 安排 30 秒后的确认（防 DO 驱逐中断 waitUntil）。
-   * 返回 null = 已回复（alarm 阶段自己发），调用方无需再发。
+   * 「开始开发」阶段 1：同步检查 + 触发启动 + 即时回复 + 启动看门狗。
+   * 二查走 DO alarm 队列（30 秒后）。返回 null = 已回复（后续阶段自己发）。
    */
   private async handleBootDev(chatId: string): Promise<string | null> {
     const client = this.codespaceClient();
@@ -299,24 +322,35 @@ export class AssistantDO extends DurableObject<Env> {
     const p1 = await beginBoot(client);
     await this.reply(chatId, p1.reply); // 先发即时回复（用户要求：立刻知道「正在启动」）
     if (p1.scheduleCheck) {
-      // 记下 chat_id，30s 后 alarm 唤醒发二查结果
-      this.ctx.storage.put("boot_check_chat", chatId);
-      this.ctx.storage.setAlarm(Date.now() + 30_000);
-      return null;
+      await pushAlarm(this.alarmStore(), {
+        due: Date.now() + 30_000,
+        kind: "boot_check",
+        payload: { chat_id: chatId },
+      });
+      // 开机指令已发出：看门狗从现在起算（origin=bot，超时未互动可自动关）
+      await this.ensureWatch(chatId, "bot");
+    } else if (p1.wasAvailable) {
+      // 本来就在跑：看门狗起点重置（你刚确认过要用）
+      await this.ensureWatch(chatId, "bot");
     }
     return null;
   }
 
-  /** alarm 回调：开机 30 秒后的二次确认。 */
+  /** alarm 回调：开机 30 秒后的二次确认（含看门狗续排）。 */
   private async onBootCheckAlarm(): Promise<void> {
-    const chatId = await this.ctx.storage.get<string>("boot_check_chat");
+    const chatId = (await this.ctx.storage.get<string>("boot_check_chat")) ?? null;
     await this.ctx.storage.delete("boot_check_chat");
-    if (!chatId) return;
     const client = this.codespaceClient();
     if (!client) return;
     const final = await checkBoot(client);
-    await this.reply(chatId, final);
-    console.log(`[cs] 开机二查 chat=${chatId} → ${final.slice(0, 60)}`);
+    if (chatId) {
+      await this.reply(chatId, final.reply);
+      console.log(`[cs] 开机二查 chat=${chatId} → ${final.reply.slice(0, 60)}`);
+      if (final.ok) {
+        // 开机成功：刷新 episode 起点（从「确认运行」起算），并排首次看门狗检查
+        await this.ensureWatch(chatId, "bot");
+      }
+    }
   }
 
   private async handleStopDev(): Promise<string> {
@@ -330,10 +364,261 @@ export class AssistantDO extends DurableObject<Env> {
     if (!client) return "未配置 GH_CODESPACE_PAT，无法查询开发机状态。";
     try {
       const st = await client.status();
+      // 状态查询 = 互动：机器在跑时刷新看门狗起点（你刚看过，说明在用）
+      if (st.state === "Available") await this.ensureWatch(null, "bot");
       return `开发机状态：${describeState(st.state)}`;
     } catch (e) {
       return `查询失败：${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
     }
+  }
+
+  /** 「用量」：本月累计运行时长（cs_runtime 表）+ 当前窗口状态。 */
+  private async handleUsage(): Promise<string> {
+    const budgetH = this.monthlyBudgetHours();
+    const lines: string[] = [];
+    // 今日 + 本月
+    const today = new Date().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    const todayMin = this.runtimeMinutes(today, today);
+    const monthMin = this.runtimeMinutes(`${month}-01`, `${month}-31`);
+    lines.push(`📊 开发机用量（本月 ${month}）`);
+    lines.push(`累计运行：${fmtDur(monthMin)} / 免费额度 ${budgetH} 小时`);
+    const pct = Math.min(100, Math.round((monthMin / 60 / budgetH) * 100));
+    lines.push(`额度消耗：${pct}%${pct >= 80 ? " ⚠️ 接近上限" : ""}`);
+    lines.push(`今日运行：${fmtDur(todayMin)}`);
+    // 当前窗口
+    const ep = await this.getEpisode();
+    if (ep && ep.running) {
+      lines.push(`当前窗口：运行中，已 ${fmtDur((Date.now() - ep.bootAt) / 60_000)}${ep.botStarted ? "" : "（非 bot 开机）"}`);
+    } else {
+      lines.push("当前窗口：关机中");
+    }
+    lines.push(`看门狗：${this.autostopEnabled() ? `${this.watchRemindMin()}/${this.watchAutostopMin()} 分钟 提醒/自动关` : "仅提醒（自动关未启用）"}`);
+    return lines.join("\n");
+  }
+
+  // ---------------------------------------------------------------- 看门狗（省额度）
+
+  /** alarm 队列存储适配器（DO ctx.storage 的最小投影）。 */
+  private alarmStore(): AlarmStore {
+    const s = this.ctx.storage;
+    return {
+      get: <T>(k: string) => s.get<T>(k),
+      put: (k: string, v: unknown) => s.put(k, v),
+      delete: async (k: string) => {
+        await s.delete(k);
+      },
+      setAlarm: async (t: number | null) => {
+        if (t === null) await s.deleteAlarm();
+        else await s.setAlarm(t);
+      },
+    };
+  }
+
+  /** 读取当前运行窗口状态。 */
+  private async getEpisode(): Promise<Episode | null> {
+    return (await this.ctx.storage.get<Episode>("cs_episode")) ?? null;
+  }
+
+  private async setEpisode(ep: Episode | null): Promise<void> {
+    if (ep) await this.ctx.storage.put("cs_episode", ep);
+    else await this.ctx.storage.delete("cs_episode");
+  }
+
+  /**
+   * 开启/刷新看门狗窗口。origin：
+   *   bot      = 你通过指令开机/查状态（允许自动关机）
+   *   observed = 巡检发现机器在跑（只提醒）
+   */
+  private async ensureWatch(chatId: string | null, origin: "bot" | "observed"): Promise<void> {
+    const prev = await this.getEpisode();
+    const now = Date.now();
+    const chat = chatId ?? prev?.chatId ?? null;
+    const ep: Episode = {
+      running: true,
+      bootAt: prev?.running ? prev.bootAt : now, // 已在跑则保留原起点
+      lastActivity: now,
+      botStarted: origin === "bot" ? true : (prev?.botStarted ?? false),
+      reminded: false,
+      chatId: chat,
+    };
+    await this.setEpisode(ep);
+    if (chat) await this.putChatId(chat);
+    await pushAlarm(this.alarmStore(), {
+      due: now + this.watchRemindMin() * 60_000,
+      kind: "watch",
+    });
+  }
+
+  /** 互动刷新：白名单用户的任何消息都算「在场」。不改变 bootAt/botStarted。 */
+  private async touchWatchActivity(chatId: string): Promise<void> {
+    await this.putChatId(chatId);
+    const ep = await this.getEpisode();
+    if (!ep || !ep.running) return; // 机器没跑：无需管理
+    ep.lastActivity = Date.now();
+    ep.reminded = false; // 你出现了：提醒状态复位（下次空闲重新提醒）
+    await this.setEpisode(ep);
+    await pushAlarm(this.alarmStore(), {
+      due: ep.lastActivity + this.watchRemindMin() * 60_000,
+      kind: "watch",
+    });
+  }
+
+  /** 关闭窗口（停止开发后调用）：落账运行时长、清 episode、撤看门狗 alarm。 */
+  private async closeEpisode(): Promise<void> {
+    const ep = await this.getEpisode();
+    if (!ep) return;
+    if (ep.running) {
+      const now = Date.now();
+      const day = new Date().toISOString().slice(0, 10);
+      this.addRuntimeDay(day, Math.max(0, (now - ep.bootAt) / 60_000));
+    }
+    await this.setEpisode(null);
+    // 从队列撤掉 watch 任务（boot_check 若有则保留）
+    const q = (await this.ctx.storage.get<AlarmTask[]>("alarmq")) ?? [];
+    const kept = q.filter((t) => t.kind !== "watch");
+    if (kept.length > 0) {
+      await this.ctx.storage.put("alarmq", kept);
+      await this.ctx.storage.setAlarm(kept[0].due);
+    } else {
+      await this.ctx.storage.delete("alarmq");
+      await this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  /** alarm 回调：看门狗检查。 */
+  private async onWatchAlarm(): Promise<void> {
+    await this.runWatchCheck();
+  }
+
+  /** 看门狗核心执行：查状态 → evalWatch → 提醒/自动关机 → 续排。 */
+  private async runWatchCheck(): Promise<{ acted: boolean; note: string }> {
+    const client = this.codespaceClient();
+    const ep = await this.getEpisode();
+    if (!client || !ep || !ep.running) return { acted: false, note: "no-episode" };
+    let running: boolean;
+    try {
+      running = (await client.status()).state === "Available";
+    } catch (e) {
+      // 状态查询失败（GitHub 抖动）：5 分钟后重试，不误判
+      console.error("[watch] 状态查询失败", e);
+      await pushAlarm(this.alarmStore(), { due: Date.now() + 5 * 60_000, kind: "watch" });
+      return { acted: false, note: "status-error-retry" };
+    }
+    const decision = evalWatch({
+      running,
+      now: Date.now(),
+      lastActivity: ep.lastActivity,
+      bootAt: ep.bootAt,
+      botStarted: ep.botStarted,
+      remindMin: this.watchRemindMin(),
+      autostopMin: this.watchAutostopMin(),
+      autostopEnabled: this.autostopEnabled(),
+      reminded: ep.reminded,
+    });
+    const chat = ep.chatId ?? (await this.getChatId());
+    if (decision.markReminded) {
+      ep.reminded = true;
+      await this.setEpisode(ep);
+    }
+    if (decision.stop) {
+      try {
+        await client.stop();
+      } catch (e) {
+        console.error("[watch] 自动关机失败", e);
+        if (chat) await this.reply(chat, `⚠️ 看门狗自动关机失败：${e instanceof Error ? e.message.slice(0, 100) : "未知错误"}。稍后重试。`);
+        await pushAlarm(this.alarmStore(), { due: Date.now() + 5 * 60_000, kind: "watch" });
+        return { acted: false, note: "stop-failed-retry" };
+      }
+      // 落账 + 清窗口
+      await this.closeEpisode();
+      if (chat) await this.reply(chat, decision.notify ?? "已自动关机。");
+      console.log("[watch] 自动关机完成");
+      return { acted: true, note: "stopped" };
+    }
+    if (decision.notify && chat) {
+      await this.reply(chat, decision.notify);
+    }
+    if (!running) {
+      // 机器其实已经关了（GitHub 空闲超时先到）：落账清窗口
+      await this.closeEpisode();
+      return { acted: true, note: "already-off" };
+    }
+    if (decision.nextCheck) {
+      await pushAlarm(this.alarmStore(), { due: decision.nextCheck, kind: "watch" });
+    }
+    return { acted: decision.notify !== null, note: decision.stop ? "stopped" : "ok" };
+  }
+
+  /**
+   * 巡检（cron 每 30 分钟 + /patrol 手动）：
+   * 弥补 alarm 只在「有 episode」时存在的盲区——机器在跑但 DO 无记录
+   * （比如你直接从 VS Code/GitHub 网页开机，bot 不知道）。
+   */
+  private async patrol(): Promise<Record<string, unknown>> {
+    const client = this.codespaceClient();
+    if (!client) return { ok: false, error: "GH_CODESPACE_PAT 未配置" };
+    let state: string;
+    try {
+      state = (await client.status()).state;
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    const ep = await this.getEpisode();
+    if (state === "Available") {
+      if (!ep || !ep.running) {
+        // 发现漏网运行：建 observed 窗口（只提醒，不自动关）
+        await this.ensureWatch(null, "observed");
+        const chat = await this.getChatId();
+        if (chat) {
+          await this.reply(chat, `👀 巡检发现开发机在运行（不是我开的）。不用了发「停止开发」，或在 GitHub 页面关机。`);
+        }
+        return { ok: true, state, note: "observed-new" };
+      }
+      // 有窗口：借巡检跑一次看门狗检查（双重保险，alarm 丢了这个也兜底）
+      const r = await this.runWatchCheck();
+      return { ok: true, state, ...r };
+    }
+    // 机器没跑：若有残留 episode，落账清掉
+    if (ep?.running) {
+      await this.closeEpisode();
+      return { ok: true, state, note: "episode-closed" };
+    }
+    return { ok: true, state, note: "idle" };
+  }
+
+  // ---------------------------------------------------------------- 运行时长账本
+
+  /** 按日累计运行分钟（cs_runtime 表）。 */
+  private addRuntimeDay(day: string, minutes: number): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO cs_runtime (day, minutes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET minutes = minutes + ?",
+      day,
+      minutes,
+      minutes,
+    );
+    this.ctx.storage.sql.exec("DELETE FROM cs_runtime WHERE day < ?", day.slice(0, 4) + "-01-01"); // 保留当年
+  }
+
+  /** 查询日期范围内的累计运行分钟。 */
+  private runtimeMinutes(fromDay: string, toDay: string): number {
+    const rows = this.ctx.storage.sql.exec<{ total: number }>(
+      "SELECT COALESCE(SUM(minutes), 0) AS total FROM cs_runtime WHERE day >= ? AND day <= ?",
+      fromDay,
+      toDay,
+    ).toArray();
+    return Math.round(rows[0]?.total ?? 0);
+  }
+
+  // ---------------------------------------------------------------- chat_id 记忆
+
+  /** 记住最近的聊天对象（patrol/看门狗主动推送目标）。 */
+  private async putChatId(chatId: string): Promise<void> {
+    await this.ctx.storage.put("last_chat_id", chatId);
+  }
+
+  private async getChatId(): Promise<string | null> {
+    return (await this.ctx.storage.get<string>("last_chat_id")) ?? null;
   }
 
   private async runAgent(intent: Intent, history: { role: string; content: string }[]): Promise<ChatResult> {
@@ -519,6 +804,27 @@ export class AssistantDO extends DurableObject<Env> {
     return (Number.isFinite(min) && min > 0 ? min : 30) * 60_000;
   }
 
+  // 看门狗配置（vars）
+  /** 空闲提醒阈值（分钟，默认 25） */
+  private watchRemindMin(): number {
+    const v = Number(this.env.CS_WATCH_REMIND_MIN ?? 25);
+    return Number.isFinite(v) && v > 0 ? v : 25;
+  }
+  /** 自动关机阈值（分钟，默认 55） */
+  private watchAutostopMin(): number {
+    const v = Number(this.env.CS_WATCH_AUTOSTOP_MIN ?? 55);
+    return Number.isFinite(v) && v > this.watchRemindMin() ? v : 55;
+  }
+  /** 是否启用自动关机（CS_WATCH_AUTOSTOP=0 关闭，默认开） */
+  private autostopEnabled(): boolean {
+    return (this.env.CS_WATCH_AUTOSTOP ?? "1") !== "0";
+  }
+  /** 月免费额度（小时，默认 60 = 2 核机的 120 core-hours） */
+  private monthlyBudgetHours(): number {
+    const v = Number(this.env.CS_MONTHLY_BUDGET_HOURS ?? 60);
+    return Number.isFinite(v) && v > 0 ? v : 60;
+  }
+
   // ---------------------------------------------------------------- 验证会话存储
 
   private async getVerify(chatId: string): Promise<VerifyState | undefined> {
@@ -548,4 +854,21 @@ CREATE TABLE IF NOT EXISTS history (chat_id TEXT, role TEXT, content TEXT, ts IN
 CREATE INDEX IF NOT EXISTS idx_history ON history(chat_id, ts);
 CREATE TABLE IF NOT EXISTS rate (chat_id TEXT, minute INTEGER, n INTEGER, PRIMARY KEY(chat_id, minute));
 CREATE TABLE IF NOT EXISTS budget (day TEXT, n INTEGER, PRIMARY KEY(day));
+CREATE TABLE IF NOT EXISTS cs_runtime (day TEXT PRIMARY KEY, minutes REAL);
 `;
+
+/** 看门狗运行窗口：一次「开机→关机」的生命周期（DO storage 单值，键 cs_episode）。 */
+interface Episode {
+  /** 机器是否在运行（窗口打开） */
+  running: boolean;
+  /** 本轮开机时间戳（运行时长起算点） */
+  bootAt: number;
+  /** 最近一次 Telegram 互动时间戳 */
+  lastActivity: number;
+  /** 是否由 bot 指令发起（决定可否自动关机） */
+  botStarted: boolean;
+  /** 本轮窗口是否已发过空闲提醒（防轰炸） */
+  reminded: boolean;
+  /** 关联 chat_id（推送目标；可为 null = 巡检发现，未关联聊天） */
+  chatId: string | null;
+}

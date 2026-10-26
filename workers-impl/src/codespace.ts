@@ -119,6 +119,8 @@ export interface BootPhase1 {
   reply: string;
   /** true → 调用方需安排 30s 后的二次确认 */
   scheduleCheck: boolean;
+  /** true → 本来就已开机（无需安排二查；用于看门狗起点判定） */
+  wasAvailable: boolean;
 }
 
 /** 阶段 1：状态检查 + 触发启动 + 即时回复。 */
@@ -127,35 +129,35 @@ export async function beginBoot(client: CodespaceClient): Promise<BootPhase1> {
   try {
     st = await client.status();
   } catch (e) {
-    return { reply: `查询 codespace 状态失败：${errBrief(e)}`, scheduleCheck: false };
+    return { reply: `查询 codespace 状态失败：${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
   }
 
   if (st.state === "Available") {
-    return { reply: "开发机已在运行中 ✓", scheduleCheck: false };
+    return { reply: "开发机已在运行中 ✓", scheduleCheck: false, wasAvailable: true };
   }
   if (st.state === "Deleted" || st.state === "Failed") {
-    return { reply: `开发机状态异常（${describeState(st.state)}），需要到 GitHub 页面处理。`, scheduleCheck: false };
+    return { reply: `开发机状态异常（${describeState(st.state)}），需要到 GitHub 页面处理。`, scheduleCheck: false, wasAvailable: false };
   }
 
   try {
     await client.start();
   } catch (e) {
-    return { reply: `启动请求失败：${errBrief(e)}`, scheduleCheck: false };
+    return { reply: `启动请求失败：${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
   }
-  return { reply: "开发机未开机，已发出启动指令，正在启动 ⏳（30 秒后自动确认）", scheduleCheck: true };
+  return { reply: "开发机未开机，已发出启动指令，正在启动 ⏳（30 秒后自动确认）", scheduleCheck: true, wasAvailable: false };
 }
 
-/** 阶段 2（alarm 回调）：二查状态并产出最终回复。 */
-export async function checkBoot(client: CodespaceClient): Promise<string> {
+/** 阶段 2（alarm 回调）：二查状态并产出最终回复。ok=true 表示确已开机。 */
+export async function checkBoot(client: CodespaceClient): Promise<{ reply: string; ok: boolean }> {
   let state: CodespaceState;
   try {
     state = (await client.status()).state;
   } catch {
-    return "开机确认查询失败，稍后发「开发机状态」手动确认。";
+    return { reply: "开机确认查询失败，稍后发「开发机状态」手动确认。", ok: false };
   }
   return state === "Available"
-    ? "开发机启动成功 ✓（运行中）"
-    : `开机失败：30 秒后仍为「${describeState(state)}」，可再发一次「开始开发」。`;
+    ? { reply: "开发机启动成功 ✓（运行中）", ok: true }
+    : { reply: `开机失败：30 秒后仍为「${describeState(state)}」，可再发一次「开始开发」。`, ok: false };
 }
 
 /** 「停止开发」：幂等停机。 */

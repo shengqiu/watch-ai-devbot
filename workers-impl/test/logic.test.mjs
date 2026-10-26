@@ -198,19 +198,19 @@ function fakeClient(states, calls = []) {
 // 阶段2：Available → 成功
 {
   const c = fakeClient(["Available"]);
-  check("二查成功", await checkBoot(c), "开发机启动成功 ✓（运行中）");
+  check("二查成功", (await checkBoot(c)).reply, "开发机启动成功 ✓（运行中）");
 }
 
 // 阶段2：仍 Shutdown → 失败
 {
   const c = fakeClient(["Shutdown"]);
-  check("二查失败提示", (await checkBoot(c)).includes("开机失败"), true);
+  check("二查失败提示", (await checkBoot(c)).reply.includes("开机失败"), true);
 }
 
 // 阶段2：查询异常 → 手动确认提示
 {
   const c = fakeClient(["ERR"]);
-  check("二查异常提示", (await checkBoot(c)).includes("手动确认"), true);
+  check("二查异常提示", (await checkBoot(c)).reply.includes("手动确认"), true);
 }
 
 // 首查异常 → 单跳失败，不安排二查
@@ -267,6 +267,121 @@ check("归一化去首尾标点", normalizeAnswer("。爸爸！"), "爸爸");
 check("归一化保留中间标点", normalizeAnswer("爸。爸"), "爸。爸");
 check("续期计算", nextExpiry(T0, HALF_H), T0 + HALF_H);
 check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
+
+// ---- 省额度看门狗（watch.ts）----
+import { evalWatch, fmtDur, pushAlarm, drainAlarms } from "../src/watch.js";
+
+const W = (over = {}) => ({
+  running: true,
+  now: 10_000_000,
+  lastActivity: 10_000_000,
+  bootAt: 10_000_000,
+  botStarted: true,
+  remindMin: 25,
+  autostopMin: 55,
+  autostopEnabled: true,
+  reminded: false,
+  ...over,
+});
+const MIN = 60_000;
+
+// 机器没跑 → 什么都不做
+check("关机：不动作", evalWatch(W({ running: false })), { notify: null, stop: false, nextCheck: null, markReminded: false });
+
+// 互动新鲜 → 静默，排到 remind 满点
+{
+  const d = evalWatch(W());
+  check("新鲜互动：静默", d.notify, null);
+  check("新鲜互动：排到 remind 点", d.nextCheck, 10_000_000 + 25 * MIN);
+  check("新鲜互动：不标记提醒", d.markReminded, false);
+}
+
+// 提醒窗口：首次 → 发提醒 + 标记
+{
+  const d = evalWatch(W({ now: 10_000_000 + 30 * MIN }));
+  check("30min：发提醒", d.notify !== null && d.notify.includes("没和我说过话"), true);
+  check("30min：标记已提醒", d.markReminded, true);
+  check("30min：不关机", d.stop, false);
+  check("30min：排到 autostop 点", d.nextCheck, 10_000_000 + 55 * MIN);
+}
+
+// 提醒窗口：已提醒过 → 静默防轰炸
+{
+  const d = evalWatch(W({ now: 10_000_000 + 30 * MIN, reminded: true }));
+  check("已提醒：静默", d.notify, null);
+  check("已提醒：仍排 autostop", d.nextCheck, 10_000_000 + 55 * MIN);
+}
+
+// 超 autostop + bot 开机 → 自动关机
+{
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN }));
+  check("60min：自动关机", d.stop, true);
+  check("60min：通知含说明", d.notify !== null && d.notify.includes("自动关机"), true);
+  check("60min：不再排程", d.nextCheck, null);
+}
+
+// 超 autostop + observed（非 bot 开机）→ 只提醒不关
+{
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, botStarted: false }));
+  check("observed：不自动关", d.stop, false);
+  check("observed：升级提醒", d.notify !== null && d.notify.includes("不敢自动关"), true);
+  check("observed：低频复查", d.nextCheck, 10_000_000 + 60 * MIN + 25 * MIN);
+}
+
+// 超 autostop + 自动关未启用 → 只提醒
+{
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, autostopEnabled: false }));
+  check("autostop 关：不关机", d.stop, false);
+  check("autostop 关：提醒引导手动", d.notify !== null && d.notify.includes("停止开发"), true);
+}
+
+// 运行时长文案含本轮信息
+{
+  const d = evalWatch(W({ now: 10_000_000 + 30 * MIN, bootAt: 10_000_000 - 10 * MIN }));
+  check("提醒含运行时长", d.notify !== null && d.notify.includes("40分钟"), true);
+}
+
+// ---- fmtDur ----
+check("fmtDur 0", fmtDur(0), "0分钟");
+check("fmtDur 59", fmtDur(59), "59分钟");
+check("fmtDur 60", fmtDur(60), "1小时");
+check("fmtDur 155", fmtDur(155), "2小时35分");
+
+// ---- alarm 队列 ----
+{
+  const calls = [];
+  const store = {
+    m: new Map(),
+    async get(k) { return this.m.get(k); },
+    async put(k, v) { this.m.set(k, v); },
+    async delete(k) { this.m.delete(k); },
+    async setAlarm(t) { calls.push(t); },
+  };
+  const t0 = Date.now();
+  // 插入 watch（55min 后）→ alarm 设到该点
+  await pushAlarm(store, { due: t0 + 55 * MIN, kind: "watch" });
+  check("alarm1 设到 55min", calls[0] === t0 + 55 * MIN, true);
+  // 插入 boot_check（30s 后）→ alarm 提前
+  await pushAlarm(store, { due: t0 + 30_000, kind: "boot_check" });
+  check("alarm2 提前到 30s", calls[1] === t0 + 30_000, true);
+  check("队列长度 2", store.m.get("alarmq").length, 2);
+  // 同 kind 覆盖
+  await pushAlarm(store, { due: t0 + 40_000, kind: "boot_check" });
+  check("同 kind 覆盖", store.m.get("alarmq").some((t) => t.kind === "boot_check" && t.due === t0 + 40_000), true);
+  check("队列仍 2 项", store.m.get("alarmq").length, 2);
+  // 时间前进：30s 的 boot_check 到期 → drain 只取它
+  const realNow = Date.now;
+  Date.now = () => t0 + 45_000;
+  const due = await drainAlarms(store);
+  check("drain 取 boot_check", due.map((d) => d.kind), ["boot_check"]);
+  check("drain 后 alarm 重排到 watch", calls[calls.length - 1] === t0 + 55 * MIN, true);
+  // 再前进：watch 到期 → drain 取走，alarm 清空
+  Date.now = () => t0 + 56 * MIN;
+  const due2 = await drainAlarms(store);
+  check("drain 取 watch", due2.map((d) => d.kind), ["watch"]);
+  check("alarm 清空", calls[calls.length - 1] === null, true);
+  Date.now = realNow;
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -24,7 +24,8 @@ deleted_classes = ["QQBotDO"]
 new_sqlite_classes = ["AssistantDO"]
 
 [triggers]
-crons = []
+# 看门狗巡检：每 30 分钟查一次开发机状态（catch 漏网的运行中机器 + 兜底 DO alarm）
+crons = ["*/30 * * * *"]
 
 [vars]
 BOT_IDENTITY = "devbot" # /healthz 与 /status 里显示，区分主/副 bot
@@ -41,6 +42,11 @@ REPLY_CHUNK_SIZE = "800"
 #   npx wrangler secret put ADMIN_KEY        # 管理端点密钥
 GH_CODESPACE_NAME = "24h-jwp7vwxvx6hpp7" # 远程开关的 codespace（与主 bot 同一台）
 VERIFY_SESSION_MIN = "30"          # 「爸爸」验证会话时长（分钟，滑动延续）
+# 省额度看门狗：25 分钟无互动提醒，55 分钟自动关机（bot 开的机才自动关）
+CS_WATCH_REMIND_MIN = "25"
+CS_WATCH_AUTOSTOP_MIN = "55"
+CS_WATCH_AUTOSTOP = "1"            # 0 = 只提醒不自动关
+CS_MONTHLY_BUDGET_HOURS = "60"     # 免费额度（2 核机 120 core-hours ÷ 2）
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）

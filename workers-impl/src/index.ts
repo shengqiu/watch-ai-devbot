@@ -63,7 +63,7 @@ export default {
       }
 
       // DO 内部路由透传（管理端点，统一 ADMIN_KEY 鉴权）
-      if (url.pathname === "/csdebug" || url.pathname === "/send") {
+      if (url.pathname === "/csdebug" || url.pathname === "/send" || url.pathname === "/patrol") {
         if (adminDenied(env, request)) {
           return Response.json({ ok: false, error: "需要 ?key=ADMIN_KEY（或 X-Admin-Key 头）" }, { status: 403 });
         }
@@ -76,9 +76,15 @@ export default {
     }
   },
 
-  // webhook 模式无需 cron。保留 no-op 以兼容历史部署残留的 Cron Trigger
-  // （触发器粘性，删 [triggers] 段未必移除，wrangler.toml 已显式置空）。
-  async scheduled(): Promise<void> {
-    /* no-op：事件驱动，无常驻任务 */
+  // 看门狗巡检：cron 每 30 分钟触发（wrangler.toml [triggers]）。
+  // 弥补 DO alarm 的盲区——机器在跑但无 episode 记录（VS Code/网页直接开机）。
+  async scheduled(event, env): Promise<void> {
+    try {
+      const stub = env.BOT.get(env.BOT.idFromName("singleton"));
+      const r = await stub.fetch("http://do/patrol");
+      console.log("[patrol]", await r.text());
+    } catch (e) {
+      console.error("[patrol] 巡检失败", e);
+    }
   },
 } satisfies ExportedHandler<Env>;

@@ -42,6 +42,10 @@ export interface Env {
 
   // 部署身份标识（var）：主 bot 不设（显示 main）；devbot 部署设为 "devbot"
   BOT_IDENTITY?: string;
+
+  // 身份验证会话（「爸爸」挑战）：答案（secret/var，默认「爸爸」）+ 会话时长（分钟，默认 30）
+  VERIFY_ANSWER?: string;
+  VERIFY_SESSION_MIN?: string;
 }
 
 // DurableObjectNamespace 是 workers-types 的全局类型（v5 无需 import）。

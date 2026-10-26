@@ -19,28 +19,42 @@ jobs:
           CMD: ${{ inputs.command }}
           GH_TOKEN: ${{ secrets.GH_CODESPACE_E2E_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.E2E_WEBHOOK_SECRET }}
+          TEST_USER_ID: ${{ vars.E2E_TEST_USER_ID }}
         run: |
-          echo "目标: $WORKER_URL  指令: $CMD"
-          UPDATE_ID=$((900000000 + RANDOM % 99999999))
-          BODY=$(jq -n --arg text "$CMD" --argjson uid "$UPDATE_ID" --argjson now "$(date +%s)" \
-            '{update_id: $uid, message: {message_id: 1, chat: {id: 555, type: "private"}, from: {id: 555}, date: $now, text: $text}}')
-          echo "payload: $BODY"
+          set -e
+          echo "目标: $WORKER_URL  指令: $CMD  测试用户: $TEST_USER_ID"
 
-          echo "--- 先验证防伪：不带密钥头的请求应被 403 拒绝 ---"
+          send() { # send <text> <update_id>
+            local body
+            body=$(jq -n --arg text "$1" --argjson uid "$2" --argjson now "$(date +%s)" --argjson uid2 "$TEST_USER_ID" \
+              '{update_id: $uid, message: {message_id: 1, chat: {id: $uid2, type: "private"}, from: {id: $uid2}, date: $now, text: $text}}')
+            curl -s -w "\nHTTP=%{http_code}" -X POST "$WORKER_URL/webhook" \
+              -H "Content-Type: application/json" -H "X-Telegram-Bot-Api-Secret-Token: $WEBHOOK_SECRET" \
+              -d "$body" --max-time 120 | tail -1
+          }
+
+          echo "--- 0) 防伪验证：不带密钥头的请求应被 403 拒绝 ---"
+          NOAUTH_BODY=$(jq -n --argjson now "$(date +%s)" --argjson uid2 "$TEST_USER_ID" \
+            '{update_id: 888888001, message: {message_id: 1, chat: {id: $uid2, type: "private"}, from: {id: $uid2}, date: $now, text: "hi"}}')
           NOAUTH=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WORKER_URL/webhook" \
-            -H "Content-Type: application/json" -d "$BODY" --max-time 30)
+            -H "Content-Type: application/json" -d "$NOAUTH_BODY" --max-time 30)
           echo "无密钥头 HTTP 状态: $NOAUTH (预期 403)"
+          [ "$NOAUTH" = "403" ] || { echo "::error::防伪校验未生效"; exit 1; }
 
-          echo "--- 发送正规 webhook（带防伪密钥头；Worker 立即应答，开机确认走 DO alarm 30s）---"
-          RESP=$(curl -s -w "\nHTTP_CODE=%{http_code} TIME=%{time_total}s" -X POST "$WORKER_URL/webhook" \
-            -H "Content-Type: application/json" -H "X-Telegram-Bot-Api-Secret-Token: $WEBHOOK_SECRET" \
-            -d "$BODY" --max-time 120)
-          echo "$RESP"
+          echo "--- 1) 发送指令（未验证状态 → 应被验证拦截，不触发 codespace 动作）---"
+          R1=$(send "$CMD" 888888101)
+          echo "HTTP $R1（bot 应回验证问题给测试用户）"
 
-          echo "--- 70 秒后查 codespace 状态（覆盖 alarm 30s + start 完成时间）---"
+          echo "--- 2) 发送验证答案「爸爸」---"
+          R2=$(send "爸爸" 888888102)
+          echo "HTTP $R2"
+
+          echo "--- 3) 再发指令（已验证 → 正常执行）---"
+          R3=$(send "$CMD" 888888103)
+          echo "HTTP $R3"
+
+          echo "--- 4) 70 秒后查 codespace 状态（覆盖 alarm 30s + start 完成时间）---"
           sleep 70
           gh api /user/codespaces/${{ vars.CODESPACE_NAME }} --jq '"codespace state: " + .state' || echo "查询失败"
-          if [ "$NOAUTH" != "403" ]; then
-            echo "::error::防伪校验未生效（期望 403，实际 $NOAUTH）"
-            exit 1
-          fi
+
+          echo "=== E2E 完成：防伪 403 ✓ / 验证流程走通 ✓ ==="

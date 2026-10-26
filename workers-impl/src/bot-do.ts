@@ -58,7 +58,7 @@ import { evalWatch, fmtDur, pushAlarm, drainAlarms, type AlarmStore, type AlarmT
 //     ③ DO alarm 软排队（boot 二查与看门狗共存）；
 //     ④ 「用量」指令：本月累计运行时长 vs 免费额度（cs_runtime 表按日累计）；
 //     ⑤ patrol 巡检（cron 半小时 + /patrol 手动）：发现漏网的运行中机器。
-const BUILD = "devbot-20261026-v1";
+const BUILD = "devbot-20261026-v1.1";
 
 const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能手表语音接收编程需求。
 输出要求：

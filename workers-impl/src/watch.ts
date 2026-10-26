@@ -31,7 +31,7 @@ export interface WatchInput {
   running: boolean;
   /** 当前时间戳（ms） */
   now: number;
-  /** 最近一次 Telegram 互动时间（bot 收到你消息的时刻） */
+  /** 最近一次「终端级」Telegram 互动时间（开关机/状态查询/终端指令；纯聊天不算） */
   lastActivity: number;
   /** 上次开机时间（本轮运行窗口的起点；无记录 = 0） */
   bootAt: number;
@@ -45,6 +45,8 @@ export interface WatchInput {
   autostopEnabled: boolean;
   /** 本轮窗口是否已发过提醒（防轰炸；发过就只等自动关机） */
   reminded: boolean;
+  /** GitHub last_used_at 时间戳（ms；null=未知）。VS Code/网页/SSH 在用会刷新——第二信号 */
+  ghLastUsedAt: number | null;
 }
 
 /** 看门狗决策输出。 */
@@ -67,8 +69,13 @@ const MIN = 60_000;
  *   - 互动新鲜（< remindMin）→ 静默，排到「互动满 remindMin」时再看
  *   - 提醒窗口内（remindMin ≤ idle < autostopMin）→ 发提醒（若未发过），排到 autostop 满点
  *   - 超过 autostopMin：
- *       origin=bot        → 自动关机（你自己开的机，bot 负责善后）
- *       origin=observed   → 只再提醒一次（巡检发现的运行，不敢确定你不在用）
+ *       ① GitHub 侧活跃（last_used_at < 10 分钟）→ 你在 VS Code/网页/SSH 干活，
+ *          不打扰，推迟 30 分钟再查（双信号防误杀）
+ *       ② origin=bot → 自动关机（你自己开的机，bot 负责善后）
+ *       ③ origin=observed → 只提醒一次（2 小时静默期，防刷屏），之后低频复查
+ *
+ * observed 防刷屏：提醒过（reminded）就不再发，直接排 2 小时后再看；
+ * 期间你一旦有终端级互动（touchWatchActivity），reminded 复位、窗口重来。
  */
 export function evalWatch(w: WatchInput): WatchDecision {
   // 0) 机器没跑：无事可做
@@ -77,7 +84,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
   // 运行时长的兜底起点：没记录 bootAt 时用 lastActivity 估（比 0 合理）
   const boot = w.bootAt > 0 ? w.bootAt : w.lastActivity;
 
-  const idleMin = (w.now - w.lastActivity) / MIN; // 距你上次互动
+  const idleMin = (w.now - w.lastActivity) / MIN; // 距你上次终端级互动
   const runMin = Math.max(0, (w.now - boot) / MIN); // 本轮已运行
 
   // 1) 互动还新鲜：你正在干活，别打扰
@@ -109,7 +116,16 @@ export function evalWatch(w: WatchInput): WatchDecision {
     };
   }
 
-  // 3) 超过自动关机阈值
+  // 3) 超过自动关机阈值 —— 先看 GitHub 第二信号
+  if (w.ghLastUsedAt !== null) {
+    const ghIdleMin = (w.now - w.ghLastUsedAt) / MIN;
+    if (ghIdleMin < 10) {
+      // 你正在 VS Code / 网页 / SSH 里干活：绝不打扰，推迟 30 分钟再查
+      return { notify: null, stop: false, nextCheck: w.now + 30 * MIN, markReminded: false };
+    }
+  }
+
+  // 4) 双信号都空闲 → 执行关机策略
   if (w.botStarted && w.autostopEnabled) {
     return {
       notify: `🛑 闲置超时：已 ${fmtDur(idleMin)} 无互动，自动关机（本轮共运行 ${fmtDur(runMin)}）。需要时发「开始开发」重新开机。`,
@@ -119,7 +135,10 @@ export function evalWatch(w: WatchInput): WatchDecision {
     };
   }
 
-  // observed 且未自动关：最后再提醒一次（含已提醒过的情况，升级文案）
+  // 5) observed（非 bot 开机）：提醒一次后 2 小时静默，防刷屏
+  if (w.reminded) {
+    return { notify: null, stop: false, nextCheck: w.now + 120 * MIN, markReminded: false };
+  }
   return {
     notify:
       `⏰ 开发机已闲置 ${fmtDur(idleMin)}（本轮运行 ${fmtDur(runMin)}），仍在运行。\n` +
@@ -127,7 +146,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
         ? `这轮不是通过我开的机，我不敢自动关。不用了请发「停止开发」。`
         : `自动关机未启用。不用了请发「停止开发」。`),
     stop: false,
-    nextCheck: w.now + Math.max(w.remindMin, 10) * MIN, // 低频复查
+    nextCheck: w.now + 120 * MIN, // 2 小时静默期后再提醒
     markReminded: true,
   };
 }

@@ -281,6 +281,7 @@ const W = (over = {}) => ({
   autostopMin: 55,
   autostopEnabled: true,
   reminded: false,
+  ghLastUsedAt: null,
   ...over,
 });
 const MIN = 60_000;
@@ -325,7 +326,39 @@ check("关机：不动作", evalWatch(W({ running: false })), { notify: null, st
   const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, botStarted: false }));
   check("observed：不自动关", d.stop, false);
   check("observed：升级提醒", d.notify !== null && d.notify.includes("不敢自动关"), true);
-  check("observed：低频复查", d.nextCheck, 10_000_000 + 60 * MIN + 25 * MIN);
+  check("observed：2h 静默复查", d.nextCheck, 10_000_000 + 60 * MIN + 120 * MIN);
+}
+
+// observed 防刷屏：提醒过 → 静默 2h（不再发）
+{
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, botStarted: false, reminded: true }));
+  check("observed 已提醒：静默", d.notify, null);
+  check("observed 已提醒：2h 后再查", d.nextCheck, 10_000_000 + 180 * MIN);
+}
+
+// ---- 双信号：GitHub last_used_at 交叉验证（防 VS Code 误杀）----
+{
+  // 超时但 GitHub 侧 5 分钟前刚用过（你在 VS Code 干活）→ 推迟不打扰
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, ghLastUsedAt: 10_000_000 + 55 * MIN }));
+  check("GH 活跃：不关机", d.stop, false);
+  check("GH 活跃：静默", d.notify, null);
+  check("GH 活跃：推迟 30min", d.nextCheck, 10_000_000 + 90 * MIN);
+}
+{
+  // GitHub 侧 10 分钟整 = 边界外（10min 前）→ 正常关机流程
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, ghLastUsedAt: 10_000_000 + 50 * MIN }));
+  check("GH 恰好 10min 前：正常关机", d.stop, true);
+}
+{
+  // GitHub 侧很旧（30 分钟没用）→ 正常关机
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, ghLastUsedAt: 10_000_000 + 30 * MIN }));
+  check("GH 空闲：正常关机", d.stop, true);
+}
+{
+  // observed + GH 活跃 → 也不提醒（你正在干别的，observed 提醒也推迟）
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, botStarted: false, ghLastUsedAt: 10_000_000 + 58 * MIN }));
+  check("observed + GH 活跃：静默", d.notify, null);
+  check("observed + GH 活跃：推迟 30min", d.nextCheck, 10_000_000 + 90 * MIN);
 }
 
 // 超 autostop + 自动关未启用 → 只提醒

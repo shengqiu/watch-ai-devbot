@@ -193,9 +193,9 @@ export class AssistantDO extends DurableObject<Env> {
       return;
     }
 
-    // 2.5) 看门狗互动刷新：白名单用户发的任何消息都算「你在用开发机」
-    //      （放在验证之前——即使验证会话过期，你的出现本身就说明在场）
-    await this.touchWatchActivity(m.chatId);
+    // 2.5) 看门狗互动刷新——先只记 chat_id（patrol 推送目标；验证状态无关）。
+    //      终端级续命判定需要 text，放到文本提取之后（见 5.5 前）。
+    await this.touchWatchActivity(m.chatId, false);
 
     // 3) 限流
     if (!(await this.allowRate(m.chatId))) {
@@ -247,6 +247,14 @@ export class AssistantDO extends DurableObject<Env> {
     }
     // 已验证 → 滑动延续
     await this.setVerify(m.chatId, nextExpiry(now, sessionMs));
+
+    // 5.6) 终端级互动续命（在 text 就绪后判定）：只有开发机相关消息才刷新看门狗，
+    //      纯聊天不续命——防止将来接 LLM 后「聊天把机器聊到永不关机」。
+    const isTerminalMsg =
+      /^(开始开发|\/boot|停止开发|关掉开发机|\/halt|开发机状态|\/cs|用量|额度|\/usage)/i.test(
+        text.trim(),
+      );
+    if (isTerminalMsg) await this.touchWatchActivity(m.chatId, true);
 
     // 6.5) 诊断命令：回显最后一轮模型回复的原文格式，定位「高亮不生效」问题。
     // 用可见标记替换围栏/缩进，纯文本发送（不走 mdToV2，避免二次转换干扰判断）。
@@ -458,11 +466,12 @@ export class AssistantDO extends DurableObject<Env> {
     });
   }
 
-  /** 互动刷新：白名单用户的任何消息都算「在场」。不改变 bootAt/botStarted。 */
-  private async touchWatchActivity(chatId: string): Promise<void> {
+  /** 互动刷新。terminal=true（终端/开发机相关消息）才续命；纯聊天只记 chat_id 不续命。 */
+  private async touchWatchActivity(chatId: string, terminal: boolean): Promise<void> {
     await this.putChatId(chatId);
     const ep = await this.getEpisode();
     if (!ep || !ep.running) return; // 机器没跑：无需管理
+    if (!terminal) return; // 纯聊天：不续命
     ep.lastActivity = Date.now();
     ep.reminded = false; // 你出现了：提醒状态复位（下次空闲重新提醒）
     await this.setEpisode(ep);
@@ -499,14 +508,18 @@ export class AssistantDO extends DurableObject<Env> {
     await this.runWatchCheck();
   }
 
-  /** 看门狗核心执行：查状态 → evalWatch → 提醒/自动关机 → 续排。 */
+  /** 看门狗核心执行：查状态（含 last_used_at）→ evalWatch → 提醒/自动关机 → 续排。 */
   private async runWatchCheck(): Promise<{ acted: boolean; note: string }> {
     const client = this.codespaceClient();
     const ep = await this.getEpisode();
     if (!client || !ep || !ep.running) return { acted: false, note: "no-episode" };
     let running: boolean;
+    let ghLastUsedAt: number | null = null;
     try {
-      running = (await client.status()).state === "Available";
+      const st = await client.status();
+      running = st.state === "Available";
+      ghLastUsedAt = st.lastUsedAt ? Date.parse(st.lastUsedAt) : null;
+      if (Number.isNaN(ghLastUsedAt as number)) ghLastUsedAt = null;
     } catch (e) {
       // 状态查询失败（GitHub 抖动）：5 分钟后重试，不误判
       console.error("[watch] 状态查询失败", e);
@@ -523,6 +536,7 @@ export class AssistantDO extends DurableObject<Env> {
       autostopMin: this.watchAutostopMin(),
       autostopEnabled: this.autostopEnabled(),
       reminded: ep.reminded,
+      ghLastUsedAt,
     });
     const chat = ep.chatId ?? (await this.getChatId());
     if (decision.markReminded) {

@@ -30,6 +30,8 @@ export interface CodespaceStatus {
   state: CodespaceState;
   /** webhook 完整 URL（GitHub 预签的 codespace 内 SSH 通道入口），可能为 null */
   sshUrl: string | null;
+  /** 最近使用时间（ISO8601；VS Code/网页/SSH 连接与交互都会刷新）——看门狗双信号用 */
+  lastUsedAt: string | null;
 }
 
 export class CodespaceClient {
@@ -63,6 +65,7 @@ export class CodespaceClient {
       name: this.name,
       state: (d.state as CodespaceState) ?? "Unknown",
       sshUrl: (d.webshell_url ?? null) as string | null,
+      lastUsedAt: (d.last_used_at ?? null) as string | null,
     };
   }
 

@@ -162,10 +162,17 @@ export class AssistantDO extends DurableObject<Env> {
     if (await this.seenMsg(key)) return;
     await this.markSeen(key);
 
-    // 2) 白名单（未配置 = 放开，仅建议开发期）。匹配 chat_id 或 user_id 任一即可
+    // 2) 白名单（未配置 = 放开，仅建议开发期）。匹配 chat_id 或 user_id 任一即可。
+    //    拒绝时回报 chat_id，方便管理员把自己加白（只回一次/分钟，避免被刷屏）。
     const allowed = (this.env.ALLOWED_USERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     if (allowed.length > 0 && !allowed.includes(m.chatId) && !allowed.includes(m.userId)) {
-      console.log(`[tg] 非白名单 chat=${m.chatId}，忽略`);
+      console.log(`[tg] 非白名单 chat=${m.chatId}，拒绝`);
+      if (await this.allowRate(m.chatId)) {
+        await this.reply(
+          m.chatId,
+          `未授权用户。你的 chat_id 是 ${m.chatId}，请联系管理员加入白名单。`,
+        );
+      }
       return;
     }
 

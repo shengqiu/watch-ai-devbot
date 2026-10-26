@@ -18,16 +18,29 @@ jobs:
           WORKER_URL: ${{ vars.WORKER_BASE_URL }}
           CMD: ${{ inputs.command }}
           GH_TOKEN: ${{ secrets.GH_CODESPACE_E2E_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.E2E_WEBHOOK_SECRET }}
         run: |
           echo "目标: $WORKER_URL  指令: $CMD"
           UPDATE_ID=$((900000000 + RANDOM % 99999999))
           BODY=$(jq -n --arg text "$CMD" --argjson uid "$UPDATE_ID" --argjson now "$(date +%s)" \
             '{update_id: $uid, message: {message_id: 1, chat: {id: 555, type: "private"}, from: {id: 555}, date: $now, text: $text}}')
           echo "payload: $BODY"
-          echo "--- 发送 webhook（Worker 立即应答，开机确认走 DO alarm 30s）---"
+
+          echo "--- 先验证防伪：不带密钥头的请求应被 403 拒绝 ---"
+          NOAUTH=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" -d "$BODY" --max-time 30)
+          echo "无密钥头 HTTP 状态: $NOAUTH (预期 403)"
+
+          echo "--- 发送正规 webhook（带防伪密钥头；Worker 立即应答，开机确认走 DO alarm 30s）---"
           RESP=$(curl -s -w "\nHTTP_CODE=%{http_code} TIME=%{time_total}s" -X POST "$WORKER_URL/webhook" \
-            -H "Content-Type: application/json" -d "$BODY" --max-time 120)
+            -H "Content-Type: application/json" -H "X-Telegram-Bot-Api-Secret-Token: $WEBHOOK_SECRET" \
+            -d "$BODY" --max-time 120)
           echo "$RESP"
+
           echo "--- 70 秒后查 codespace 状态（覆盖 alarm 30s + start 完成时间）---"
           sleep 70
           gh api /user/codespaces/${{ vars.CODESPACE_NAME }} --jq '"codespace state: " + .state' || echo "查询失败"
+          if [ "$NOAUTH" != "403" ]; then
+            echo "::error::防伪校验未生效（期望 403，实际 $NOAUTH）"
+            exit 1
+          fi

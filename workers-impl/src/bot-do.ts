@@ -50,7 +50,7 @@ import { CodespaceClient, beginBoot, checkBoot, stopCodespace, describeState } f
 // v17：Codespace 开发机远程开关——「开始开发/停止开发/开发机状态」指令
 //     （含 /boot /halt /cs 别名）。两次查询开机协议（30s 间隔、不循环、幂等停机），
 //     GitHub REST 薄客户端见 src/codespace.ts；凭证 GH_CODESPACE_PAT（secret）。
-const BUILD = "devbot-20261026-v1";
+const BUILD = "devbot-20261026-v0";
 
 const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能手表语音接收编程需求。
 输出要求：

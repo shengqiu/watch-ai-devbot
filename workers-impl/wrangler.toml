@@ -35,7 +35,10 @@ SESSION_MAX_TURNS = "10"
 RATE_LIMIT_PER_MIN = "20"
 DAILY_CALL_BUDGET = "200"
 REPLY_CHUNK_SIZE = "800"
-ALLOWED_USERS = "7618809103"      # 白名单（逗号分隔可多用户；当前：用户本人）
+# ALLOWED_USERS、VERIFY_ANSWER、ADMIN_KEY 均走 secret（不进公开源码）：
+#   npx wrangler secret put ALLOWED_USERS    # 逗号分隔 chat_id 白名单
+#   npx wrangler secret put VERIFY_ANSWER    # 验证答案
+#   npx wrangler secret put ADMIN_KEY        # 管理端点密钥
 GH_CODESPACE_NAME = "24h-jwp7vwxvx6hpp7" # 远程开关的 codespace（与主 bot 同一台）
 VERIFY_SESSION_MIN = "30"          # 「爸爸」验证会话时长（分钟，滑动延续）
 

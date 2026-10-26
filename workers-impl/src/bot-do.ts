@@ -204,21 +204,25 @@ export class AssistantDO extends DurableObject<Env> {
 
     // 5.5) 身份验证（30 分钟滑动会话）：
     //   - 未验证：一切问题/指令都不转发 LLM / Codespace，只回验证问题；
-    //     若这条消息本身就是正确答案（「爸爸」）→ 通过并延续 30 分钟。
+    //     若这条消息本身就是正确答案 → 通过并延续 30 分钟。
     //   - 已验证：任何交互把会话滑动延续 30 分钟。
+    //   - 答案 VERIFY_ANSWER 走 secret（不在公开源码里）；未配置 = 服务锁定（默认安全）。
     //   - 设备限制由「白名单账号」达成（Telegram 不提供设备信息）。
     const now = Date.now();
-    const verifyAnswer = this.env.VERIFY_ANSWER || "爸爸";
+    const verifyAnswer = this.env.VERIFY_ANSWER;
     const sessionMs = this.verifySessionMs();
     const state = await this.getVerify(m.chatId);
     if (!isVerified(state, now)) {
-      if (isAnswerMatch(text, verifyAnswer)) {
+      if (verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
         await this.setVerify(m.chatId, nextExpiry(now, sessionMs));
         await this.reply(m.chatId, "验证通过 ✓（半小时内互动免验证）");
         return;
       }
       await this.setVerify(m.chatId, 0); // 保持未验证
-      await this.reply(m.chatId, CHALLENGE_TEXT);
+      await this.reply(
+        m.chatId,
+        verifyAnswer ? CHALLENGE_TEXT : `${CHALLENGE_TEXT}\n（管理员未配置验证答案，服务锁定中）`,
+      );
       return;
     }
     // 已验证 → 滑动延续

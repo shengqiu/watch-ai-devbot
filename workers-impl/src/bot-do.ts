@@ -58,7 +58,26 @@ import { evalWatch, fmtDur, pushAlarm, drainAlarms, type AlarmStore, type AlarmT
 //     ③ DO alarm 软排队（boot 二查与看门狗共存）；
 //     ④ 「用量」指令：本月累计运行时长 vs 免费额度（cs_runtime 表按日累计）；
 //     ⑤ patrol 巡检（cron 半小时 + /patrol 手动）：发现漏网的运行中机器。
-const BUILD = "devbot-20261026-v1.2";
+// v1.3：终端化定位——未识别的文本不再静默退化成 LLM 聊天（那会抛出
+//       「所有模型都调用失败」这种跟终端毫无关系的报错）。未配 LLM key 时
+//       直接回 TERMINAL_HINT，把 devbot 支持的指令列清楚。
+const BUILD = "devbot-20261026-v1.3";
+
+/**
+ * 未识别输入时的提示。devbot 的定位是「Telegram 即终端」，
+ * 所以这里列的是开发机控制指令，而不是「请配置 GEMINI_API_KEY」——
+ * 后者只会让用户以为这是个聊天机器人。
+ */
+const TERMINAL_HINT = [
+  "🖥 开发机控制指令：",
+  "  开始开发 / /boot —— 开机",
+  "  停止开发 / /halt —— 关机",
+  "  开发机状态 / /cs —— 查状态",
+  "  用量 / /usage —— 本月额度",
+  "",
+  "⚠️ 直接执行 shell/tmux 命令的功能还没上线（需要 codespace 内跑一个 agent，",
+  "因为 CF Worker 无法出站 SSH）。上线后这里就能直接敲命令了。",
+].join("\n");
 
 const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能手表语音接收编程需求。
 输出要求：
@@ -296,7 +315,18 @@ export class AssistantDO extends DurableObject<Env> {
       return;
     }
 
-    // 6) 意图解析 + 会话历史 + LLM 路由
+    // 6) 没有可用 LLM 厂商（未配 key）→ 不做无谓调用，直接给终端提示。
+    //    原实现会照常调用并抛「所有模型都调用失败了：所有厂商均失败 -> gemini: ...」，
+    //    对只想操作开发机的用户来说完全是噪音，且掩盖了「终端功能尚未启用」这一事实。
+    const providers = loadProviders(this.env);
+    if (Object.keys(providers).length === 0) {
+      await this.appendHistory(m.chatId, "user", text);
+      await this.reply(m.chatId, TERMINAL_HINT);
+      console.log(`[tg] 无可用 LLM 厂商，已回终端提示 chat=${m.chatId}`);
+      return;
+    }
+
+    // 7) 意图解析 + 会话历史 + LLM 路由
     const intent = parseIntent(text);
     const history = await this.getHistory(m.chatId);
     let answer: string;
@@ -314,7 +344,7 @@ export class AssistantDO extends DurableObject<Env> {
     await this.appendHistory(m.chatId, "assistant", answer);
     await this.incrBudget();
 
-    // 7) 分段回包
+    // 8) 分段回包
     await this.reply(m.chatId, answer);
     console.log(`[tg] 已回复 chat=${m.chatId} via ${via}`);
   }

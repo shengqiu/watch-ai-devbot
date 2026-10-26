@@ -1,0 +1,46 @@
+# Watch AI Devbot — 主配置（本仓库唯一 Worker）
+# Telegram 开发指令 bot：Codespace 远程开关 + AI 编程助手能力
+# 部署：npx wrangler deploy（CI 见 .github/workflows/deploy.yml）
+name = "watch-ai-devbot" # 独立 worker 名 → watch-ai-devbot.shengqiu-purdue.workers.dev
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+# Durable Object：单例，承载消息流水线与会话状态（webhook 模式按需唤醒、事毕休眠）
+# 与主 worker 完全同构；独立 worker = 独立 DO 命名空间，状态互不相通。
+[[durable_objects.bindings]]
+name = "BOT"
+class_name = "AssistantDO"
+
+# SQLite 存储（会话/去重/限流/额度）。迁移只增不减（与主 worker 相同的迁移序列）：
+#   v1 = 首个通道实现（早期 DO 类，已废弃）
+#   v2 = 删除早期 DO 类（连同其旧 schema/数据），新建 AssistantDO（当前 schema，从零开始）
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["QQBotDO"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["QQBotDO"]
+new_sqlite_classes = ["AssistantDO"]
+
+[triggers]
+crons = []
+
+[vars]
+BOT_IDENTITY = "devbot" # /healthz 与 /status 里显示，区分主/副 bot
+DEFAULT_CODING_PROVIDER = "gemini"
+DEFAULT_CHAT_PROVIDER = "gemini"
+MAX_OUTPUT_TOKENS = "4096"
+SESSION_MAX_TURNS = "10"
+RATE_LIMIT_PER_MIN = "20"
+DAILY_CALL_BUDGET = "200"
+REPLY_CHUNK_SIZE = "800"
+ALLOWED_USERS = ""               # ⚠️ 开发 bot 有开机权限，验证跑通后务必收紧（chat_id 逗号分隔）
+GH_CODESPACE_NAME = "24h-jwp7vwxvx6hpp7" # 远程开关的 codespace（与主 bot 同一台）
+
+# 密钥用 wrangler secret put 注入（不要写在这里）：
+#   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）
+#   GEMINI_API_KEY（聊天/编程能力用；不配则只有开发机指令可用）
+#   GH_CODESPACE_PAT（Codespaces REST 调用凭证）
+#   （可选）TELEGRAM_WEBHOOK_SECRET —— webhook 防伪密钥
+#   （可选）STT_BASE_URL / STT_API_KEY / STT_MODEL —— 语音转写

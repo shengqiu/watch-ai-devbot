@@ -1,0 +1,33 @@
+name: E2E Telegram Boot Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "要测试的指令文本"
+        required: false
+        default: "开始开发"
+
+jobs:
+  e2e:
+    name: Send fake Telegram webhook
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send webhook and report
+        env:
+          WORKER_URL: ${{ vars.WORKER_BASE_URL }}
+          CMD: ${{ inputs.command }}
+          GH_TOKEN: ${{ secrets.GH_CODESPACE_E2E_TOKEN }}
+        run: |
+          echo "目标: $WORKER_URL  指令: $CMD"
+          UPDATE_ID=$((900000000 + RANDOM % 99999999))
+          BODY=$(jq -n --arg text "$CMD" --argjson uid "$UPDATE_ID" --argjson now "$(date +%s)" \
+            '{update_id: $uid, message: {message_id: 1, chat: {id: 555, type: "private"}, from: {id: 555}, date: $now, text: $text}}')
+          echo "payload: $BODY"
+          echo "--- 发送 webhook（Worker 立即应答，开机确认走 DO alarm 30s）---"
+          RESP=$(curl -s -w "\nHTTP_CODE=%{http_code} TIME=%{time_total}s" -X POST "$WORKER_URL/webhook" \
+            -H "Content-Type: application/json" -d "$BODY" --max-time 120)
+          echo "$RESP"
+          echo "--- 70 秒后查 codespace 状态（覆盖 alarm 30s + start 完成时间）---"
+          sleep 70
+          gh api /user/codespaces/${{ vars.CODESPACE_NAME }} --jq '"codespace state: " + .state' || echo "查询失败"

@@ -19,6 +19,7 @@ jobs:
           CMD: ${{ inputs.command }}
           GH_TOKEN: ${{ secrets.GH_CODESPACE_E2E_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.E2E_WEBHOOK_SECRET }}
+          E2E_ANSWER: ${{ secrets.E2E_VERIFY_ANSWER }}
           TEST_USER_ID: ${{ vars.E2E_TEST_USER_ID }}
         run: |
           set -e
@@ -46,7 +47,7 @@ jobs:
           echo "HTTP $R1（bot 应回验证问题给测试用户）"
 
           echo "--- 2) 发送验证答案「爸爸」---"
-          R2=$(send "爸爸" 888888102)
+          R2=$(send "$E2E_ANSWER" 888888102)
           echo "HTTP $R2"
 
           echo "--- 3) 再发指令（已验证 → 正常执行）---"

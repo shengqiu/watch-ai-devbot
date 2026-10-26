@@ -47,6 +47,9 @@ CS_WATCH_REMIND_MIN = "25"
 CS_WATCH_AUTOSTOP_MIN = "55"
 CS_WATCH_AUTOSTOP = "1"            # 0 = 只提醒不自动关
 CS_MONTHLY_BUDGET_HOURS = "60"     # 免费额度（2 核机 120 core-hours ÷ 2）
+CS_GH_CAP_MIN = "180"              # GH 连续活跃上限（分钟）：防 dev server 刷日志无限续命
+CS_GH_CAP_ACTION = "stop"          # 触达上限后：stop=警告+宽限后关机 | notify=只提醒永不动手
+CS_GH_CAP_GRACE_MIN = "15"         # stop 模式宽限期（分钟）：警告后给多久让你回一个字取消
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）

@@ -58,7 +58,7 @@ import { evalWatch, fmtDur, pushAlarm, drainAlarms, type AlarmStore, type AlarmT
 //     ③ DO alarm 软排队（boot 二查与看门狗共存）；
 //     ④ 「用量」指令：本月累计运行时长 vs 免费额度（cs_runtime 表按日累计）；
 //     ⑤ patrol 巡检（cron 半小时 + /patrol 手动）：发现漏网的运行中机器。
-const BUILD = "devbot-20261026-v1.1";
+const BUILD = "devbot-20261026-v1.2";
 
 const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能手表语音接收编程需求。
 输出要求：
@@ -457,6 +457,9 @@ export class AssistantDO extends DurableObject<Env> {
       botStarted: origin === "bot" ? true : (prev?.botStarted ?? false),
       reminded: false,
       chatId: chat,
+      ghFreshSince: null, // 新窗口：GH 追踪重置
+      capNotified: false,
+      capNotifiedAt: null,
     };
     await this.setEpisode(ep);
     if (chat) await this.putChatId(chat);
@@ -474,6 +477,10 @@ export class AssistantDO extends DurableObject<Env> {
     if (!terminal) return; // 纯聊天：不续命
     ep.lastActivity = Date.now();
     ep.reminded = false; // 你出现了：提醒状态复位（下次空闲重新提醒）
+    // 第三信号一并清零：宽限倒计时取消，GH「持续活跃」重新计时
+    ep.ghFreshSince = null;
+    ep.capNotified = false;
+    ep.capNotifiedAt = null;
     await this.setEpisode(ep);
     await pushAlarm(this.alarmStore(), {
       due: ep.lastActivity + this.watchRemindMin() * 60_000,
@@ -537,12 +544,22 @@ export class AssistantDO extends DurableObject<Env> {
       autostopEnabled: this.autostopEnabled(),
       reminded: ep.reminded,
       ghLastUsedAt,
+      ghFreshSince: ep.ghFreshSince,
+      capNotified: ep.capNotified,
+      capNotifiedAt: ep.capNotifiedAt,
+      ghCapMin: this.ghCapMin(),
+      ghCapAction: this.ghCapAction(),
+      graceMin: this.watchGraceMin(),
     });
+    // 写回第三信号追踪状态（ghFreshSince/capNotified/capNotifiedAt）
+    ep.ghFreshSince = decision.ghFreshSince;
+    ep.capNotified = decision.capNotified;
+    ep.capNotifiedAt = decision.capNotifiedAt;
     const chat = ep.chatId ?? (await this.getChatId());
     if (decision.markReminded) {
       ep.reminded = true;
-      await this.setEpisode(ep);
     }
+    await this.setEpisode(ep);
     if (decision.stop) {
       try {
         await client.stop();
@@ -841,6 +858,24 @@ export class AssistantDO extends DurableObject<Env> {
   private autostopEnabled(): boolean {
     return (this.env.CS_WATCH_AUTOSTOP ?? "1") !== "0";
   }
+  /** GH 连续活跃上限（分钟，默认 180）：第三信号保险丝 */
+  private ghCapMin(): number {
+    const v = Number(this.env.CS_GH_CAP_MIN ?? 180);
+    return Number.isFinite(v) && v >= 30 ? v : 180;
+  }
+  /**
+   * 触达上限后的动作（默认 stop）：
+   *   stop   = 警告一次 + 宽限倒计时，到期强制关机（有硬上限，杜绝无限泄漏）
+   *   notify = 只提醒，永不自动关（保守；适合你经常在 VS Code 长会话干活的时期）
+   */
+  private ghCapAction(): "notify" | "stop" {
+    return this.env.CS_GH_CAP_ACTION === "notify" ? "notify" : "stop";
+  }
+  /** "stop" 模式下的宽限期（分钟，默认 15） */
+  private watchGraceMin(): number {
+    const v = Number(this.env.CS_GH_CAP_GRACE_MIN ?? 15);
+    return Number.isFinite(v) && v > 0 ? v : 15;
+  }
   /** 月免费额度（小时，默认 60 = 2 核机的 120 core-hours） */
   private monthlyBudgetHours(): number {
     const v = Number(this.env.CS_MONTHLY_BUDGET_HOURS ?? 60);
@@ -885,7 +920,7 @@ interface Episode {
   running: boolean;
   /** 本轮开机时间戳（运行时长起算点） */
   bootAt: number;
-  /** 最近一次 Telegram 互动时间戳 */
+  /** 最近一次终端级 Telegram 互动时间戳 */
   lastActivity: number;
   /** 是否由 bot 指令发起（决定可否自动关机） */
   botStarted: boolean;
@@ -893,4 +928,10 @@ interface Episode {
   reminded: boolean;
   /** 关联 chat_id（推送目标；可为 null = 巡检发现，未关联聊天） */
   chatId: string | null;
+  /** GH「连续活跃」追踪起点（第三信号：防 dev server 刷日志无限续命） */
+  ghFreshSince: number | null;
+  /** 本轮窗口是否已发过「持续活跃上限」警告 */
+  capNotified: boolean;
+  /** 上限警告发出的时刻（宽限倒计时起点） */
+  capNotifiedAt: number | null;
 }

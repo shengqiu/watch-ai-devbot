@@ -45,6 +45,9 @@ export interface Env {
   CS_WATCH_AUTOSTOP_MIN?: string; // 自动关机阈值（分钟，默认 55）
   CS_WATCH_AUTOSTOP?: string; // "0" = 只提醒不自动关（默认开）
   CS_MONTHLY_BUDGET_HOURS?: string; // 月免费额度小时数（默认 60；2 核 = 120 core-h ÷ 2）
+  CS_GH_CAP_MIN?: string; // GH 连续活跃上限（分钟，默认 180）：防 dev server 刷日志无限续命
+  CS_GH_CAP_ACTION?: string; // 触达上限后的动作：stop（默认，警告+宽限后关机）| notify（只提醒）
+  CS_GH_CAP_GRACE_MIN?: string; // stop 模式下的宽限期（分钟，默认 15）
 
   // 部署身份标识（var）：主 bot 不设（显示 main）；devbot 部署设为 "devbot"
   BOT_IDENTITY?: string;

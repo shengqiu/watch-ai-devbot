@@ -282,12 +282,26 @@ const W = (over = {}) => ({
   autostopEnabled: true,
   reminded: false,
   ghLastUsedAt: null,
+  ghFreshSince: null,
+  capNotified: false,
+  capNotifiedAt: null,
+  ghCapMin: 180,
+  ghCapAction: "stop",
+  graceMin: 15,
   ...over,
 });
 const MIN = 60_000;
 
 // 机器没跑 → 什么都不做
-check("关机：不动作", evalWatch(W({ running: false })), { notify: null, stop: false, nextCheck: null, markReminded: false });
+check("关机：不动作", evalWatch(W({ running: false })), {
+  notify: null,
+  stop: false,
+  nextCheck: null,
+  markReminded: false,
+  ghFreshSince: null,
+  capNotified: false,
+  capNotifiedAt: null,
+});
 
 // 互动新鲜 → 静默，排到 remind 满点
 {
@@ -359,6 +373,114 @@ check("关机：不动作", evalWatch(W({ running: false })), { notify: null, st
   const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, botStarted: false, ghLastUsedAt: 10_000_000 + 58 * MIN }));
   check("observed + GH 活跃：静默", d.notify, null);
   check("observed + GH 活跃：推迟 30min", d.nextCheck, 10_000_000 + 90 * MIN);
+}
+
+// ---- 第三信号：GH 连续活跃上限保险丝（防 dev server 刷日志无限续命）----
+// 背景：last_used_at 无法区分「人在 VS Code 敲键盘」和「dev server 刷日志」，
+// 两者在 GitHub API 上完全一样。所以不能无限信任它——必须给推迟加上硬上限。
+{
+  // GH 活跃、空闲刚过 autostop 但未达上限 → 静默推迟 30min，开始追踪
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, ghLastUsedAt: 10_000_000 + 55 * MIN }));
+  check("cap：首次活跃开始追踪", d.ghFreshSince, 10_000_000 + 60 * MIN);
+  check("cap：首次活跃不提醒", d.notify, null);
+  check("cap：推迟 30min", d.nextCheck, 10_000_000 + 90 * MIN);
+  check("cap：不关机", d.stop, false);
+}
+{
+  // ★ 关键回归：已发过普通提醒（reminded=true）不能阻止上限警告。
+  //   旧实现多了 !w.reminded 条件 → 25min 提醒一次后永远静默、机器无限续命，
+  //   正是本次要修的失效模式。
+  const d = evalWatch(W({
+    now: 10_000_000 + 180 * MIN,
+    ghLastUsedAt: 10_000_000 + 179 * MIN,
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    reminded: true,
+  }));
+  check("cap：reminded 不阻塞上限警告", d.notify !== null && d.notify.includes("持续活跃"), true);
+  check("cap：警告阶段不关机", d.stop, false);
+  check("cap：标记 capNotified", d.capNotified, true);
+  check("cap：记录警告时刻", d.capNotifiedAt, 10_000_000 + 180 * MIN);
+  check("cap：宽限 15min 后复查", d.nextCheck, 10_000_000 + 195 * MIN);
+}
+{
+  // 宽限期内仍未互动 → 静默等到宽限点（不重复轰炸）
+  const d = evalWatch(W({
+    now: 10_000_000 + 190 * MIN,
+    ghLastUsedAt: 10_000_000 + 189 * MIN,
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    capNotified: true,
+    capNotifiedAt: 10_000_000 + 180 * MIN,
+  }));
+  check("cap：宽限期内静默", d.notify, null);
+  check("cap：宽限期内不关机", d.stop, false);
+  check("cap：排到宽限点", d.nextCheck, 10_000_000 + 195 * MIN);
+}
+{
+  // 宽限期走完 → 强制关机。泄漏从此有硬上限（≤ ghCapMin + graceMin）
+  const d = evalWatch(W({
+    now: 10_000_000 + 196 * MIN,
+    ghLastUsedAt: 10_000_000 + 195 * MIN,
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    capNotified: true,
+    capNotifiedAt: 10_000_000 + 180 * MIN,
+  }));
+  check("cap：宽限到 → 强制关机", d.stop, true);
+  check("cap：关机后追踪清零", d.ghFreshSince, null);
+  check("cap：关机后 capNotified 清零", d.capNotified, false);
+}
+{
+  // notify 模式：触达上限只提醒一次，永不自动关
+  const d = evalWatch(W({
+    now: 10_000_000 + 200 * MIN,
+    ghLastUsedAt: 10_000_000 + 199 * MIN,
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    ghCapAction: "notify",
+  }));
+  check("cap：notify 模式提醒", d.notify !== null && d.notify.includes("持续活跃"), true);
+  check("cap：notify 模式永不关机", d.stop, false);
+  check("cap：notify 模式标记", d.capNotified, true);
+}
+{
+  // notify 模式：不重复刷屏
+  const d = evalWatch(W({
+    now: 10_000_000 + 260 * MIN,
+    ghLastUsedAt: 10_000_000 + 259 * MIN,
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    ghCapAction: "notify",
+    capNotified: true,
+    capNotifiedAt: 10_000_000 + 200 * MIN,
+  }));
+  check("cap：notify 模式不重复", d.notify, null);
+  check("cap：notify 模式仍不关机", d.stop, false);
+}
+{
+  // 自动关机被关闭 → 即使触达上限也只提醒
+  const d = evalWatch(W({
+    now: 10_000_000 + 200 * MIN,
+    ghLastUsedAt: 10_000_000 + 199 * MIN,
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    autostopEnabled: false,
+  }));
+  check("cap：autostop 关 → 只提醒", d.notify !== null && d.notify.includes("只提醒"), true);
+  check("cap：autostop 关 → 不关机", d.stop, false);
+}
+{
+  // GH 转为空闲 → 追踪清零，走正常关机路径
+  const d = evalWatch(W({
+    now: 10_000_000 + 200 * MIN,
+    ghLastUsedAt: 10_000_000 + 100 * MIN, // 100 分钟前，已不活跃
+    ghFreshSince: 10_000_000 + 60 * MIN,
+    capNotified: true,
+  }));
+  check("cap：GH 转空闲 → 关机", d.stop, true);
+  check("cap：追踪清零", d.ghFreshSince, null);
+}
+{
+  // 用户终端级互动 → 第三信号全部复位（宽限倒计时取消）
+  const d = evalWatch(W({ now: 10_000_000 + 10 * MIN }));
+  check("cap：互动新鲜重置追踪", d.ghFreshSince, null);
+  check("cap：互动新鲜重置 capNotified", d.capNotified, false);
+  check("cap：互动新鲜重置警告时刻", d.capNotifiedAt, null);
 }
 
 // 超 autostop + 自动关未启用 → 只提醒

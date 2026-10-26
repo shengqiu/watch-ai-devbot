@@ -11,13 +11,21 @@
  *   pushAlarm   —— DO alarm 单槽位软排队（boot 二查与看门狗共用一个 alarm 通道）
  *   fmtDur      —— 时长格式化（Telegram 回包用）
  *
- * 决策规则（两层保险）：
- *   ① 空闲提醒：机器运行中且距上次 Telegram 互动 ≥ REMIND 分钟 → 发提醒
+ * 决策规则（三层防护）：
+ *   ① 空闲提醒：机器运行中且距上次终端级 Telegram 互动 ≥ REMIND 分钟 → 发提醒
  *     （提醒即续期：再等一个 AUTOSTOP-REMIND 窗口，避免每 5 分钟轰炸）
- *   ② 自动关机：提醒之后仍无互动 ≥ AUTOSTOP 分钟 → 直接 stop（强制，任何进程拦不住）
+ *   ② 自动关机：提醒之后仍无互动 ≥ AUTOSTOP 分钟，且 GitHub 侧也空闲
+ *     （last_used_at ≥ 10 分钟没刷新；VS Code/网页/SSH 在用会刷新——双信号防误杀）
+ *   ③ 活跃上限保险丝（本次新增）：当 GitHub 侧一直报「活跃」导致 ② 被无限推迟时，
+ *     仅凭 GH 信号无法区分「人在 VS Code 干活」和「dev server 刷日志续命」——
+ *     两者在 API 上完全一样。解法是不再无限推迟，而是转为一个有界的确认流程：
+ *       - Telegram 连续空闲达到 GH_CAP 分钟且 GH 仍报活跃 → 判定「疑似刷日志续命」
+ *       - 发一次警告并启动 GRACE 分钟倒计时（回我任意一个字即取消并全部复位）
+ *       - 倒计时走完仍无互动 → 强制关机（有硬上限，杜绝无限泄漏）
+ *     保守场景下可用 CS_GH_CAP_ACTION="notify" 降级为「只提醒、永不自动关」。
  *
  * 互动的判定（什么叫「你在用」）：
- *   - 你给 bot 发了任何消息（白名单过滤后 touchWatchActivity）
+ *   - 你给 bot 发了终端级消息（开始/停止/状态/用量等指令；纯聊天不续命）
  *   - 你刚开机 / 刚查过状态（ensureWatch 重置起点）
  *   origin=bot 的操作（你自己触发的开机/状态查询）之后允许自动关机；
  *   origin=observed（巡检发现机器在跑，但你很久没说话）只提醒不自动关 ——
@@ -47,6 +55,18 @@ export interface WatchInput {
   reminded: boolean;
   /** GitHub last_used_at 时间戳（ms；null=未知）。VS Code/网页/SSH 在用会刷新——第二信号 */
   ghLastUsedAt: number | null;
+  /** GH 连续活跃追踪起点（ms；null=未在追踪）。跨检查持久化于 episode */
+  ghFreshSince: number | null;
+  /** 本轮窗口是否已发过「GH 持续活跃上限」警告（防轰炸：只发一次） */
+  capNotified: boolean;
+  /** 上限警告发出的时刻（ms；用于宽限倒计时）。跨检查持久化于 episode */
+  capNotifiedAt: number | null;
+  /** GH 连续活跃上限（分钟，默认 180）：持续活跃但 Telegram 全程零互动 → 触发确认流程 */
+  ghCapMin: number;
+  /** 触达上限后的动作："notify"=只提醒（永不自动关） | "stop"=警告+宽限倒计时后强制关机 */
+  ghCapAction: "notify" | "stop";
+  /** "stop" 模式下的宽限期（分钟，默认 15）：警告后给多久让你回一个字取消 */
+  graceMin: number;
 }
 
 /** 看门狗决策输出。 */
@@ -59,6 +79,12 @@ export interface WatchDecision {
   nextCheck: number | null;
   /** 决策后是否标记「已提醒」（写回 episode 状态用） */
   markReminded: boolean;
+  /** 写回 episode 的 GH 追踪起点（null = 清零重置） */
+  ghFreshSince: number | null;
+  /** 写回 episode 的「上限已提醒」标记 */
+  capNotified: boolean;
+  /** 写回 episode 的「上限警告时刻」（null = 清零） */
+  capNotifiedAt: number | null;
 }
 
 const MIN = 60_000;
@@ -79,7 +105,17 @@ const MIN = 60_000;
  */
 export function evalWatch(w: WatchInput): WatchDecision {
   // 0) 机器没跑：无事可做
-  if (!w.running) return { notify: null, stop: false, nextCheck: null, markReminded: false };
+  if (!w.running) {
+    return {
+      notify: null,
+      stop: false,
+      nextCheck: null,
+      markReminded: false,
+      ghFreshSince: null,
+      capNotified: false,
+      capNotifiedAt: null,
+    };
+  }
 
   // 运行时长的兜底起点：没记录 bootAt 时用 lastActivity 估（比 0 合理）
   const boot = w.bootAt > 0 ? w.bootAt : w.lastActivity;
@@ -87,10 +123,22 @@ export function evalWatch(w: WatchInput): WatchDecision {
   const idleMin = (w.now - w.lastActivity) / MIN; // 距你上次终端级互动
   const runMin = Math.max(0, (w.now - boot) / MIN); // 本轮已运行
 
-  // 1) 互动还新鲜：你正在干活，别打扰
+  // 1) 互动还新鲜：你正在干活，别打扰（同时把第三信号追踪清零）
   if (idleMin < w.remindMin) {
-    return { notify: null, stop: false, nextCheck: w.lastActivity + w.remindMin * MIN, markReminded: false };
+    return {
+      notify: null,
+      stop: false,
+      nextCheck: w.lastActivity + w.remindMin * MIN,
+      markReminded: false,
+      ghFreshSince: null, // 你刚互动过：GH 追踪重置
+      capNotified: false,
+      capNotifiedAt: null,
+    };
   }
+
+  // GitHub 第二信号：last_used_at 是否在 10 分钟内刷新过
+  // （VS Code 打字、网页操作、SSH 连接、以及终端输出都会刷新它）
+  const ghFresh = w.ghLastUsedAt !== null && (w.now - w.ghLastUsedAt) / MIN < 10;
 
   // 2) 提醒窗口内：提示一次（防轰炸：本轮窗口只发一次）
   if (idleMin < w.autostopMin) {
@@ -101,43 +149,134 @@ export function evalWatch(w: WatchInput): WatchDecision {
         stop: false,
         nextCheck: w.lastActivity + w.autostopMin * MIN,
         markReminded: false,
+        ghFreshSince: w.ghFreshSince,
+        capNotified: w.capNotified,
+        capNotifiedAt: w.capNotifiedAt,
       };
     }
     const later = Math.max(0, w.autostopMin - idleMin);
+    // GH 侧活跃时不承诺自动关机会不会执行——它会被无限推迟，说了不算
+    const tail = ghFresh
+      ? `看起来你还在别处（VS Code／网页／SSH）干活，先不打扰。不用了记得发「停止开发」省额度。`
+      : w.botStarted && w.autostopEnabled
+        ? `再不理我就自动关机（约 ${fmtDur(later)}后）。在干活就随便回我一个字。`
+        : `不用了就发「停止开发」，我帮你关机省额度。`;
     return {
-      notify:
-        `⏰ 开发机已运行 ${fmtDur(runMin)}，你已 ${fmtDur(idleMin)} 没和我说过话。\n` +
-        (w.botStarted && w.autostopEnabled
-          ? `再不理我就自动关机（约 ${fmtDur(later)}后）。在干活就随便回我一个字。`
-          : `不用了就发「停止开发」，我帮你关机省额度。`),
+      notify: `⏰ 开发机已运行 ${fmtDur(runMin)}，你已 ${fmtDur(idleMin)} 没和我说过话。\n` + tail,
       stop: false,
       nextCheck: w.lastActivity + w.autostopMin * MIN,
       markReminded: true,
+      ghFreshSince: w.ghFreshSince,
+      capNotified: w.capNotified,
+      capNotifiedAt: w.capNotifiedAt,
     };
   }
 
   // 3) 超过自动关机阈值 —— 先看 GitHub 第二信号
-  if (w.ghLastUsedAt !== null) {
-    const ghIdleMin = (w.now - w.ghLastUsedAt) / MIN;
-    if (ghIdleMin < 10) {
-      // 你正在 VS Code / 网页 / SSH 里干活：绝不打扰，推迟 30 分钟再查
-      return { notify: null, stop: false, nextCheck: w.now + 30 * MIN, markReminded: false };
+  if (ghFresh) {
+    // GH 说「有人在用」。可能性有二，API 上完全无法区分：
+    //   (a) 你在 VS Code / 网页 / SSH 里正经干活
+    //   (b) dev server 刷日志，被动刷新 last_used_at，人早走了
+    // (a) 不能误杀，所以先推迟；但推迟必须有上限，否则 (b) 会无限续命烧掉整晚额度。
+    const freshSince = w.ghFreshSince ?? w.now; // 首次发现活跃：从此刻开始计时
+    const freshMin = (w.now - freshSince) / MIN;
+    const capHit = w.ghCapMin > 0 && idleMin >= w.ghCapMin;
+
+    // 触达上限 → 进入「有界确认」：警告一次 + 宽限倒计时，到期才动手
+    if (capHit && w.autostopEnabled && w.ghCapAction === "stop") {
+      if (!w.capNotified) {
+        return {
+          notify:
+            `⚠️ 开发机显示「持续活跃」已 ${fmtDur(freshMin)}，但你 ${fmtDur(idleMin)} 没和我说过话。\n` +
+            `这很像 dev server 在刷日志给 GitHub 的活跃信号续命（人已离开但机器一直计费）。\n` +
+            `${fmtDur(w.graceMin)}后我会强制关机；在干活就随便回我一个字，立刻取消。`,
+          stop: false,
+          nextCheck: w.now + Math.max(1, w.graceMin) * MIN,
+          markReminded: true,
+          ghFreshSince: freshSince,
+          capNotified: true,
+          capNotifiedAt: w.now,
+        };
+      }
+      const since = w.capNotifiedAt ?? w.now;
+      const waited = (w.now - since) / MIN;
+      if (waited >= w.graceMin) {
+        return {
+          notify:
+            `🛑 疑似闲置：GH 显示活跃但你 ${fmtDur(idleMin)} 无互动，已过 ${fmtDur(w.graceMin)} 宽限期，强制关机` +
+            `（本轮共运行 ${fmtDur(runMin)}）。需要时发「开始开发」重新开机。`,
+          stop: true,
+          nextCheck: null,
+          markReminded: false,
+          ghFreshSince: null,
+          capNotified: false,
+          capNotifiedAt: null,
+        };
+      }
+      // 宽限期未走完：等到宽限点再判
+      return {
+        notify: null,
+        stop: false,
+        nextCheck: since + w.graceMin * MIN,
+        markReminded: false,
+        ghFreshSince: freshSince,
+        capNotified: true,
+        capNotifiedAt: since,
+      };
     }
+
+    // 触达上限但自动关机被关闭（或 action=notify）：只提醒一次，绝不动手
+    if (capHit && !w.capNotified) {
+      return {
+        notify:
+          `⚠️ 开发机显示「持续活跃」已 ${fmtDur(freshMin)}，但你 ${fmtDur(idleMin)} 没和我说过话` +
+          `（疑似 dev server 刷日志在给 GitHub 的活跃信号续命）。\n` +
+          `当前为「只提醒、不自动关机」模式，我不会动手；不用了请发「停止开发」省额度。`,
+        stop: false,
+        nextCheck: w.now + 60 * MIN,
+        markReminded: true,
+        ghFreshSince: freshSince,
+        capNotified: true,
+        capNotifiedAt: w.now,
+      };
+    }
+
+    // 未触达上限：常规推迟 30 分钟（保留 GH 追踪起点）
+    return {
+      notify: null,
+      stop: false,
+      nextCheck: w.now + 30 * MIN,
+      markReminded: false,
+      ghFreshSince: freshSince,
+      capNotified: w.capNotified,
+      capNotifiedAt: w.capNotifiedAt,
+    };
   }
 
-  // 4) 双信号都空闲 → 执行关机策略
+  // 4) 双信号都空闲 → 重置 GH 追踪，执行关机策略
   if (w.botStarted && w.autostopEnabled) {
     return {
       notify: `🛑 闲置超时：已 ${fmtDur(idleMin)} 无互动，自动关机（本轮共运行 ${fmtDur(runMin)}）。需要时发「开始开发」重新开机。`,
       stop: true,
       nextCheck: null,
       markReminded: false,
+      ghFreshSince: null,
+      capNotified: false,
+      capNotifiedAt: null,
     };
   }
 
   // 5) observed（非 bot 开机）：提醒一次后 2 小时静默，防刷屏
   if (w.reminded) {
-    return { notify: null, stop: false, nextCheck: w.now + 120 * MIN, markReminded: false };
+    return {
+      notify: null,
+      stop: false,
+      nextCheck: w.now + 120 * MIN,
+      markReminded: false,
+      ghFreshSince: null,
+      capNotified: w.capNotified,
+      capNotifiedAt: w.capNotifiedAt,
+    };
   }
   return {
     notify:
@@ -148,6 +287,9 @@ export function evalWatch(w: WatchInput): WatchDecision {
     stop: false,
     nextCheck: w.now + 120 * MIN, // 2 小时静默期后再提醒
     markReminded: true,
+    ghFreshSince: null,
+    capNotified: false,
+    capNotifiedAt: null,
   };
 }
 

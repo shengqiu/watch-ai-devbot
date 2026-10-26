@@ -76,11 +76,13 @@ export class AssistantDO extends DurableObject<Env> {
     // 端点集中解析（默认官方地址，可用环境变量覆盖，见 src/config.ts）
     const ep = endpoints(env);
     this.tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN ?? "", ep.telegramApiBase);
-    // SQLite 建表（幂等）；schema 版本标记避免每次唤醒都跑 DDL
-    void this.ctx.storage.get("schema_v1").then((done) => {
+    // SQLite 建表（幂等）；schema 版本标记避免每次唤醒都跑 DDL。
+    // v1→v2：新增 cs_runtime 表（看门狗运行时长账本）。DDL 全部 IF NOT EXISTS，
+    // 升级标记即重跑一遍，老表不受影响。
+    void this.ctx.storage.get("schema_v2").then((done) => {
       if (done) return;
       this.ctx.storage.sql.exec(SCHEMA_SQL);
-      void this.ctx.storage.put("schema_v1", true);
+      void this.ctx.storage.put("schema_v2", true);
     });
   }
 
@@ -267,8 +269,14 @@ export class AssistantDO extends DurableObject<Env> {
       return;
     }
     if (/^(停止开发|关掉开发机|\/halt)[，。!！\s]*$/i.test(trimmed)) {
-      await this.closeEpisode();
-      await this.reply(m.chatId, await this.handleStopDev());
+      // 先停机（核心动作，不容失败），再落账（记账失败不应阻断停机）
+      const reply = await this.handleStopDev();
+      try {
+        await this.closeEpisode();
+      } catch (e) {
+        console.error("[watch] closeEpisode 失败（不影响停机）", e);
+      }
+      await this.reply(m.chatId, reply);
       return;
     }
     if (/^(开发机状态|\/cs)[，。!！\s]*$/i.test(trimmed)) {

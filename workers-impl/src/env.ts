@@ -41,7 +41,7 @@ export interface Env {
   STT_MODEL?: string;
 
   // 行为配置（vars）
-  ALLOWED_USERS?: string; // 逗号分隔的 chat_id 白名单；空 = 放开
+  ALLOWED_USERS?: string; // 逗号分隔的 user_id 白名单（from.id）；空 = 放开
   DEFAULT_CODING_PROVIDER?: string;
   DEFAULT_CHAT_PROVIDER?: string;
   MAX_OUTPUT_TOKENS?: string;

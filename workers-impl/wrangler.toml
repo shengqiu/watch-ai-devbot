@@ -42,7 +42,7 @@ RATE_LIMIT_PER_MIN = "20"
 DAILY_CALL_BUDGET = "200"
 REPLY_CHUNK_SIZE = "800"
 # ALLOWED_USERS、VERIFY_ANSWER、ADMIN_KEY 均走 secret（不进公开源码）：
-#   npx wrangler secret put ALLOWED_USERS    # 逗号分隔 chat_id 白名单
+#   npx wrangler secret put ALLOWED_USERS    # 逗号分隔 user_id 白名单（from.id）
 #   npx wrangler secret put VERIFY_ANSWER    # 验证答案
 #   npx wrangler secret put ADMIN_KEY        # 管理端点密钥
 GH_CODESPACE_NAME = "24h-977gg5v9vcp5wq" # 远程开关的 codespace（与主 bot 同一台；2026-10-27 重建后短名变更）

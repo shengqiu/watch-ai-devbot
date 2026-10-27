@@ -132,7 +132,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261027-v4.6";
+const BUILD = "devbot-20261027-v4.7";
 
 /**
  * 未识别输入时的兜底提示。
@@ -353,15 +353,16 @@ export class AssistantDO extends DurableObject<Env> {
     if (await this.seenMsg(key)) return;
     await this.markSeen(key);
 
-    // 2) 白名单（未配置 = 放开，仅建议开发期）。匹配 chat_id 或 user_id 任一即可。
-    //    拒绝时回报 chat_id，方便管理员把自己加白（只回一次/分钟，避免被刷屏）。
+    // 2) 白名单（未配置 = 放开，仅建议开发期）。**只认 user_id（from.id）**，
+    //    不认 chat_id——群聊里 chat_id 是群号不是人，按 chat_id 放行会把整个群放进来。
+    //    拒绝时回报 user_id，方便管理员把该号加白（只回一次/分钟，避免被刷屏）。
     const allowed = (this.env.ALLOWED_USERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (allowed.length > 0 && !allowed.includes(m.chatId) && !allowed.includes(m.userId)) {
-      console.log(`[tg] 非白名单 chat=${m.chatId}，拒绝`);
+    if (allowed.length > 0 && !allowed.includes(m.userId)) {
+      console.log(`[tg] 非白名单 user=${m.userId}（chat=${m.chatId}），拒绝`);
       if (await this.allowRate(m.chatId)) {
         await this.reply(
           m.chatId,
-          `未授权用户。你的 chat_id 是 ${m.chatId}，请联系管理员加入白名单。`,
+          `未授权用户。你的 user_id 是 ${m.userId}，请联系管理员加入白名单。`,
         );
       }
       return;

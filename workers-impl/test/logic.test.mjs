@@ -12,8 +12,10 @@ import {
   DEFAULT_GEMINI_MODEL,
   buildKeyScript,
   buildStatusScript,
+  buildModelsScript,
   buildNewSessionScript,
   parseGeminiArgs,
+  parseModelChain,
   previewPrompt,
   sanitizeModel,
   b64Utf8,
@@ -899,7 +901,8 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("准备模式不跑 prompt", prep.includes("-p "), false);
 
   const run = buildGeminiScript({ prompt: "hi", model: "flash" });
-  check("运行模式带 -p", run.includes('-p "$(cat /tmp/ws-gemini-prompt.txt)"'), true);
+  check("问题落文件（避开转义）", run.includes('P="$(cat /tmp/ws-gemini-prompt.txt)"'), true);
+  check("运行模式带 -p", run.includes('-p "$P"'), true);
   check("运行模式带模型", run.includes("-m flash"), true);
   check("stdin 重定向 /dev/null（防偷吃后续命令行）", run.includes("</dev/null"), true);
   check("yolo 审批（无人值守没法按 y）", run.includes("--approval-mode=yolo"), true);
@@ -1206,6 +1209,61 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("报错给出补 secret 的路径", run.includes("Settings → Codespaces → GEMINI_API_KEY"), true);
   check("报错给出临时替代命令", run.includes("/gemini key <KEY>"), true);
   check("报错不再说「还没有 Gemini API key」", run.includes("还没有 Gemini API key"), false);
+}
+
+// ---- 免费模型链：配额分桶 → 用完一个换下一个 ----
+{
+  // 链解析
+  check("空配置用默认链", parseModelChain(undefined).length >= 3, true);
+  check("默认链首是 3.6-flash", parseModelChain(undefined)[0], "gemini-3.6-flash");
+  check("逗号分隔", parseModelChain("a-1,b-2").join(","), "a-1,b-2");
+  check("空格分隔也行", parseModelChain("a-1 b-2").join(","), "a-1,b-2");
+  check("去重", parseModelChain("a-1,a-1").join(","), "a-1");
+  check("非法名被丢弃", parseModelChain("ok-1,bad/../x").join(","), "ok-1");
+  check("全非法回落默认链", parseModelChain(",,;/,").length >= 3, true);
+
+  // 自动脚本：循环 + 可重试判定 + 记住成功模型
+  const auto = buildGeminiScript({ prompt: "hi" });
+  check("自动模式遍历链", auto.includes("for m in $CHAIN"), true);
+  check("链写进脚本", auto.includes('CHAIN="gemini-3.6-flash'), true);
+  check("记住上次成功的模型", auto.includes("gemini-model"), true);
+  check("上次成功的提到最前", auto.includes("CHAIN=\"$last"), true);
+  check("识别配额错误", auto.includes("RESOURCE_EXHAUSTED"), true);
+  check("识别 429", auto.includes("429"), true);
+  check("识别过载 503", auto.includes("503"), true);
+  check("识别模型下线 404", auto.includes("no longer available"), true);
+  check("换模型时给一行提示", auto.includes("换下一个免费模型"), true);
+  check("说明上下文接不上", auto.includes("之前的对话上下文接不上"), true);
+  check("换模型不硬续旧会话", auto.includes('[ -z "$tried" ]'), true);
+  check("全失败给总结", auto.includes("链上的免费模型都试过了"), true);
+  check("自动模式没有写死单个 -m", auto.includes('-m "$m"'), true);
+
+  // 固定模型：只跑那一个，不偷偷换
+  const pin = buildGeminiScript({ prompt: "hi", model: "gemini-3.5-flash" });
+  check("固定模式带 -m 名字", pin.includes("-m gemini-3.5-flash"), true);
+  check("固定模式不进入循环", pin.includes("for m in $CHAIN"), false);
+  check("固定模式记住选择", pin.includes("gemini-model"), true);
+
+  // status 两种形态
+  const autoSt = buildStatusScript("", ["a-1", "b-2"]);
+  check("status 自动模式标注链", autoSt.includes("模型：自动（链：a-1 → b-2）"), true);
+  check("status 自动模式显示优先项", autoSt.includes("优先："), true);
+  const pinSt = buildStatusScript("gemini-3.5-flash", ["a-1"]);
+  check("status 固定模式标注固定", pinSt.includes("模型：固定 gemini-3.5-flash"), true);
+  check("status 固定模式提示怎么回链", pinSt.includes("model auto"), true);
+
+  // 参数解析
+  check("/gemini models", parseGeminiArgs("models").kind, "models");
+  check("/gemini ls 是别名", parseGeminiArgs("ls").kind, "models");
+  check("model auto → auto", parseGeminiArgs("model auto").model, "auto");
+  check("model reset → auto", parseGeminiArgs("m reset").model, "auto");
+  check("model <名字> 保留", parseGeminiArgs("model gemini-3.5-flash").model, "gemini-3.5-flash");
+
+  // 清单脚本：标出链中成员，过滤非对话模型
+  const models = buildModelsScript(["a-1"]);
+  check("清单标 ✅", models.includes('echo "  ✅ $m"'), true);
+  check("清单过滤 embedding", models.includes("embedding"), true);
+  check("清单走 REST 列表", models.includes("generativelanguage.googleapis.com/v1beta/models"), true);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

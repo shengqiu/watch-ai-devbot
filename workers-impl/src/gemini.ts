@@ -25,6 +25,42 @@ export const GEMINI_REPO = "/workspaces/watch-ai-assistant";
  * 这里给一个当前可用的兜底，运行时可用 Worker 变量 GEMINI_MODEL 覆盖。
  */
 export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
+/**
+ * 免费额度下的**备用模型链**（顺序 = 尝试顺序）。
+ *
+ * 为什么需要它：Google 的免费配额是**按模型分桶**的，一个模型当天用尽不影响别的。
+ * 实测（2026-10-27，同一个 key）：
+ *   gemini-3.6-flash / 3.5-flash / flash-lite-latest / 3.5-flash-lite / 3.1-flash-lite → 200
+ *   gemini-3.7-flash → 503（高负载）
+ *   gemini-3.8-flash、gemini-flash-latest → 20 秒零字节（**挂住**，不是报错）
+ *   gemini-3.1-pro-preview / pro-latest / 4-argon → 429（免费额度不含）
+ * 所以默认链只放「能真正返回」的模型；会挂住的那两个故意不进链——它们会让每次调用
+ * 白等 20~60 秒，比直接失败更糟。想用可以 `/gemini model gemini-3.8-flash` 手动钉。
+ */
+export const DEFAULT_MODEL_CHAIN: string[] = [
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-flash-lite-latest",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+];
+/** 上次成功的模型（持久卷）。下次优先从它开始，避免每次都从链头试错。 */
+export const GEMINI_MODEL_FILE = "$HOME/.config/watch-ai/gemini-model";
+/**
+ * 解析 `GEMINI_MODELS` 环境变量（逗号/空格分隔）为链；非法名直接丢弃。
+ * 空或全非法 → 返回默认链，绝不返回空数组（空数组等于「没有模型可跑」）。
+ */
+export function parseModelChain(raw: string | undefined): string[] {
+  const out: string[] = [];
+  for (const piece of (raw ?? "").split(/[\s,]+/)) {
+    const m = piece.trim();
+    if (!m) continue;
+    // 复用 sanitizeModel 的白名单（它返回 "-m xxx"，这里只要名字部分）
+    const ok = sanitizeModel(m).replace(/^-m\s+/, "");
+    if (ok && !out.includes(ok)) out.push(ok);
+  }
+  return out.length ? out : [...DEFAULT_MODEL_CHAIN];
+}
 /** API key 落盘位置（与 agent key 同目录，持久卷，重启不丢）。 */
 export const GEMINI_KEY_FILE = "$HOME/.config/watch-ai/gemini-key";
 /**
@@ -73,8 +109,10 @@ export function sanitizeModel(model: string | undefined): string {
 export interface GeminiRunOpts {
   /** 要问的问题；不传 = 只做环境准备（装 CLI / 查 key） */
   prompt?: string;
-  /** 模型（flash / pro / gemini-2.5-pro…） */
+  /** 用户手动钉死的模型。**设了就不自动切换**（用户的选择优先于我们的猜测）。 */
   model?: string;
+  /** 免费模型链（按顺序尝试）。`model` 为空时才生效。 */
+  chain?: string[];
   /** 是否允许续用上次会话（默认 true） */
   resume?: boolean;
 }
@@ -175,19 +213,65 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
 
   // 问题走 base64 落临时文件：彻底避开引号 / 换行 / $ 变量展开的转义地狱
   L.push(`printf %s '${b64Utf8(prompt)}' | base64 -d > /tmp/ws-gemini-prompt.txt`);
-  L.push(`G=""`);
-  if (resume) L.push(`[ -f "${GEMINI_SESSION_MARK}" ] && G="-r latest"`);
-  const flags = ["gemini", "$G", "--skip-trust", "--approval-mode=yolo", model, '-p "$(cat /tmp/ws-gemini-prompt.txt)"', "</dev/null"]
-    .filter(Boolean)
-    .join(" ");
+  L.push(`P="$(cat /tmp/ws-gemini-prompt.txt)"`);
+
   // 输出过一道 grep：CLI 每次启动都会在 stderr 打「YOLO mode is enabled…」（还打两遍），
   // 在 Telegram 里就是每条回答前的两行噪音。-color / Ripgrep 那两条同理兜底。
   // --line-buffered 保住流式（否则 grep 会攒到进程退出才吐）；退出码用 PIPESTATUS[0] 取。
-  const NOISE = "^(YOLO mode is enabled|Warning: .*-color support|Warning: True color|Ripgrep is not available|Attempt [0-9]+ failed)";
-  L.push(`${flags} 2>&1 | grep --line-buffered -vE '${NOISE}'`);
-  L.push(`rc=\${PIPESTATUS[0]}`);
-  // 只有成功才允许下一次 -r latest（失败时清掉标记，下条自动回到全新会话）
-  L.push(`if [ $rc -eq 0 ]; then mkdir -p "$(dirname "${GEMINI_SESSION_MARK}")"; touch "${GEMINI_SESSION_MARK}"; fi`);
+  const NOISE =
+    "^(YOLO mode is enabled|Warning: .*-color support|Warning: True color|Ripgrep is not available|Attempt [0-9]+ failed)";
+
+  if (model) {
+    // 用户钉了模型：只跑它，不偷偷换（否则「我明明指定了 X」会变成扯不清的谜题）
+    L.push(`OUT=/tmp/ws-gemini-out.txt`);
+    L.push(`G=""`);
+    if (resume) L.push(`[ -f "${GEMINI_SESSION_MARK}" ] && G="-r latest"`);
+    L.push(`gemini $G ${model} --skip-trust --approval-mode=yolo -p "$P" </dev/null 2>&1 | grep --line-buffered -vE '${NOISE}' | tee "$OUT"`);
+    L.push(`rc=\${PIPESTATUS[0]}`);
+    L.push(`if [ $rc -eq 0 ]; then mkdir -p "$(dirname "${GEMINI_SESSION_MARK}")"; touch "${GEMINI_SESSION_MARK}"; printf %s '${model.replace(/^-m\s+/, "")}' > "${GEMINI_MODEL_FILE}"; fi`);
+    L.push(`exit $rc`);
+    L.push(`)`);
+    return L.join("\n");
+  }
+
+  // 自动模式：按链依次尝试。可重试的失败（配额 / 过载 / 模型下线）就换下一个，
+  // 其它失败（网络、代码问题）立刻停——换模型解决不了那些，只会让用户多等两个来回。
+  const chain = (opts.chain?.length ? opts.chain : DEFAULT_MODEL_CHAIN).slice(0, 6);
+  L.push(`CHAIN="${chain.join(" ")}"`);
+  L.push(`MODELF="${GEMINI_MODEL_FILE}"`);
+  // 上次成功的模型提到最前：稳定性靠它，避免每次都从链头试错
+  L.push(`if [ -f "$MODELF" ]; then`);
+  L.push(`  last="$(cat "$MODELF" 2>/dev/null)"`);
+  L.push(`  case " $CHAIN " in *" $last "*) CHAIN="$last $(printf %s " $CHAIN " | sed "s/ $last / /")" ;; esac`);
+  L.push(`fi`);
+  L.push(`OUT=/tmp/ws-gemini-out.txt`);
+  L.push(`rc=1; tried=""`);
+  L.push(`for m in $CHAIN; do`);
+  L.push(`  : > "$OUT"`);
+  // 第一次尝试才续会话：换模型后旧 session 可能属于另一个模型，硬续容易再失败一次
+  L.push(`  G=""; if [ -z "$tried" ] && [ -f "${GEMINI_SESSION_MARK}" ]; then G="-r latest"; fi`);
+  L.push(`  gemini $G -m "$m" --skip-trust --approval-mode=yolo -p "$P" </dev/null 2>&1 | grep --line-buffered -vE '${NOISE}' | tee "$OUT"`);
+  L.push(`  rc=\${PIPESTATUS[0]}`);
+  L.push(`  if [ $rc -eq 0 ]; then`);
+  L.push(`    mkdir -p "$(dirname "${GEMINI_SESSION_MARK}")"; touch "${GEMINI_SESSION_MARK}"`);
+  L.push(`    printf %s "$m" > "$MODELF"`);
+  L.push(`    [ -n "$tried" ] && echo "" && echo "✅ 本次由 $m 回答（前面试过：$tried）"`);
+  L.push(`    break`);
+  L.push(`  fi`);
+  // 判定是否「换个模型就能好」：配额（429/RESOURCE_EXHAUSTED）、过载（503/UNAVAILABLE）、
+  // 模型下线（404/NOT_FOUND/no longer available）。其余错误立即放弃。
+  L.push(`  if grep -qiE 'RESOURCE_EXHAUSTED|exceeded your current quota|quota|429|UNAVAILABLE|overloaded|high demand|503|NOT_FOUND|not found|no longer available|404' "$OUT"; then`);
+  // 第一次失败意味着「-r latest 续不上」，换的模型只能开新会话。不说清楚，
+  // 用户会以为它忘了前面聊的内容——那是另一类 bug，不能混在一起。
+  L.push(`    [ -z "$tried" ] && echo "   （换模型后是新会话，之前的对话上下文接不上）"`);
+  L.push(`    tried="$tried $m"`);
+  L.push(`    echo ""`);
+  L.push(`    echo "⚠️ $m 不可用（配额 / 过载 / 下线），换下一个免费模型…"`);
+  L.push(`    continue`);
+  L.push(`  fi`);
+  L.push(`  break`);
+  L.push(`done`);
+  L.push(`if [ $rc -ne 0 ] && [ -n "$tried" ]; then echo ""; echo "❌ 链上的免费模型都试过了：$tried"; echo "   过一会儿再试，或 /gemini model <名字> 指定一个。"; fi`);
   L.push(`exit $rc`);
   L.push(`)`);
   return L.join("\n");
@@ -207,8 +291,10 @@ export function buildKeyScript(key: string): string {
   ].join("\n");
 }
 
-/** 环境自检：装没装 / 有没有 key / 有没有可续的会话。 */
-export function buildStatusScript(model?: string): string {
+/** 环境自检：装没装 / 有没有 key / 模型链 / 有没有可续的会话。 */
+export function buildStatusScript(model?: string, chain?: string[]): string {
+  const pinned = model ? sanitizeModel(model).replace(/^-m\s+/, "") : "";
+  const list = chain?.length ? chain : DEFAULT_MODEL_CHAIN;
   return [
     "(",
     `cd ${GEMINI_REPO} 2>/dev/null || echo "⚠️ 仓库目录不存在：${GEMINI_REPO}"`,
@@ -223,9 +309,38 @@ export function buildStatusScript(model?: string): string {
     `  secrets) echo "认证：✓ 从 .env-secrets 现取（agent 未被 post-start 拉起，属正常兜底）" ;;`,
     `  *)       echo "认证：✗ 三处都没有 key（secret 被删了？补 GEMINI_API_KEY，或发 /gemini key <KEY>）" ;;`,
     `esac`,
-    `echo "模型：${model ? sanitizeModel(model).replace(/^-m\s+/, "") : DEFAULT_GEMINI_MODEL}（/gemini model <名字> 可换）"`,
+    pinned
+      ? `echo "模型：固定 ${pinned}（不自动切换；/gemini model auto 回到链）"`
+      : `echo "模型：自动（链：${list.join(" → ")}）"; last="$(cat ${GEMINI_MODEL_FILE} 2>/dev/null)"; echo "优先：\${last:-${list[0]}}（上次成功的会提到最前）"`,
     `if [ -f "${GEMINI_SESSION_MARK}" ]; then echo "会话：有（下条会用 -r latest 续）"; else echo "会话：无（下条开新会话）"; fi`,
     `echo "目录：$(pwd)"`,
+    ")",
+  ].join("\n");
+}
+
+/**
+ * 列出账号可见的对话模型，并标出哪些在当前链里（✅）。
+ *
+ * 为什么走 REST 而不是 CLI：CLI 没有列模型的子命令，而 `GET /v1beta/models`
+ * 是同一个 key 就能查的权威来源。过滤掉明显不能聊天的（embedding / image / tts /
+ * live / transcribe…），否则 60 多个名字里混着 nano-banana 只会更难选。
+ */
+export function buildModelsScript(chain?: string[]): string {
+  const list = chain?.length ? chain : DEFAULT_MODEL_CHAIN;
+  return [
+    "(",
+    ...resolveKeyLines(),
+    `if [ -z "\${GEMINI_API_KEY:-}" ]; then echo "❌ 没有 key，先发 /gemini key <KEY>"; exit 2; fi`,
+    `echo "链（自动切换顺序）：${list.join(" → ")}"`,
+    `last="$(cat ${GEMINI_MODEL_FILE} 2>/dev/null)"; [ -n "$last" ] && echo "上次成功：$last"`,
+    `echo ""; echo "账号可见的对话模型（✅ = 已在链中）："`,
+    `curl -s --max-time 20 "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000" -H "x-goog-api-key: $GEMINI_API_KEY" \\`,
+    `  | tr ',' '\\n' | grep -o '"name": *"models/[^"]*"' | sed 's|.*models/||; s|"||' \\`,
+    `  | grep -viE 'embedding|aqa|imagen|veo|tts|live|audio|transcribe|lyria|nano-banana|robotics|computer-use|deep-research|antigravity|omni|image' \\`,
+    `  | sort -u | while read -r m; do`,
+    `      case " ${list.join(" ")} " in *" $m "*) echo "  ✅ $m" ;; *) echo "     $m" ;; esac`,
+    `    done`,
+    `echo ""; echo "用法：/gemini model <名字> 固定；/gemini model auto 回到链"`,
     ")",
   ].join("\n");
 }
@@ -245,6 +360,7 @@ export type GeminiAction =
   | { kind: "new" }
   | { kind: "key"; key: string }
   | { kind: "model"; model: string }
+  | { kind: "models" }
   | { kind: "help" };
 
 /**
@@ -253,9 +369,10 @@ export type GeminiAction =
  *   （空）           → 打开模式
  *   off / exit      → 关闭模式
  *   status          → 自检
+ *   models          → 列出账号可见的模型（标出链中的）
  *   new / reset     → 新会话
  *   key <KEY>       → 写 key
- *   model <名字>    → 换模型
+ *   model <名字>    → 固定模型；`model auto` 回到自动链
  *   help            → 单条帮助
  *   其它任何文本     → 当作一次性提问
  */
@@ -267,10 +384,15 @@ export function parseGeminiArgs(args: string): GeminiAction {
   const key = head.toLowerCase();
   if (key === "off" || key === "exit" || key === "quit") return { kind: "off" };
   if (key === "status") return { kind: "status" };
+  if (key === "models" || key === "ls") return { kind: "models" };
   if (key === "new" || key === "reset") return { kind: "new" };
   if (key === "help") return { kind: "help" };
   if (key === "key" || key === "auth") return tail ? { kind: "key", key: tail } : { kind: "help" };
-  if (key === "model" || key === "m") return tail ? { kind: "model", model: tail } : { kind: "help" };
+  if (key === "model" || key === "m") {
+    if (!tail) return { kind: "help" };
+    // auto = 交还给免费链（与「固定某个模型」相对）
+    return { kind: "model", model: /^(auto|reset|off|default|any)$/i.test(tail) ? "auto" : tail };
+  }
   return { kind: "ask", prompt: raw };
 }
 

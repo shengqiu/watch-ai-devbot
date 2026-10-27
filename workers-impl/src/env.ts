@@ -22,6 +22,12 @@ export interface Env {
   GEMINI_API_KEY?: string;
   /** Gemini CLI 默认模型（var；不配则用代码兜底 DEFAULT_GEMINI_MODEL）。 */
   GEMINI_MODEL?: string;
+  /**
+   * 免费模型链（var；逗号/空格分隔，按顺序尝试）。
+   * 配额是按模型分桶的，所以填多个不同型号才能真正「用完一个换下一个」。
+   * 不配则用代码里的 DEFAULT_MODEL_CHAIN。
+   */
+  GEMINI_MODELS?: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
   DEEPSEEK_API_KEY?: string;

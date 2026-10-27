@@ -68,6 +68,11 @@ AGENT_ID = ""                      # 期望的 agent 身份（codespace 名）�
 # 对 2026 年新发的 key 会返回「no longer available to users」直接 404。
 # 单聊里可用 /gemini model <名字> 覆盖；换默认值改这里即可，无需动代码。
 GEMINI_MODEL = "gemini-3.6-flash"
+# 免费模型链（逗号分隔，按顺序尝试）。免费配额按模型分桶：一个用尽不影响另一个。
+# 2026-10-27 实测：这五个都返回 200；3.7-flash 是 503，3.8-flash / flash-latest 会
+# 「20 秒零字节挂住」（比报错更糟，故不入链），pro / 4-argon 不在免费额度内（429）。
+# 改这里即可调整顺序或换模型，不用改代码。
+GEMINI_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
 # 强制换版开关：DO 被 SSE 钉住时 deploy 不生效（healthz 的 build 不翻）。
 # 改这里的值 = 路由到一个全新 DO 实例，立刻跑新代码，不用等连接断开。
 # 代价：新实例没有旧 storage —— 验证会话重打一次、/gemini 会话模式与暂存提问清零。

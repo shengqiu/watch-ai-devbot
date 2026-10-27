@@ -49,11 +49,12 @@ import { ShellHub, type ShellOutMsg } from "./shell";
 import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest } from "./agent-auth";
 import {
   buildGeminiScript,
-  DEFAULT_GEMINI_MODEL,
   buildKeyScript,
   buildStatusScript,
+  buildModelsScript,
   buildNewSessionScript,
   parseGeminiArgs,
+  parseModelChain,
   previewPrompt,
   sanitizeModel,
 } from "./gemini";
@@ -125,7 +126,7 @@ import {
 //       带时间窗 + nonce 防重放；下行命令由 Worker 签名、agent 验签后才执行，
 //       并绑定 codespace 身份（X-Agent-Id）。另加失败次数封禁，回到「只有这台
 //       Worker 能和这台开发机通信」。
-const BUILD = "devbot-20261027-v4.4";
+const BUILD = "devbot-20261027-v4.5";
 
 /**
  * 未识别输入时的兜底提示。
@@ -763,13 +764,24 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /**
-   * 当前生效的模型：会话级 `/gemini model` > Worker 变量 GEMINI_MODEL > 代码兜底。
-   * 必须有兜底——把模型留给 CLI 自己挑会用已停用的 2.5 系列，直接 404。
+   * 用户是否钉死了模型（`/gemini model <名字>`）。空串 = 自动，按免费链尝试。
+   * 钉死时不自动切换：用户显式指定就该照办，否则「我明明指定了 X」会变成谜题。
    */
-  private async geminiModelInUse(chatId: string): Promise<string> {
-    const own = await this.geminiModel(chatId);
-    const fromEnv = this.env.GEMINI_MODEL?.trim();
-    return own || fromEnv || DEFAULT_GEMINI_MODEL;
+  private async geminiPin(chatId: string): Promise<string> {
+    return (await this.geminiModel(chatId))?.trim() ?? "";
+  }
+
+  /**
+   * 免费模型链（尝试顺序）：
+   *   `GEMINI_MODELS`（逗号/空格分隔）> 代码里的默认链；
+   *   `GEMINI_MODEL` 作为链头保留兼容（老配置只写了一个模型）。
+   * 配额是按模型分桶的，所以链上放多个不同型号才有意义——见 gemini.ts 的实测记录。
+   */
+  private geminiChain(): string[] {
+    const list = parseModelChain(this.env.GEMINI_MODELS);
+    const head = this.env.GEMINI_MODEL?.trim();
+    if (head && !list.includes(head)) return [head, ...list];
+    return list;
   }
 
   /**
@@ -805,19 +817,37 @@ export class AssistantDO extends DurableObject<Env> {
         return;
       case "model": {
         const m = act.model.trim();
+        if (m === "auto") {
+          await this.ctx.storage.delete(`gem_model:${chatId}`);
+          await this.reply(
+            chatId,
+            `🤖 已回到自动：按免费链依次尝试，某个模型配额用尽会自己换下一个。\n链：${this.geminiChain().join(" → ")}`,
+          );
+          return;
+        }
         if (!sanitizeModel(m)) {
-          await this.reply(chatId, `模型名不合法：${m}\n用法：/gemini model flash（或 pro / gemini-2.5-pro）`);
+          await this.reply(
+            chatId,
+            `模型名不合法：${m}\n用法：/gemini model gemini-3.6-flash（或 auto 回到自动链）\n看可用清单：/gemini models`,
+          );
           return;
         }
         await this.ctx.storage.put(`gem_model:${chatId}`, m);
-        await this.reply(chatId, `🤖 模型已切到 ${m}，下一条问题生效。`);
+        await this.reply(chatId, `🤖 已固定 ${m}（固定后不自动切换；/gemini model auto 回到链）`);
         return;
       }
+      case "models":
+        await this.enqueueGemini(chatId, buildModelsScript(this.geminiChain()), "📚 模型清单");
+        return;
       case "new":
         await this.enqueueGemini(chatId, buildNewSessionScript(), "🆕 新会话");
         return;
       case "status":
-        await this.enqueueGemini(chatId, buildStatusScript(await this.geminiModelInUse(chatId)), "🔍 gemini status");
+        await this.enqueueGemini(
+          chatId,
+          buildStatusScript(await this.geminiPin(chatId), this.geminiChain()),
+          "🔍 gemini status",
+        );
         return;
       case "key": {
         // 带密钥的那条消息先删掉（私聊里 bot 可以删自己的消息与用户刚发的消息）
@@ -871,8 +901,8 @@ export class AssistantDO extends DurableObject<Env> {
     const modeHint = prompt ? null : "🤖 Gemini 模式已开：直接发问题即可（/gemini off 退出，行首 ! 仍执行 shell）";
 
     if (this.shell.online()) {
-      const model = await this.geminiModelInUse(chatId);
-      const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt, model }), {
+      const model = await this.geminiPin(chatId);
+      const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt, model, chain: this.geminiChain() }), {
         label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
       });
       if (modeHint) await this.reply(chatId, modeHint);
@@ -962,8 +992,8 @@ export class AssistantDO extends DurableObject<Env> {
     }
 
     const prompt = await this.takeGeminiPrompt(chatId);
-    const model = await this.geminiModelInUse(chatId);
-    const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt: prompt ?? undefined, model }), {
+    const model = await this.geminiPin(chatId);
+    const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt: prompt ?? undefined, model, chain: this.geminiChain() }), {
       label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
     });
     if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");

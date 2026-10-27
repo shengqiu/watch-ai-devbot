@@ -92,7 +92,7 @@ export interface Env {
    * 单例 DO 的名字（var，默认 "singleton"）。**改这个值 = 立刻换一个全新实例**。
    *
    * 为什么需要它：DO 一旦被 SSE 长连接（或密集 alarm）钉住，deploy 之后线上仍是
-   * 旧代码——healthz 里能看到 build 一直不翻。正常恢复要等连接断开 + 平台回收，
+   * 旧代码——用 /status（需 ADMIN_KEY）能看到 build 一直不翻。正常恢复要等连接断开 + 平台回收，
    * 实测可以拖到 5 分钟以上，改一行文案都要等这么久完全不可接受。
    * 这个值是 index.ts 拼 idFromName 用的，在 DO 之外读，所以改完立刻生效。
    *

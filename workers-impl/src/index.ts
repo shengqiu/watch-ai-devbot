@@ -1,6 +1,7 @@
 /**
  * Worker 入口：Telegram 通道。无长连接、无 cron——事件驱动，按需唤醒 DO。
- *   GET  /healthz                 → DO 状态（build 等，部署后验收用；公开只读）
+ *   GET  /healthz                 → 公开存活探针（只回 {ok:true}，不含任何部署/连接信息）
+ *   GET  /status?key=             → 诊断详情（build/identity/shell/auth/来源 IP；需 ADMIN_KEY）
  *   GET  /setup?key=              → 一次性注册 webhook（需 ADMIN_KEY，防重注册攻击）
  *   POST /webhook                 → Telegram 事件推送入口
  *                                   （① 来源 IP 必须是 Telegram 网段 ② 必须带 secret_token 头）
@@ -46,6 +47,17 @@ export default {
       const stub = doStub(env);
 
       if (url.pathname === "/healthz") {
+        // 公开只读存活探针：只回通用 liveness，不暴露任何部署/连接信息
+        // （build/identity/shell/auth/来源 IP 全部挪到需 ADMIN_KEY 的 /status，见安全审查 #7）。
+        return Response.json({ ok: true });
+      }
+
+      if (url.pathname === "/status") {
+        // 诊断详情：仅限管理员。暴露部署身份、shell 在线状态、鉴权模式、最近来源 IP
+        // 这些都属于 operational metadata，不能对匿名公开（/healthz 只回 liveness）。
+        if (adminDenied(env, request)) {
+          return Response.json({ ok: false, error: "需要 ?key=ADMIN_KEY（或 X-Admin-Key 头）" }, { status: 403 });
+        }
         const r = await stub.fetch("http://do/status");
         return Response.json({
           ok: true,

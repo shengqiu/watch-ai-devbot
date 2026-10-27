@@ -131,7 +131,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261027-v4.8";
+const BUILD = "devbot-20261028-v4.9";
 
 /**
  * 未识别输入时的兜底提示。
@@ -159,7 +159,7 @@ export class AssistantDO extends DurableObject<Env> {
   private readonly authFails = new Map<string, { n: number; first: number; until: number }>();
   /** 最近一次通过鉴权的 agent 连接（诊断用：能看出走的是签名还是旧的明文密钥）。 */
   private lastAuth: { mode: "hmac" | "legacy"; at: number; id: string } | null = null;
-  /** 最近一条 webhook 的来源 IP（应始终落在 Telegram 网段内，/healthz 可见）。 */
+  /** 最近一条 webhook 的来源 IP（应始终落在 Telegram 网段内，仅 /status（需 ADMIN_KEY）可见）。 */
   private lastWebhookIp = "";
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -327,7 +327,7 @@ export class AssistantDO extends DurableObject<Env> {
     }
     const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
     if (!timingSafeEq(got, expected)) return new Response("forbidden", { status: 403 });
-    // 记录来源 IP：确认「进来的流量确实来自 Telegram 网段」用，/healthz 可见
+    // 记录来源 IP：确认「进来的流量确实来自 Telegram 网段」用，仅 /status（需 ADMIN_KEY）可见
     this.lastWebhookIp = request.headers.get("CF-Connecting-IP") ?? "";
 
     let update: TgUpdate;

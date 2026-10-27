@@ -27,6 +27,17 @@ export const GEMINI_REPO = "/workspaces/watch-ai-assistant";
 export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
 /** API key 落盘位置（与 agent key 同目录，持久卷，重启不丢）。 */
 export const GEMINI_KEY_FILE = "$HOME/.config/watch-ai/gemini-key";
+/**
+ * Codespaces secret 的原始存放处（值为 base64）。
+ *
+ * 为什么需要直接读它：secret 并不是容器的普通环境变量，而是由
+ * `/etc/profile.d/codespaces.sh` 在**登录 shell 且 $SSH_CONNECTION 非空**时才导出。
+ * agent 由 `post-start.sh` 拉起时，那里会主动补一次（见 post-start.sh 的 load_secret），
+ * 但 agent 也可能是手动 `setsid` 拉起、或被杀后由 supervisor 重启的 —— 这两条路上
+ * 环境里就没有 GEMINI_API_KEY，于是 `/gemini` 会误报「还没有 API key」。
+ * 这里读同一份文件做兜底，跟启动方式解耦。
+ */
+export const GEMINI_SECRETS_FILE = "/workspaces/.codespaces/shared/.env-secrets";
 /** 「已有会话」标记：只在一次成功调用后创建。 */
 export const GEMINI_SESSION_MARK = "$HOME/.config/watch-ai/gemini-session";
 /**
@@ -69,6 +80,30 @@ export interface GeminiRunOpts {
 }
 
 /**
+ * 解析 API key 的 bash 片段。三级来源，任一命中就 `export`：
+ *   1. `$GEMINI_API_KEY`            —— post-start.sh 从 secret 注入的环境变量
+ *   2. `~/.config/watch-ai/gemini-key` —— `/gemini key` 写入（持久卷，重启不丢）
+ *   3. `.env-secrets`（base64）      —— 兜底：agent 被手动拉起时环境里没有 #1
+ *
+ * 抽成函数是为了让 buildGeminiScript 和 buildStatusScript 用**同一套**判定，
+ * 否则会出现「真跑能拿到 key，status 却说没有」这种自相矛盾的诊断。
+ */
+export function resolveKeyLines(): string[] {
+  return [
+    `KEYF="${GEMINI_KEY_FILE}"`,
+    `if [ -n "\${GEMINI_API_KEY:-}" ]; then GEMINI_KEY_SRC=env; else`,
+    `  if [ -f "$KEYF" ]; then export GEMINI_API_KEY="$(cat "$KEYF")"; GEMINI_KEY_SRC=file; fi`,
+    `  if [ -z "\${GEMINI_API_KEY:-}" ] && [ -r "${GEMINI_SECRETS_FILE}" ]; then`,
+    `    __e=$(sed -n 's/^GEMINI_API_KEY=//p' "${GEMINI_SECRETS_FILE}" 2>/dev/null | head -1)`,
+    `    if [ -n "\${__e:-}" ]; then export GEMINI_API_KEY="$(printf %s "$__e" | base64 -d 2>/dev/null)"; GEMINI_KEY_SRC=secrets; fi`,
+    `    unset __e`,
+    `  fi`,
+    `fi`,
+    `[ -n "\${GEMINI_KEY_SRC:-}" ] || GEMINI_KEY_SRC=none`,
+  ];
+}
+
+/**
  * 生成一段「准备 + 执行」的 bash 脚本（整体包在子 shell 里）。
  *
  * 为什么包 `( … )`：脚本里要 `exit 2` 这类早退，而开发机里的 bash 是长驻的，
@@ -85,13 +120,12 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
   // 用户级安装落点必须在最前面：全局 prefix 装不进去时 gemini 会落在 ~/.local/bin，
   // 不提前铺好 PATH 就会「明明装成功了却 command not found」。
   L.push(`export PATH="${GEMINI_USER_PREFIX}/bin:$PATH"`);
-  // key 优先环境变量（Codespaces secret），其次文件（/gemini key 写的）
-  L.push(`KEYF="${GEMINI_KEY_FILE}"`);
-  L.push(`if [ -z "\${GEMINI_API_KEY:-}" ] && [ -f "$KEYF" ]; then export GEMINI_API_KEY="$(cat "$KEYF")"; fi`);
+  // key 三级来源：环境变量 → 持久卷文件 → .env-secrets（见 resolveKeyLines 注释）
+  L.push(...resolveKeyLines());
   L.push(`if [ -z "\${GEMINI_API_KEY:-}" ]; then`);
   L.push(`  echo "❌ 还没有 Gemini API key。"`);
-  L.push(`  echo "   发 /gemini key <你的key>（在 aistudio.google.com 申请），"`);
-  L.push(`  echo "   或把它加成 Codespaces secret（GEMINI_API_KEY）后重启机器。"`);
+  L.push(`  echo "   发 /gemini key <你的key>（在 aistudio.google.com 申请）。"`);
+  L.push(`  echo "   或确认 Codespaces secret GEMINI_API_KEY 还在（改完 secret 要重启机器才生效）。"`);
   L.push(`  exit 2`);
   L.push(`fi`);
 
@@ -178,7 +212,14 @@ export function buildStatusScript(model?: string): string {
     `export PATH="${GEMINI_USER_PREFIX}/bin:$PATH"`,
     `if command -v gemini >/dev/null 2>&1; then echo "CLI：✓ $(gemini --version 2>/dev/null | tail -1)（$(command -v gemini)）"; else echo "CLI：✗ 未安装（发 /gemini 自动装）"; fi`,
     `if sudo -n true 2>/dev/null; then echo "sudo：✓ 免密可用"; else echo "sudo：✗ 用不了（不影响 Gemini，安装并不需要它）"; fi`,
-    `if [ -n "\${GEMINI_API_KEY:-}" ]; then echo "认证：✓ 环境变量 GEMINI_API_KEY"; elif [ -f "${GEMINI_KEY_FILE}" ]; then echo "认证：✓ 文件 $(ls -l "${GEMINI_KEY_FILE}" | awk '{print $1}')"; else echo "认证：✗ 没有 key（发 /gemini key <KEY>）"; fi`,
+    // 与执行路径共用同一套解析，避免「能跑但 status 说没 key」
+    ...resolveKeyLines(),
+    `case "\${GEMINI_KEY_SRC:-none}" in`,
+    `  env)     echo "认证：✓ 环境变量 GEMINI_API_KEY（$(printf %s "$GEMINI_API_KEY" | wc -c) 字节）" ;;`,
+    `  file)    echo "认证：✓ 文件 $(ls -l "$KEYF" | awk '{print $1}')" ;;`,
+    `  secrets) echo "认证：✓ 从 .env-secrets 现取（agent 未被 post-start 拉起，属正常兜底）" ;;`,
+    `  *)       echo "认证：✗ 没有 key（发 /gemini key <KEY>）" ;;`,
+    `esac`,
     `echo "模型：${model ? sanitizeModel(model).replace(/^-m\s+/, "") : DEFAULT_GEMINI_MODEL}（/gemini model <名字> 可换）"`,
     `if [ -f "${GEMINI_SESSION_MARK}" ]; then echo "会话：有（下条会用 -r latest 续）"; else echo "会话：无（下条开新会话）"; fi`,
     `echo "目录：$(pwd)"`,

@@ -17,6 +17,8 @@ import {
   previewPrompt,
   sanitizeModel,
   b64Utf8,
+  resolveKeyLines,
+  GEMINI_SECRETS_FILE,
 } from "../src/gemini.js";
 import {
   COMMANDS,
@@ -1172,6 +1174,31 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("off 也放行空 IP", T.webhookVerdict("", "off").allow, true);
   check("只有显式 off 才关", T.guardMode("0"), "off");
   check("怪值回落到 on", T.guardMode("whatever"), "on");
+}
+
+// ---- Gemini key 三级解析（环境 → 持久卷文件 → .env-secrets）----
+// 背景：Codespaces secret 只在 SSH 登录 shell 里由 profile.d 导出；agent 被手动/重启
+// 拉起时环境里没有 GEMINI_API_KEY，而脚本又只认环境变量 + key 文件 → 误报「没有 key」。
+{
+  const lines = resolveKeyLines().join("\n");
+  check("key 解析含 .env-secrets 兜底", lines.includes(GEMINI_SECRETS_FILE), true);
+  check("兜底走 base64 解码", lines.includes("base64 -d"), true);
+  check(
+    "环境变量优先（不覆盖已有值）",
+    lines.includes('if [ -n "${GEMINI_API_KEY:-}" ]; then GEMINI_KEY_SRC=env'),
+    true,
+  );
+  check("有 none 兜底分支", lines.includes("GEMINI_KEY_SRC=none"), true);
+
+  const run = buildGeminiScript({ prompt: "hi" });
+  check("执行脚本带三级兜底", run.includes(".env-secrets"), true);
+  check("执行脚本仍认持久卷文件", run.includes("gemini-key"), true);
+  check("续会话标记仍在", run.includes("gemini-session"), true);
+
+  const st = buildStatusScript();
+  check("status 与执行共用同一套解析", st.includes("GEMINI_KEY_SRC"), true);
+  check("status 说明 secrets 兜底来源", st.includes("从 .env-secrets 现取"), true);
+  check("status 保留模型行（回归）", st.includes("模型："), true);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

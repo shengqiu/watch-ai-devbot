@@ -1,15 +1,17 @@
 /**
  * Worker 入口：Telegram 通道。无长连接、无 cron——事件驱动，按需唤醒 DO。
  *   GET  /healthz                 → 公开存活探针（只回 {ok:true}，不含任何部署/连接信息）
- *   GET  /status?key=             → 诊断详情（build/identity/shell/auth/来源 IP；需 ADMIN_KEY）
- *   GET  /setup?key=              → 一次性注册 webhook（需 ADMIN_KEY，防重注册攻击）
+ *   GET  /status                  → 诊断详情（build/identity/shell/auth/来源 IP；需 X-Admin-Key 头）
+ *   GET  /setup                   → 一次性注册 webhook（需 X-Admin-Key 头，防重注册攻击）
  *   POST /webhook                 → Telegram 事件推送入口
  *                                   （① 来源 IP 必须是 Telegram 网段 ② 必须带 secret_token 头）
- *   GET  /send?key=&text=&chat_id= → 调试推送（需 ADMIN_KEY）
- *   GET  /csdebug?key=            → Codespace 状态诊断（需 ADMIN_KEY）
+ *   GET  /send                    → 调试推送（需 X-Admin-Key 头）
+ *   GET  /csdebug                 → Codespace 状态诊断（需 X-Admin-Key 头）
  *   GET  /shell/stream            → agent 下行命令通道（SSE 长连接，需 HMAC 签名头）
  *   POST /shell/out               → agent 回传命令输出（需 HMAC 签名头）
- *   GET  /shell/status?key=       → shell 通道诊断（需 ADMIN_KEY）
+ *   GET  /shell/status            → shell 通道诊断（需 X-Admin-Key 头）
+ *   管理端点鉴权一律走请求头（Authorization: Bearer <ADMIN_KEY> 或 X-Admin-Key），
+ *   绝不接受 ?key= 查询串——避免密钥被访问日志 / 代理遥测记录（安全审查 #8）。
  */
 import type { Env } from "./env";
 import { endpoints } from "./config";
@@ -19,12 +21,14 @@ import { guardMode, webhookVerdict } from "./telegram-ip";
 // Durable Object 必须从入口导出（wrangler 据此注册绑定）
 export { AssistantDO } from "./bot-do";
 
-/** 管理端点鉴权：ADMIN_KEY secret 未配置 = 全部管理端点拒绝（默认安全）。 */
+/** 管理端点鉴权：ADMIN_KEY secret 未配置 = 全部管理端点拒绝（默认安全）。
+ *  密钥只认请求头（Authorization: Bearer <ADMIN_KEY> 或 X-Admin-Key），绝不接受 URL 查询串，
+ *  避免密钥被访问日志 / 代理遥测记录（安全审查 #8）。 */
 function adminDenied(env: Env, request: Request): boolean {
   const key = env.ADMIN_KEY;
   if (!key) return true;
-  const url = new URL(request.url);
-  const got = url.searchParams.get("key") ?? request.headers.get("X-Admin-Key") ?? "";
+  const auth = request.headers.get("Authorization") ?? request.headers.get("X-Admin-Key") ?? "";
+  const got = auth.startsWith("Bearer ") ? auth.slice(7).trim() : auth;
   return got !== key;
 }
 
@@ -56,7 +60,7 @@ export default {
         // 诊断详情：仅限管理员。暴露部署身份、shell 在线状态、鉴权模式、最近来源 IP
         // 这些都属于 operational metadata，不能对匿名公开（/healthz 只回 liveness）。
         if (adminDenied(env, request)) {
-          return Response.json({ ok: false, error: "需要 ?key=ADMIN_KEY（或 X-Admin-Key 头）" }, { status: 403 });
+          return Response.json({ ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" }, { status: 403 });
         }
         const r = await stub.fetch("http://do/status");
         return Response.json({
@@ -69,7 +73,7 @@ export default {
 
       if (url.pathname === "/setup") {
         if (adminDenied(env, request)) {
-          return Response.json({ ok: false, error: "需要 ?key=ADMIN_KEY（或 X-Admin-Key 头）" }, { status: 403 });
+          return Response.json({ ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" }, { status: 403 });
         }
         if (!env.TELEGRAM_BOT_TOKEN) {
           return Response.json(
@@ -124,8 +128,17 @@ export default {
 
       // 部署后重载：让 DO 换到新构建。鉴权在 DO 内用独立的 DEPLOY_KEY（只给 CI），
       // 不套 ADMIN_KEY —— 这样 CI 不需要拿到管理全站的那把钥匙。
+      // 安全：只接受 POST（状态变更操作），密钥走 Authorization 头（见 bot-do.ts），绝不进 URL。
       if (url.pathname === "/admin/reload") {
-        return stub.fetch(`http://do/admin/reload?${url.searchParams.toString()}`);
+        if (request.method !== "POST") {
+          return new Response("method not allowed", { status: 405 });
+        }
+        return stub.fetch(
+          new Request("http://do/admin/reload", {
+            method: "POST",
+            headers: request.headers,
+          }),
+        );
       }
 
       // DO 内部路由透传（管理端点，统一 ADMIN_KEY 鉴权）
@@ -136,7 +149,7 @@ export default {
         url.pathname === "/shell/status"
       ) {
         if (adminDenied(env, request)) {
-          return Response.json({ ok: false, error: "需要 ?key=ADMIN_KEY（或 X-Admin-Key 头）" }, { status: 403 });
+          return Response.json({ ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" }, { status: 403 });
         }
         return stub.fetch(`http://do${url.pathname}?${url.searchParams.toString()}`);
       }

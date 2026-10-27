@@ -131,7 +131,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261028-v4.9";
+const BUILD = "devbot-20261028-v4.10";
 
 /**
  * 未识别输入时的兜底提示。
@@ -199,8 +199,14 @@ export class AssistantDO extends DurableObject<Env> {
           // 长连接钉住），于是「部署成功、线上版本号不变」。ctx.abort() 直接终止实例，
           // 下一次请求就会用新代码创建新实例 —— 这是 CI 里「部署完调一次」的那一步。
           // 鉴权用独立的 DEPLOY_KEY（只给 CI），不复用 ADMIN_KEY。
-          const k = url.searchParams.get("key") ?? "";
-          if (!this.env.DEPLOY_KEY || !timingSafeEq(k, this.env.DEPLOY_KEY)) {
+          // 安全（安全审查 #8）：只接受 POST，密钥走 Authorization: Bearer <DEPLOY_KEY>
+          // 头（或 X-Deploy-Key 头）—— 绝不进 URL 查询串，避免被访问日志 / 代理遥测记录。
+          if (request.method !== "POST") {
+            return new Response("method not allowed", { status: 405 });
+          }
+          const auth = request.headers.get("Authorization") ?? request.headers.get("X-Deploy-Key") ?? "";
+          const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : auth;
+          if (!this.env.DEPLOY_KEY || !timingSafeEq(token, this.env.DEPLOY_KEY)) {
             return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
           }
           // 先让响应发出去，再自毁：abort 会立刻中断所有在途请求（包括这个响应）
@@ -225,7 +231,7 @@ export class AssistantDO extends DurableObject<Env> {
           }
         }
         case "/patrol":
-          // 看门狗巡检（cron 半小时触发 / 手动 ?key= 触发）：查机器状态并跑 evalWatch
+          // 看门狗巡检（cron 半小时触发 / 手动带 X-Admin-Key 头触发）：查机器状态并跑 evalWatch
           return Response.json(await this.patrol());
         case "/shell/stream": {
           // codespace 内 agent 的下行命令通道（SSE 长连接）。

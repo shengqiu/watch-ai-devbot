@@ -75,7 +75,8 @@ export interface Env {
 
   /**
    * 部署后重载用的密钥（secret，只给 GitHub Actions）。
-   * 部署完成后 CI 调一次 /admin/reload?key=... 让 DO 立刻换到新构建；
+   * 部署完成后 CI 用 POST + Authorization: Bearer <DEPLOY_KEY> 头调一次
+   * /admin/reload 让 DO 立刻换到新构建；密钥绝不进 URL 查询串（安全审查 #8）。
    * 不复用 ADMIN_KEY —— CI 不该拿到管理全站的那把钥匙。未配置 = 该端点 401。
    */
   DEPLOY_KEY?: string;

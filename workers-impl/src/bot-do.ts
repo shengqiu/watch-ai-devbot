@@ -201,6 +201,11 @@ export class AssistantDO extends DurableObject<Env> {
           // 鉴权用独立的 DEPLOY_KEY（只给 CI），不复用 ADMIN_KEY。
           // 安全（安全审查 #8）：只接受 POST，密钥走 Authorization: Bearer <DEPLOY_KEY>
           // 头（或 X-Deploy-Key 头）—— 绝不进 URL 查询串，避免被访问日志 / 代理遥测记录。
+          //
+          // ⚠️ 改这个鉴权方式会踩「自举死锁」：正在跑的实例是旧代码，它只认旧方式，
+          //    会拒绝新格式的 reload → 不自毁 → 永远停在旧版本，新代码上线不了。
+          //    所以要改鉴权，必须同时 bump wrangler.toml 的 DO_KEY（换全新实例跑新代码），
+          //    或让新旧两版同时兼容一段时间。本次 v4.10 就是这样靠 DO_KEY 换版的。
           if (request.method !== "POST") {
             return new Response("method not allowed", { status: 405 });
           }

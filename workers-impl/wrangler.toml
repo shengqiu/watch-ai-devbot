@@ -77,7 +77,7 @@ GEMINI_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-flash-lite-latest,gemi
 # 改这里的值 = 路由到一个全新 DO 实例，立刻跑新代码，不用等连接断开。
 # 代价：新实例没有旧 storage —— 验证会话重打一次、/gemini 会话模式与暂存提问清零。
 # 只在需要强制换版时改；平时保持不动。
-DO_KEY = "singleton-s10"
+DO_KEY = "singleton-s11"
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）

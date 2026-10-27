@@ -100,7 +100,7 @@ export default {
 
       // Shell 通道（codespace 内 agent 反连）：不走 ADMIN_KEY，
       // 由 DO 用 AGENT_KEY 做双向鉴权（agent 只需收命令 + 回传输出，不给它管理权限）。
-      if (url.pathname === "/shell/stream" || url.pathname === "/shell/out") {
+      if (url.pathname === "/shell/stream" || url.pathname === "/shell/out" || url.pathname === "/shell/ping") {
         return stub.fetch(
           new Request(`http://do${url.pathname}?${url.searchParams.toString()}`, {
             method: request.method,

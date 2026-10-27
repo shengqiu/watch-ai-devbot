@@ -45,7 +45,7 @@ import {
   type PendingCmd,
 } from "./verify";
 import { evalWatch, fmtDur, pushAlarm, drainAlarms, type AlarmStore, type AlarmTask } from "./watch";
-import { ShellHub, type ShellOutMsg } from "./shell";
+import { ShellHub, type ShellOutMsg, type ShellPing } from "./shell";
 import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest } from "./agent-auth";
 import {
   buildGeminiScript,
@@ -126,7 +126,13 @@ import {
 //       带时间窗 + nonce 防重放；下行命令由 Worker 签名、agent 验签后才执行，
 //       并绑定 codespace 身份（X-Agent-Id）。另加失败次数封禁，回到「只有这台
 //       Worker 能和这台开发机通信」。
-const BUILD = "devbot-20261027-v4.5";
+// v4.6：修「上一条命令还在跑」锁死 —— 根因是下行帧**没有回执**：SSE 连接半死时
+//       命令写进 controller 不报错、对面却根本没收，Worker 只能枯等 TTL。
+//       现在三件套：① agent 收命令立刻 ack，超时未 ack 就重发（agent 侧幂等）；
+//       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
+//       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
+//       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
+const BUILD = "devbot-20261027-v4.6";
 
 /**
  * 未识别输入时的兜底提示。
@@ -244,6 +250,20 @@ export class AssistantDO extends DurableObject<Env> {
           }
           this.shell.tick(); // 收到回传 = agent 活着，刷新在线时间
           await this.shell.onOutput(body);
+          return Response.json({ ok: true, pending: this.shell.pending() });
+        }
+        case "/shell/ping": {
+          // agent 心跳：唯一可信的「通道真的活着」证据（SSE 写成功在连接半死时不可信）。
+          const raw = await request.text();
+          const bad = await this.guardAgent(request, raw, url.pathname);
+          if (bad) return bad;
+          let ping: ShellPing = {};
+          try {
+            ping = JSON.parse(raw) as ShellPing;
+          } catch {
+            /* 空 body 也允许：至少说明 agent 活着 */
+          }
+          this.shell.onPing(ping);
           return Response.json({ ok: true, pending: this.shell.pending() });
         }
         case "/shell/status":

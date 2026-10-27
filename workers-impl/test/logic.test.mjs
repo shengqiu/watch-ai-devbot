@@ -736,7 +736,110 @@ const {
   check("detach 后离线", hub.online(), false);
 }
 
-// ---- fmtDur ----
+// ---- ShellHub 下行回执：ack 超时重发 → 放弃（修「上一条还在跑」锁死）----
+// 回归背景：2026-10-27 用户被「⌨️ 上一条命令还在跑：🛠 准备 Gemini 环境」锁住，
+// 而 agent.log 里连 exec 都没有 —— 命令被写进了一条**半死**的 SSE，Worker 却
+// 无从分辨。修法：命令下发后必须拿到 ack，拿不到就重发，仍拿不到就解锁。
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sent = [];
+  const written = [];
+  const hub = new ShellHub(async (_c, t) => sent.push(t), { ackMs: 30, maxTries: 3, staleMs: 600000 });
+  hub.attach({ enqueue: (b) => written.push(new TextDecoder().decode(b)) });
+  const frames = () => written.filter((w) => w.includes('"t":"cmd"')).length;
+
+  const q = hub.enqueue("c1", "gemini", { label: "🛠 准备 Gemini 环境" });
+  check("首次下发 1 帧", frames(), 1);
+  await sleep(60);
+  check("没 ack → 自动重发", frames(), 2);
+  await sleep(300); // 30ms → 60ms → 120ms 递增，第 3 次后放弃
+  check("重发到上限后解锁", hub.pending(), 0);
+  check("解锁时说明了原因", sent.join("").includes("自动解锁"), true);
+  check("解锁提示带命令名", sent.join("").includes("准备 Gemini 环境"), true);
+  void q;
+}
+
+// ---- ShellHub：ack 到手就不再重发，且不会被误判成僵尸 ----
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const written = [];
+  const hub = new ShellHub(async () => {}, { ackMs: 40, idleMs: 60, staleMs: 600000 });
+  hub.attach({ enqueue: (b) => written.push(new TextDecoder().decode(b)) });
+  const q = hub.enqueue("c1", "ls");
+  await hub.onOutput({ id: q.id, ack: true });
+  const frames = written.filter((w) => w.includes('"t":"cmd"')).length;
+  await sleep(120);
+  check("已 ack → 不再重发", written.filter((w) => w.includes('"t":"cmd"')).length, frames);
+  check("已 ack → 命令还在队列", hub.pending(), 1);
+
+  // agent 心跳说「在跑的就是它」→ 再久也不能清
+  hub.onPing({ epoch: 100, running: q.id });
+  check("ping 说在跑 → 不清理", hub.reapLost(Date.now() + 10 * 60_000).length, 0);
+  // 心跳说「空闲了」→ 这条确实没了（中途被重启/中断）
+  hub.onPing({ epoch: 100, running: null });
+  check("ping 说空闲 → 判定中断", hub.reapLost(Date.now() + 60_000).length, 1);
+  check("中断后队列清空", hub.pending(), 0);
+}
+
+// ---- ShellHub：agent 重启（epoch 变化）→ 立刻中断它手上的命令 ----
+{
+  const sent = [];
+  const hub = new ShellHub(async (_c, t) => sent.push(t), { ackMs: 60000, staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  hub.onPing({ epoch: 200 });
+  const q = hub.enqueue("c1", "npm run build", { label: "🔨 build" });
+  await hub.onOutput({ id: q.id, ack: true });
+  check("重启前在跑", hub.pending(), 1);
+  hub.onPing({ epoch: 201, running: null });
+  await new Promise((r) => setTimeout(r, 20));
+  check("epoch 变化 → 立刻解锁", hub.pending(), 0);
+  check("说明是 agent 重启导致", sent.join("").includes("agent 重启过"), true);
+}
+
+// ---- ShellHub：发下一条命令时自动清掉失联的那条（用户不用记得 /ctrlc）----
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sent = [];
+  const hub = new ShellHub(async (_c, t) => sent.push(t), { ackMs: 20, staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  hub.onPing({ epoch: 300 }); // 严格模式：running 是权威判据
+  const stuck = hub.enqueue("c1", "old-cmd", { label: "🛠 准备 Gemini 环境" });
+  void stuck;
+  await sleep(90); // > ackMs × 3 = 没送达
+  const next = hub.enqueue("c1", "new-cmd");
+  check("失联命令不再阻塞", next.ok, true);
+  check("新命令已下发", hub.pending(), 1);
+  await sleep(20);
+  check("告知用户已解锁", sent.join("").includes("自动解锁"), true);
+}
+
+// ---- ShellHub：SSE 断开时保留「已送达」的命令（bash 里还在跑）----
+{
+  const hub = new ShellHub(async () => {}, { ackMs: 60000, staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  const q = hub.enqueue("c1", "long build");
+  await hub.onOutput({ id: q.id, ack: true });
+  hub.detach();
+  check("断开后离线", hub.online(), false);
+  check("已送达的命令被保留", hub.pending(), 1);
+}
+
+// ---- ShellHub：在线判定只认 agent 心跳，不信「SSE 写成功」----
+// 回归背景：连接半死时 write 不报错，用它当存活证据会把死通道判成在线，
+// 命令于是被写进虚空。见过 ping 之后必须只认 ping。
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const hub = new ShellHub(async () => {}, { staleMs: 120, ackMs: 60000 });
+  hub.attach({ enqueue: () => {} });
+  check("attach 后在线", hub.online(), true);
+  await sleep(200);
+  check("没有 ping → 判离线", hub.online(), false);
+  hub.onPing({ epoch: 1, running: null });
+  check("收到 ping → 恢复在线", hub.online(), true);
+  check("pingSeen 已置位", hub.snapshot().pingSeen, true);
+}
+
+
 check("fmtDur 0", fmtDur(0), "0分钟");
 check("fmtDur 59", fmtDur(59), "59分钟");
 check("fmtDur 60", fmtDur(60), "1小时");

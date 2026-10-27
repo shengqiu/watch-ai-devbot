@@ -7,6 +7,26 @@ import { clampEffort, modelOrder } from "../src/router/providers.js";
 import { escapeV2, mdToV2 } from "../src/telegram/markdown.js";
 import { chunkText } from "../src/asr.js";
 import { extractIncoming } from "../src/telegram/update.js";
+import {
+  buildGeminiScript,
+  DEFAULT_GEMINI_MODEL,
+  buildKeyScript,
+  buildStatusScript,
+  buildNewSessionScript,
+  parseGeminiArgs,
+  previewPrompt,
+  sanitizeModel,
+  b64Utf8,
+} from "../src/gemini.js";
+import {
+  COMMANDS,
+  matchCommand,
+  looksLikeUnknownSlash,
+  suggestCommand,
+  renderHelp,
+  renderCommandHelp,
+  menuCommands,
+} from "../src/commands.js";
 
 let pass = 0, fail = 0;
 function check(name, got, want) {
@@ -154,7 +174,15 @@ check("语音 mime", v?.voiceMime, "audio/ogg");
 check("无 message 返回 null", extractIncoming({ update_id: 102 }), null);
 
 // ---- Codespace 开发机（beginBoot / checkBoot / stopCodespace / describeState）----
-import { describeState, beginBoot, checkBoot, stopCodespace } from "../src/codespace.js";
+import {
+  describeState,
+  beginBoot,
+  checkBoot,
+  stopCodespace,
+  bootTimeoutReply,
+  BOOT_MAX_ATTEMPTS,
+  BOOT_RETRY_DELAY_MS,
+} from "../src/codespace.js";
 
 // 状态中文化
 check("state Available", describeState("Available"), "运行中");
@@ -198,14 +226,40 @@ function fakeClient(states, calls = []) {
 // 阶段2：Available → 成功
 {
   const c = fakeClient(["Available"]);
-  check("二查成功", (await checkBoot(c)).reply, "开发机启动成功 ✓（运行中）");
+  const r = await checkBoot(c);
+  check("二查成功 ok", r.ok, true);
+  check("二查成功 pending", r.pending, false);
+  check("二查成功 reply", r.reply.includes("启动成功"), true);
 }
 
 // 阶段2：仍 Shutdown → 失败
 {
   const c = fakeClient(["Shutdown"]);
-  check("二查失败提示", (await checkBoot(c)).reply.includes("开机失败"), true);
+  const r = await checkBoot(c);
+  check("二查失败提示", r.reply.includes("开机失败"), true);
+  check("二查失败 pending", r.pending, false);
 }
+
+// 阶段2：Provisioning / Queued 属于「还没好」，不能误报失败（回归：30s 时机器常卡在 Provisioning）
+for (const st of ["Provisioning", "Queued", "Creating", "ProvisioningWithWarning"]) {
+  const c = fakeClient([st]);
+  const r = await checkBoot(c);
+  check(`二查 ${st} pending`, r.pending, true);
+  check(`二查 ${st} 不判失败`, r.ok, false);
+  check(`二查 ${st} 静默（reply 为空）`, r.reply, "");
+}
+
+// 阶段1：已经在启动途中 → 不重复 POST start（会 409），直接进观察模式
+{
+  const c = fakeClient(["Provisioning"]);
+  const p1 = await beginBoot(c);
+  check("启动中不重复 start", c.calls.join(","), "status");
+  check("启动中仍安排二查", p1.scheduleCheck, true);
+  check("启动中文案含「我会告诉你」", p1.reply.includes("我会告诉你"), true);
+}
+
+// 超时收尾文案
+check("超时文案", bootTimeoutReply().includes("2.5 分钟"), true);
 
 // 阶段2：查询异常 → 手动确认提示
 {
@@ -246,7 +300,18 @@ function fakeClient(states, calls = []) {
 }
 
 // ---- 身份验证会话（verify.ts）----
-import { isVerified, isAnswerMatch, normalizeAnswer, nextExpiry, CHALLENGE_TEXT } from "../src/verify.js";
+import {
+  isVerified,
+  isAnswerMatch,
+  normalizeAnswer,
+  nextExpiry,
+  CHALLENGE_TEXT,
+  shouldReplay,
+  previewCmd,
+  PENDING_CMD_TTL_MS,
+  answerFingerprint,
+  looksLikeCommand,
+} from "../src/verify.js";
 
 const T0 = 1_000_000;
 const HALF_H = 30 * 60_000;
@@ -257,16 +322,70 @@ check("已验证（未到期）", isVerified({ exp: T0 + HALF_H }, T0), true);
 check("到期边界=过期", isVerified({ exp: T0 }, T0), false);
 
 check("答案精确匹配", isAnswerMatch("爸爸", "爸爸"), true);
-check("答案带标点", isAnswerMatch("爸爸。", "爸爸"), true);
-check("答案带空格感叹", isAnswerMatch(" 爸爸！ ", "爸爸"), true);
+check("答案首尾空格容忍", isAnswerMatch("  爸爸  ", "爸爸"), true);
+check("答案带了标点 → 不通过", isAnswerMatch("爸爸。", "爸爸"), false);
+check("答案带感叹 → 不通过", isAnswerMatch("爸爸！", "爸爸"), false);
+check("答案多一个字 → 不通过", isAnswerMatch("爸爸爸", "爸爸"), false);
+check("答案少一个字 → 不通过", isAnswerMatch("爸", "爸爸"), false);
+check("答案中间加空格 → 不通过", isAnswerMatch("爸 爸", "爸爸"), false);
+check("大小写不敏感？→ 敏感", isAnswerMatch("ABC", "abc"), false);
 check("错误答案", isAnswerMatch("妈妈", "爸爸"), false);
 check("空答案", isAnswerMatch("", "爸爸"), false);
 check("纯标点答案", isAnswerMatch("。。", "爸爸"), false);
 
 check("归一化去首尾标点", normalizeAnswer("。爸爸！"), "爸爸");
 check("归一化保留中间标点", normalizeAnswer("爸。爸"), "爸。爸");
+
+// ---- 验证词指纹（换词后旧会话立即失效）----
+{
+  const fpA = answerFingerprint("哈哈");
+  const fpB = answerFingerprint("爸爸");
+  check("同词同指纹", answerFingerprint("哈哈"), fpA);
+  check("带标点同指纹", answerFingerprint(" 哈哈！ "), fpA);
+  check("不同词不同指纹", fpA === fpB, false);
+  // 会话绑定指纹：换词后即便没过期也不算已验证
+  const future = T0 + HALF_H;
+  check("指纹匹配 → 已验证", isVerified({ exp: future, fp: fpA }, T0, fpA), true);
+  check("指纹不符（换词）→ 需重新验证", isVerified({ exp: future, fp: fpB }, T0, fpA), false);
+  // 老数据（裸 number → fp 为空）与当前指纹不符 → 重新验证一次
+  check("老会话无指纹 → 需重新验证", isVerified({ exp: future, fp: "" }, T0, fpA), false);
+  check("未配置验证词时老会话仍有效", isVerified({ exp: future, fp: "" }, T0, ""), true);
+}
 check("续期计算", nextExpiry(T0, HALF_H), T0 + HALF_H);
 check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
+
+// ---- 验证前命令暂存（shouldReplay / previewCmd）----
+{
+  const t = 1_700_000_000_000;
+  check("暂存刚存的可重放", shouldReplay({ cmd: "git status", at: t }, t + 1000), true);
+  check("暂存 9 分钟仍可", shouldReplay({ cmd: "ls", at: t }, t + 9 * 60_000), true);
+  check("暂存 11 分钟过期", shouldReplay({ cmd: "ls", at: t }, t + 11 * 60_000), false);
+  check("暂存空命令不重放", shouldReplay({ cmd: "   ", at: t }, t), false);
+  check("暂存缺失不重放", shouldReplay(undefined, t), false);
+  check("暂存坏结构不重放", shouldReplay({ at: t }, t), false);
+  check("时间倒流不重放", shouldReplay({ cmd: "ls", at: t + 5000 }, t), false);
+
+  check("预览短命令原样", previewCmd("git status"), "git status");
+  check("预览多行折叠", previewCmd("cd /tmp\nls -la"), "cd /tmp ⏎ ls -la");
+  check("预览超长截断", previewCmd("x".repeat(200)).endsWith("⋯"), true);
+  check("预览截断长度", previewCmd("x".repeat(200), 10).length, 11);
+  check("TTL 为 10 分钟", PENDING_CMD_TTL_MS, 10 * 60_000);
+}
+
+// ---- 像不像命令（决定验证后补不补执行）----
+{
+  check("像命令 pwd", looksLikeCommand("pwd"), true);
+  check("像命令 git status", looksLikeCommand("git status"), true);
+  check("像命令 cd /tmp", looksLikeCommand("cd /tmp"), true);
+  check("像命令 开始开发（已非指令）", looksLikeCommand("开始开发"), false);
+  check("像命令 开发机状态", looksLikeCommand("开发机状态"), true);
+  check("像命令 /boot", looksLikeCommand("/boot"), true);
+  check("不像命令 你好", looksLikeCommand("你好"), false);
+  check("不像命令 爸爸", looksLikeCommand("爸爸"), false);
+  check("不像命令 哈哈哈", looksLikeCommand("哈哈哈"), false);
+  check("不像命令 空", looksLikeCommand("   "), false);
+  check("不像命令 今天天气不错", looksLikeCommand("今天天气不错"), false);
+}
 
 // ---- 省额度看门狗（watch.ts）----
 import { evalWatch, fmtDur, pushAlarm, drainAlarms } from "../src/watch.js";
@@ -487,13 +606,130 @@ check("关机：不动作", evalWatch(W({ running: false })), {
 {
   const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, autostopEnabled: false }));
   check("autostop 关：不关机", d.stop, false);
-  check("autostop 关：提醒引导手动", d.notify !== null && d.notify.includes("停止开发"), true);
+  check("autostop 关：提醒引导手动", d.notify !== null && d.notify.includes("/halt"), true);
 }
 
 // 运行时长文案含本轮信息
 {
   const d = evalWatch(W({ now: 10_000_000 + 30 * MIN, bootAt: 10_000_000 - 10 * MIN }));
   check("提醒含运行时长", d.notify !== null && d.notify.includes("40分钟"), true);
+}
+
+// ---- 联机 shell（shell.ts：输出清洗 / 分块 / marker 解析 / 队列）----
+const {
+  stripAnsi,
+  sanitizeOutput,
+  chunkOutput,
+  capOutput,
+  markerLine,
+  parseMarkerLine,
+  extractMarkers,
+  ShellHub,
+} = await import("../src/shell.js");
+{
+  const ESC2 = String.fromCharCode(27);
+  check("stripAnsi CSI 颜色", stripAnsi(`${ESC2}[31m红${ESC2}[0m`), "红");
+  check("stripAnsi OSC 标题", stripAnsi(`${ESC2}]0;标题${ESC2}\\after`), "after");
+  check("sanitize CRLF", sanitizeOutput("a\r\nb\rc"), "a\nb\nc");
+  check("sanitize 行尾空白", sanitizeOutput("x   \ny\t\n"), "x\ny\n");
+
+  check("chunkOutput 短文本", chunkOutput("hi", 10), ["hi"]);
+  check("chunkOutput 优先断行", chunkOutput("aaa\nbbb", 4), ["aaa", "bbb"]);
+  check("chunkOutput 无换行硬切", chunkOutput("abcdefgh", 3), ["abc", "def", "gh"]);
+
+  check("capOutput 不截断", capOutput("abc", 10), "abc");
+  {
+    const capped = capOutput("x".repeat(100), 20);
+    check("capOutput 含省略标记", capped.includes("省略"), true);
+    check("capOutput 保留尾", capped.endsWith("x".repeat(8)), true);
+  }
+
+  check("markerLine 拼接", markerLine(0, "/tmp"), "__WS__0__/tmp__");
+  check("parseMarkerLine 正常", parseMarkerLine("__WS__0__/tmp__"), { exit: 0, cwd: "/tmp" });
+  check("parseMarkerLine 非零退出码", parseMarkerLine("__WS__127__/workspaces/x__"), {
+    exit: 127,
+    cwd: "/workspaces/x",
+  });
+  // cwd 含下划线 / 空格也要能正确切分（贪婪匹配 + 末尾 __ 收尾）
+  check("parseMarkerLine 含下划线 cwd", parseMarkerLine("__WS__0__/a/__b__"), { exit: 0, cwd: "/a/__b" });
+  check("parseMarkerLine 普通行", parseMarkerLine("total 12"), null);
+
+  {
+    const r = extractMarkers("out1\n" + markerLine(0, "/tmp") + "\n");
+    check("extractMarkers 文本", r.text, "out1\n");
+    check("extractMarkers exit", r.exit, 0);
+    check("extractMarkers cwd", r.cwd, "/tmp");
+  }
+}
+
+// ---- ShellHub 状态机：离线/排队/输出刷写/串行 ----
+{
+  const sent = [];
+  const hub = new ShellHub(async (chatId, text) => {
+    sent.push({ chatId, text });
+  }, { flushMs: 10, maxChars: 100 });
+
+  check("初始离线", hub.online(), false);
+  const e1 = hub.enqueue("c1", "ls");
+  check("离线时拒绝排队", e1.ok, false);
+  check("离线提示含引导", String(e1.message).includes("shell"), true);
+
+  // 伪造一个 SSE 控制器（只记录写入的字节）
+  const written = [];
+  const ctl = { enqueue: (b) => written.push(new TextDecoder().decode(b)) };
+  hub.attach(ctl);
+  check("attach 后在线", hub.online(), true);
+  check("attach 下发 hello", written.join("").includes('"t":"hello"'), true);
+
+  const q1 = hub.enqueue("c1", "ls -la");
+  check("排队成功", q1.ok, true);
+  check("pending=1", hub.pending(), 1);
+  check("下发 cmd 事件", written.some((w) => w.includes('"t":"cmd"') && w.includes("ls -la")), true);
+  check("串行：第二条被拒", hub.enqueue("c1", "pwd").ok, false);
+
+  // 增量输出：静默窗口到期后推一条（首条带 $ 回显）
+  await hub.onOutput({ id: q1.id, text: "a.txt\n" });
+  await new Promise((r) => setTimeout(r, 40));
+  check("增量刷写出去了", sent.length >= 1, true);
+  check("首条含命令回显", sent[0].text.includes("$ ls -la"), true);
+
+  // 收尾：exit + cwd
+  await hub.onOutput({ id: q1.id, text: "b.txt\n", done: true, exit: 0, cwd: "/tmp" });
+  const last = sent[sent.length - 1];
+  check("收尾含 exit", last.text.includes("exit 0"), true);
+  check("收尾含 cwd", last.text.includes("/tmp"), true);
+  check("命令完成后清空", hub.pending(), 0);
+
+  // 输出超限截断
+  const sent2 = [];
+  const hub2 = new ShellHub(async (chatId, text) => {
+    sent2.push(text);
+  }, { flushMs: 5, maxChars: 50 });
+  hub2.attach({ enqueue: () => {} });
+  const q2 = hub2.enqueue("c1", "yes");
+  await hub2.onOutput({ id: q2.id, text: "z".repeat(500), done: true, exit: 0, cwd: "/tmp" });
+  check("超长输出被掐断", sent2.join("").includes("截断"), true);
+}
+
+// ---- ShellHub 心跳：tick 能恢复在线 ----
+// 回归背景：agent 空闲时不 POST，lastSeen 会冻结在 attach 时刻；90s 后 online()
+// 误判离线导致所有命令被拒。attach() 的 20s SSE 心跳写成功后必须 refresh lastSeen，
+// 这里用 tick() 验证「刷新即恢复在线」这一核心机制。
+{
+  const hub = new ShellHub(async () => {}, { staleMs: 120 });
+  hub.attach({ enqueue: () => {} });
+  check("attach 后在线", hub.online(), true);
+
+  await new Promise((r) => setTimeout(r, 200));
+  check("超 staleMs 无心跳 → 离线", hub.online(), false);
+
+  const stale = hub.seenAt();
+  hub.tick();
+  check("tick 推进 seenAt", hub.seenAt() > stale, true);
+  check("tick 后恢复在线", hub.online(), true);
+
+  hub.detach();
+  check("detach 后离线", hub.online(), false);
 }
 
 // ---- fmtDur ----
@@ -536,6 +772,406 @@ check("fmtDur 155", fmtDur(155), "2小时35分");
   check("drain 取 watch", due2.map((d) => d.kind), ["watch"]);
   check("alarm 清空", calls[calls.length - 1] === null, true);
   Date.now = realNow;
+}
+
+// ---- 开机二查的 chat_id 传递（回归：payload 曾经没被传下去，导致「成功」消息静默丢失）----
+{
+  const m = new Map();
+  const store = {
+    get: async (k) => m.get(k),
+    put: async (k, v) => { m.set(k, v); },
+    delete: async (k) => { m.delete(k); },
+    setAlarm: async () => {},
+  };
+  await pushAlarm(store, { due: 0, kind: "boot_check", payload: { chat_id: "7618809103", attempt: 3 } });
+  const got = (await drainAlarms(store)).find((t) => t.kind === "boot_check");
+  check("boot_check 带 chat_id", got.payload.chat_id, "7618809103");
+  check("boot_check 带 attempt", got.payload.attempt, 3);
+}
+
+// 重试预算：首查 30s + 8×15s = 150s ≈ 2.5 分钟（与 bootTimeoutReply 文案一致）
+check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 1000), 150);
+
+// ---- 指令注册表（commands.ts）：解析 / 帮助 / 菜单 ----
+{
+  // 斜杠形式
+  check("cmd /boot", matchCommand("/boot")?.spec.name, "boot");
+  check("cmd /BOOT 大小写", matchCommand("/BOOT")?.spec.name, "boot");
+  check("cmd /cs", matchCommand("/cs")?.spec.name, "cs");
+  // 中文口语形式
+  // 中文开关机口语已停用（2026-10-27 用户要求：只有 /boot 能开机）
+  check("cmd 开始开发（已停用）", matchCommand("开始开发"), null);
+  check("cmd 开始开发。（已停用）", matchCommand("开始开发。"), null);
+  check("cmd 开机（已停用）", matchCommand("开机"), null);
+  check("cmd 关机（已停用）", matchCommand("关机"), null);
+  check("cmd 停止开发（已停用）", matchCommand("停止开发"), null);
+  check("cmd 帮助", matchCommand("帮助")?.spec.name, "help");
+  // 验证词/开机口令不能撞上任何指令，否则会被指令派发抢走
+  check("cmd 验证词不撞指令", matchCommand("哈哈"), null);
+  check("cmd /? 符号别名", matchCommand("/?")?.spec.name, "help");
+  check("cmd ？全角", matchCommand("？")?.spec.name, "help");
+  // 带参数
+  check("cmd /help boot args", matchCommand("/help boot")?.args, "boot");
+  check("cmd /help 带斜杠参数", matchCommand("/help /boot")?.args, "/boot");
+  // 不该命中的
+  check("cmd 句中不命中", matchCommand("帮我开始开发"), null);
+  check("cmd 普通命令不命中", matchCommand("git status"), null);
+  check("cmd 空", matchCommand("   "), null);
+  check("cmd 绝对路径不命中", matchCommand("/usr/bin/env"), null);
+
+  // 打错的斜杠指令 vs 绝对路径
+  check("unknown /hlep", looksLikeUnknownSlash("/hlep"), true);
+  check("unknown /usr/bin/env", looksLikeUnknownSlash("/usr/bin/env"), false);
+  check("unknown /tmp/a.sh", looksLikeUnknownSlash("/tmp/a.sh"), false);
+  check("unknown 裸斜杠", looksLikeUnknownSlash("/"), false);
+  check("unknown 非斜杠", looksLikeUnknownSlash("pwd"), false);
+
+  // 纠错建议
+  check("suggest /hlep → help", suggestCommand("/hlep"), "help");
+  check("suggest boott → boot", suggestCommand("boott"), "boot");
+  check("suggest 无解 → null", suggestCommand("zzzzzzzz"), null);
+
+  // 帮助渲染
+  const h = renderHelp();
+  check("help 含全部指令", COMMANDS.every((c) => h.includes(`/${c.name}`)), true);
+  check("help 含 shell 说明", h.includes("直接发文字"), true);
+  check("help 含分组图标", h.includes("🖥") && h.includes("⌨️"), true);
+  const one = renderCommandHelp("boot");
+  check("单条帮助无别名则不显示别名行", one.includes("别名"), false);
+  check("单条帮助有别名则显示", renderCommandHelp("help").includes("别名"), true);
+  check("单条帮助认斜杠别名", renderCommandHelp("/halt")?.includes("/halt"), true);
+  check("单条帮助认斜杠", renderCommandHelp("/halt")?.includes("/halt"), true);
+  check("单条帮助不存在 → null", renderCommandHelp("nope"), null);
+
+  // 注册表自检：名字唯一、别名不撞车、详情非空
+  const names = COMMANDS.map((c) => c.name);
+  check("指令名唯一", new Set(names).size, names.length);
+  const allTokens = COMMANDS.flatMap((c) => [c.name, ...c.aliases]).map((s) => s.toLowerCase());
+  check("名字与别名全局唯一", new Set(allTokens).size, allTokens.length);
+  check("每条都有详情", COMMANDS.every((c) => c.detail.length > 0), true);
+
+  // Telegram 菜单：命名必须符合 ^[a-z0-9_]{1,32}$
+  const menu = menuCommands();
+  check("菜单非空", menu.length >= 5, true);
+  check("菜单命名合法", menu.every((m) => /^[a-z0-9_]{1,32}$/.test(m.command)), true);
+  check("菜单描述非空", menu.every((m) => m.description.length > 0 && m.description.length <= 256), true);
+  check("菜单无重复", new Set(menu.map((m) => m.command)).size, menu.length);
+}
+
+// ---- Gemini 接入层（src/gemini.ts）----
+{
+  // base64：中文必须能原样还原（btoa 只吃 latin1，实现里是按 UTF-8 字节转的）
+  const cn = "帮我看下 README 的错别字，然后 git commit";
+  check("base64 中文可还原", Buffer.from(b64Utf8(cn), "base64").toString("utf8"), cn);
+  check("base64 空串", b64Utf8(""), "");
+
+  // 模型白名单：拼进 shell 的命令片段必须挡住注入
+  check("模型正常", sanitizeModel("flash"), "-m flash");
+  check("模型带点", sanitizeModel("gemini-2.5-pro"), "-m gemini-2.5-pro");
+  check("模型去前缀横杠", sanitizeModel("--yolo"), "-m yolo");
+  check("模型注入被拒", sanitizeModel("flash; rm -rf /"), "");
+  check("模型中文被拒", sanitizeModel("模型"), "");
+  check("模型空", sanitizeModel(undefined), "");
+
+  // 参数解析
+  check("gem 空 → open", parseGeminiArgs("").kind, "open");
+  check("gem off", parseGeminiArgs("off").kind, "off");
+  check("gem exit 等价 off", parseGeminiArgs("exit").kind, "off");
+  check("gem status", parseGeminiArgs("status").kind, "status");
+  check("gem new", parseGeminiArgs("new").kind, "new");
+  check("gem key 取值", parseGeminiArgs("key AIza123").key, "AIza123");
+  check("gem key 无值 → help", parseGeminiArgs("key").kind, "help");
+  check("gem model", parseGeminiArgs("model pro").model, "pro");
+  const ask = parseGeminiArgs("把 README 第 3 节改成中文");
+  check("gem 其它文本 → ask", ask.kind, "ask");
+  check("gem ask 保留全文", ask.prompt, "把 README 第 3 节改成中文");
+
+  // 脚本：整体包子 shell（顶层 exit 会杀掉长驻 bash）
+  const prep = buildGeminiScript();
+  check("脚本包子 shell", prep.startsWith("("), true);
+  check("脚本以 ) 收尾", prep.trimEnd().endsWith(")"), true);
+  check("脚本 cd 仓库", prep.includes("cd /workspaces/watch-ai-assistant"), true);
+  check("无 key 时 exit 2", prep.includes("exit 2"), true);
+  check("缺 CLI 才装", prep.includes("command -v gemini"), true);
+  check("装的是官方包", prep.includes("@google/gemini-cli"), true);
+  check("准备模式不跑 prompt", prep.includes("-p "), false);
+
+  const run = buildGeminiScript({ prompt: "hi", model: "flash" });
+  check("运行模式带 -p", run.includes('-p "$(cat /tmp/ws-gemini-prompt.txt)"'), true);
+  check("运行模式带模型", run.includes("-m flash"), true);
+  check("stdin 重定向 /dev/null（防偷吃后续命令行）", run.includes("</dev/null"), true);
+  check("yolo 审批（无人值守没法按 y）", run.includes("--approval-mode=yolo"), true);
+  check("跳过目录信任", run.includes("--skip-trust"), true);
+  check("续会话受标记文件保护", run.includes("gemini-session"), true);
+  check("成功后打标记", run.includes("touch"), true);
+  check("prompt 不落明文进命令", run.includes("hi"), false);
+  check(
+    "prompt 能还原",
+    Buffer.from(/printf %s '([^']+)'/.exec(run)[1], "base64").toString("utf8"),
+    "hi",
+  );
+
+  // 写 key 的脚本绝不能出现明文
+  const keyCmd = buildKeyScript("AIzaSECRET123");
+  check("key 不落明文", keyCmd.includes("AIzaSECRET123"), false);
+  check("key 落 chmod 600", keyCmd.includes("chmod 600"), true);
+  check(
+    "key 可还原",
+    Buffer.from(/printf %s '([^']+)'/.exec(keyCmd)[1], "base64").toString("utf8"),
+    "AIzaSECRET123",
+  );
+
+  check("状态脚本查 CLI", buildStatusScript().includes("command -v gemini"), true);
+  check("状态脚本查 key", buildStatusScript().includes("GEMINI_API_KEY"), true);
+  // 回归：不指定模型时 CLI 会用已停用的 2.5 系列 → 新 key 直接 404。
+  // 所以 buildGeminiScript 必须把 -m 显式拼进去，且默认值不能是 2.5。
+  check("默认模型非 2.5", DEFAULT_GEMINI_MODEL.startsWith("gemini-3"), true);
+  check(
+    "脚本显式带 -m",
+    buildGeminiScript({ prompt: "hi", model: DEFAULT_GEMINI_MODEL }).includes(`-m ${DEFAULT_GEMINI_MODEL}`),
+    true,
+  );
+  check("状态脚本报模型", buildStatusScript(DEFAULT_GEMINI_MODEL).includes(DEFAULT_GEMINI_MODEL), true);
+  check("状态脚本未给模型也报兜底值", buildStatusScript().includes(DEFAULT_GEMINI_MODEL), true);
+  check("状态脚本模型名经过白名单", buildStatusScript("a;rm -rf /").includes("rm -rf"), false);
+  // 终端能力：不声明的话 CLI 每次回答前都会打一行 256 色警告（Telegram 里是噪音）
+  {
+    const sc = buildGeminiScript({ prompt: "hi" });
+    check("声明 256 色终端", sc.includes("TERM=xterm-256color"), true);
+    check("声明 truecolor", sc.includes("COLORTERM=truecolor"), true);
+    check("过滤 YOLO 噪音", sc.includes("YOLO mode is enabled"), true);
+    check("流式不过度缓冲", sc.includes("--line-buffered"), true);
+    check("退出码取 gemini 而非 grep", sc.includes("PIPESTATUS[0]"), true);
+  }
+  check("新会话删标记", buildNewSessionScript().includes("rm -f"), true);
+
+  check("prompt 预览压成一行", previewPrompt("a\nb\nc"), "a b c");
+  check("prompt 预览截断", previewPrompt("x".repeat(200), 10).length, 11);
+}
+
+// ---- ShellHub：label / echo / quiet（Gemini 长脚本与密钥命令用）----
+{
+  const sent = [];
+  const written = [];
+  const hub = new ShellHub(
+    async (chatId, text) => {
+      sent.push(text);
+    },
+    { flushMs: 5 },
+  );
+  hub.attach({ enqueue: (b) => written.push(new TextDecoder().decode(b)) });
+
+  const q = hub.enqueue("c1", "( echo hi )\n( echo bye )", { label: "🤖 打个招呼" });
+  await hub.onOutput({ id: q.id, text: "hi\n", done: true, exit: 0, cwd: "/tmp" });
+  const out = sent.join("\n");
+  check("回显用 label 而非脚本", out.includes("$ 🤖 打个招呼"), true);
+  check("回显不含脚本原文", out.includes("echo bye"), false);
+
+  const q2 = hub.enqueue("c1", "printf %s 'x' > key", { echo: false, quiet: true });
+  check("quiet 标记下发到 agent", written.some((w) => w.includes('"q":1')), true);
+  await hub.onOutput({ id: q2.id, text: "ok\n", done: true, exit: 0, cwd: "/tmp" });
+  check("echo:false 不带 $ 前缀", sent[sent.length - 1].includes("$ printf"), false);
+}
+
+// ---- /ctrlc 逃生：卡住的命令不能把人锁 45 分钟 ----
+{
+  const sent = [];
+  const hub = new ShellHub(async (_c, t) => {
+    sent.push(t);
+  }, { flushMs: 5 });
+  hub.attach({ enqueue: () => {} });
+
+  check("首条命令可下发", hub.enqueue("c1", "( sleep 100 )", { label: "🤖 卡住的命令" }).ok, true);
+  const blocked = hub.enqueue("c1", "echo hi");
+  check("忙时拒绝第二条", blocked.ok, false);
+  check("拒绝提示带出是哪条在跑", String(blocked.message).includes("🤖 卡住的命令"), true);
+  check("拒绝提示给出逃生办法", String(blocked.message).includes("/ctrlc"), true);
+
+  const dropped = hub.killAll();
+  check("killAll 交出被丢的命令", dropped.length, 1);
+  check("killAll 后队列为空", hub.pending(), 0);
+  check("清空后立刻可再下发", hub.enqueue("c1", "echo hi").ok, true);
+}
+
+// ---- 打错的斜杠指令必须被当场纠正，不能当成 prompt / shell 命令 ----
+{
+  check("hault 被识别为未知斜杠指令", looksLikeUnknownSlash("/hault"), true);
+  check("hault 能猜出 halt", suggestCommand("/hault"), "halt");
+  check("绝对路径不算未知指令", looksLikeUnknownSlash("/etc/hosts"), false);
+  check("带参的绝对路径也不算", looksLikeUnknownSlash("/tmp/a.sh -x"), false);
+  check("hlep 能猜出 help", suggestCommand("/hlep"), "help");
+}
+
+// ---- Gemini 安装：三级降级，不需要用户去开全局 sudo ----
+{
+  const s = buildGeminiScript({ prompt: "hi" });
+  check("安装有 sudo -n 这一级", s.includes("sudo -n"), true);
+  check("sudo 之前先试普通 npm", s.indexOf("npm i -g @google/gemini-cli") < s.indexOf("sudo -n"), true);
+  check("以 ~/.local 兜底", s.includes('--prefix "$HOME/.local"'), true);
+  check("PATH 提前铺好", s.includes('export PATH="$HOME/.local/bin:$PATH"'), true);
+  check("PATH 在安装判断之前", s.indexOf('export PATH="$HOME/.local/bin') < s.indexOf("if ! command -v gemini"), true);
+  const st = buildStatusScript();
+  check("status 报告 sudo 状态", st.includes("sudo -n true"), true);
+  check("status 显示安装路径", st.includes("command -v gemini"), true);
+}
+
+// ---- agent 通道鉴权：HMAC 双向签名 / 时间窗 / 防重放 / 身份绑定 ----
+{
+  const A = await import("../src/agent-auth.js");
+  const secret = "0123456789abcdef0123456789abcdef";
+
+  // 基础原语（用公开测试向量，防止「两端各算各的」）
+  check("sha256 空串", await A.sha256Hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  check(
+    "hmac-sha256 标准向量",
+    await A.hmacHex("key", "The quick brown fox jumps over the lazy dog"),
+    "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+  );
+  check("定长比较 相等", A.timingSafeEq("abc", "abc"), true);
+  check("定长比较 一字节差", A.timingSafeEq("abc", "abd"), false);
+  check("定长比较 长度差", A.timingSafeEq("a", "ab"), false);
+  check("定长比较 空值", A.timingSafeEq("", ""), false);
+
+  // 时间窗
+  const now = 1_700_000_000_000;
+  check("时间戳 当前", A.tsFresh(String(now), now), true);
+  check("时间戳 60s 前", A.tsFresh(String(now - 60_000), now), true);
+  check("时间戳 5 分钟前", A.tsFresh(String(now - 300_000), now), false);
+  check("时间戳 非数字", A.tsFresh("abc", now), false);
+
+  // nonce 防重放
+  const nc = new A.NonceCache();
+  check("nonce 首见", nc.check("n1", now), false);
+  check("nonce 重放", nc.check("n1", now), true);
+  check("nonce 另一个", nc.check("n2", now), false);
+
+  // 组装一次合法请求
+  const mk = async (o = {}) => {
+    const ts = String(o.ts ?? now);
+    const nonce = o.nonce ?? "abcdef0123456789abcdef";
+    const body = o.body ?? JSON.stringify({ id: "c1", text: "hi" });
+    const sig = await A.signRequest(secret, { ts, nonce, method: "POST", path: "/shell/out", bodyText: body });
+    const h = new Headers({
+      "X-Agent-Sig": sig,
+      "X-Agent-Ts": ts,
+      "X-Agent-Nonce": nonce,
+      "X-Agent-Id": o.id ?? "cs-1",
+    });
+    return { headers: h, bodyText: o.bodyText ?? body };
+  };
+
+  const base = { secret, legacyAllowed: false, method: "POST", path: "/shell/out", now, expectedId: "cs-1" };
+  const okReq = await mk();
+  const r1 = await A.verifyAgentRequest({ ...base, ...okReq, nonces: new A.NonceCache() });
+  check("合法签名通过", r1.ok && r1.mode, "hmac");
+
+  const r2 = await A.verifyAgentRequest({ ...base, ...okReq, bodyText: '{"id":"c1","text":"evil"}', nonces: new A.NonceCache() });
+  check("改包体 → 拒绝", r2.ok, false);
+
+  const nc2 = new A.NonceCache();
+  await A.verifyAgentRequest({ ...base, ...okReq, nonces: nc2 });
+  const r3 = await A.verifyAgentRequest({ ...base, ...okReq, nonces: nc2 });
+  check("同签名重放 → 拒绝", r3.ok, false);
+
+  const stale = await mk({ ts: now - 600_000, nonce: "stale0000000000" });
+  check("过期时间戳 → 拒绝", (await A.verifyAgentRequest({ ...base, ...stale, nonces: new A.NonceCache() })).ok, false);
+
+  const otherId = await mk({ nonce: "otherid00000000", id: "someone-else" });
+  check("身份不符 → 拒绝", (await A.verifyAgentRequest({ ...base, ...otherId, nonces: new A.NonceCache() })).ok, false);
+
+  check(
+    "没配 AGENT_KEY → 一律拒绝",
+    (await A.verifyAgentRequest({ ...base, secret: "", ...okReq, nonces: new A.NonceCache() })).ok,
+    false,
+  );
+
+  // 旧的明文密钥：默认拒绝，只有显式放开过渡才通
+  const legacyHeaders = new Headers({ "X-Agent-Key": secret });
+  const l1 = await A.verifyAgentRequest({ ...base, headers: legacyHeaders, bodyText: "", nonces: new A.NonceCache() });
+  check("明文密钥 默认拒绝", l1.ok, false);
+  const l2 = await A.verifyAgentRequest({
+    ...base,
+    legacyAllowed: true,
+    headers: legacyHeaders,
+    bodyText: "",
+    nonces: new A.NonceCache(),
+  });
+  check("过渡开关打开才放行", l2.ok && l2.mode, "legacy");
+
+  // 下行命令签名：帧里必须带 sig，且等于 HMAC(v1\\n<id>\\n<cmd>)
+  const frames = [];
+  const hub = new ShellHub(async () => {}, { signer: (id, cmd) => A.signCommand(secret, id, cmd) });
+  hub.attach({ enqueue: (u8) => frames.push(new TextDecoder().decode(u8)) });
+  hub.enqueue("chat-1", "echo hi");
+  await new Promise((r) => setTimeout(r, 30));
+  const frame = frames.map((f) => f.replace(/^data: /, "").trim()).find((f) => f.includes('"t":"cmd"'));
+  const ev = JSON.parse(frame);
+  check("下行帧带签名", typeof ev.sig === "string" && ev.sig.length === 64, true);
+  check("下行签名可复算", ev.sig, await A.signCommand(secret, ev.id, "echo hi"));
+
+  // 跨实现一致性：agent 侧用 node:crypto 的 createHmac，Worker 用 WebCrypto subtle。
+  // 两者必须逐字节相同，否则「签名对不上」会表现为通道永远连不上。
+  const { createHmac } = await import("node:crypto");
+  check(
+    "node:crypto 与 WebCrypto 结果一致",
+    createHmac("sha256", secret).update(`v1\n${ev.id}\necho hi`).digest("hex"),
+    ev.sig,
+  );
+  hub.detach();
+
+  // 没有 signer（老配置）时不下发 sig —— agent 那边按未签名处理
+  const frames2 = [];
+  const hub2 = new ShellHub(async () => {});
+  hub2.attach({ enqueue: (u8) => frames2.push(new TextDecoder().decode(u8)) });
+  hub2.enqueue("chat-2", "ls");
+  await new Promise((r) => setTimeout(r, 10));
+  const ev2 = JSON.parse(frames2.map((f) => f.replace(/^data: /, "").trim()).find((f) => f.includes('"t":"cmd"')));
+  check("无 signer 时没有 sig 字段", "sig" in ev2, false);
+  hub2.detach();
+}
+
+// ---- webhook 入口白名单：只认 Telegram 网段（网络层唯一入口）----
+{
+  const T = await import("../src/telegram-ip.js");
+
+  check("官方网段常量", T.TELEGRAM_CIDRS, ["149.154.160.0/20", "91.108.4.0/22"]);
+  check("归一化 IPv4-mapped", T.normalizeIp("::ffff:149.154.167.220"), "149.154.167.220");
+  check("归一化 去空白", T.normalizeIp("  8.8.8.8 "), "8.8.8.8");
+
+  // /20 边界：149.154.160.0 ~ 149.154.175.255
+  check("网段起点", T.inCidr("149.154.160.0", "149.154.160.0/20"), true);
+  check("网段内", T.inCidr("149.154.167.220", "149.154.160.0/20"), true);
+  check("网段终点", T.inCidr("149.154.175.255", "149.154.160.0/20"), true);
+  check("网段外（上界 +1）", T.inCidr("149.154.176.0", "149.154.160.0/20"), false);
+  check("网段外（下界 -1）", T.inCidr("149.154.159.255", "149.154.160.0/20"), false);
+
+  // 91.108.4.0/22 边界：.4.0 ~ .7.255
+  check("第二网段 内", T.inCidr("91.108.6.6", "91.108.4.0/22"), true);
+  check("第二网段 终点", T.inCidr("91.108.7.255", "91.108.4.0/22"), true);
+  check("第二网段 外", T.inCidr("91.108.8.0", "91.108.4.0/22"), false);
+
+  check("自定义 /32", T.inCidr("1.2.3.4", "1.2.3.4/32"), true);
+  check("非法 CIDR", T.inCidr("1.2.3.4", "1.2.3.4/33"), false);
+  check("非法 IP", T.inCidr("300.1.1.1", "149.154.160.0/20"), false);
+  check("IPv6 一律不放行", T.isTelegramIp("2001:db8::1"), false);
+
+  check("Telegram IP 判定", T.isTelegramIp("149.154.167.220"), true);
+  check("Telegram IP 判定（mapped）", T.isTelegramIp("::ffff:91.108.4.5"), true);
+  check("普通公网 IP", T.isTelegramIp("8.8.8.8"), false);
+  check("空值", T.isTelegramIp(""), false);
+
+  // 判定表：默认 on = 非 Telegram 直接拒
+  check("on + Telegram → 放行", T.webhookVerdict("149.154.167.220", undefined).allow, true);
+  check("on 是默认值", T.webhookVerdict("1.1.1.1", undefined).mode, "on");
+  check("on + 非 Telegram → 拒绝", T.webhookVerdict("1.1.1.1", undefined).allow, false);
+  check("on + 拒绝原因", T.webhookVerdict("1.1.1.1", undefined).reason, "not-telegram");
+  check("on + 缺 IP → 拒绝（fail-closed）", T.webhookVerdict("", "on").allow, false);
+  check("warn + 非 Telegram → 放行但标记", T.webhookVerdict("1.1.1.1", "warn").reason, "warn-only");
+  check("warn + 非 Telegram 仍放行", T.webhookVerdict("1.1.1.1", "warn").allow, true);
+  check("off 全放行", T.webhookVerdict("1.1.1.1", "off").reason, "guard-off");
+  check("off 也放行空 IP", T.webhookVerdict("", "off").allow, true);
+  check("只有显式 off 才关", T.guardMode("0"), "off");
+  check("怪值回落到 on", T.guardMode("whatever"), "on");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

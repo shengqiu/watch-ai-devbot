@@ -1,13 +1,13 @@
 /**
  * GitHub Codespaces REST 薄客户端（Worker 内运行）。
  *
- * 用途：Telegram 指令「开始开发/停止开发」→ 远程开关 codespace 开发机。
+ * 用途：Telegram 指令 /boot、/halt → 远程开关 codespace 开发机。
  * 端点（均需 Codespaces 用户权限的 fine-grained PAT 或 codespace scope）：
  *   GET  /user/codespaces/{name}        查询状态
  *   POST /user/codespaces/{name}/start  开机
  *   POST /user/codespaces/{name}/stop   停机
  *
- * 注意：单查必须用 codespace 的 name（形如 24h-jwp7vwxvx6hpp7），
+ * 注意：单查必须用 codespace 的 name（形如 24h-977gg5v9vcp5wq），
  * 用数字 id 会 404（实测）。
  */
 
@@ -16,6 +16,7 @@ const API_BASE = "https://api.github.com";
 export type CodespaceState =
   | "Shutdown"
   | "ShuttingDown"
+  | "Queued"
   | "Available"
   | "Provisioning"
   | "ProvisioningWithWarning"
@@ -93,6 +94,8 @@ export function describeState(state: CodespaceState): string {
     case "ProvisioningWithWarning":
     case "Creating":
       return "启动中";
+    case "Queued":
+      return "排队中";
     case "Rebuilding":
       return "重建中";
     case "Deleted":
@@ -105,7 +108,7 @@ export function describeState(state: CodespaceState): string {
 }
 
 /**
- * 「开始开发」协议（两次查询、不循环）——分两阶段执行：
+ * /boot 协议（两次查询、不循环）——分两阶段执行：
  *
  *   阶段 1（webhook 请求内同步完成）：
  *     查状态；已开机 → 回「已在运行」；未开机 → POST start → 立即回「正在启动」
@@ -116,6 +119,18 @@ export function describeState(state: CodespaceState): string {
  * sleep 中的 waitUntil 任务会随之中断；setAlarm 持久化、驱逐后也能准时唤醒。
  */
 export const BOOT_CHECK_DELAY_MS = 30_000;
+/** 启动未完成时的重查间隔（Provisioning/Queued 都属于「还没好」，不能判失败）。 */
+export const BOOT_RETRY_DELAY_MS = 15_000;
+/** 最多重查次数：30s 首查 + 8×15s ≈ 2.5 分钟，足够冷启动一台 2 核机。 */
+export const BOOT_MAX_ATTEMPTS = 8;
+
+/** 仍在上机中的状态：既不算成功也不算失败，继续等。 */
+const BOOTING_STATES: ReadonlySet<CodespaceState> = new Set<CodespaceState>([
+  "Queued",
+  "Provisioning",
+  "ProvisioningWithWarning",
+  "Creating",
+]);
 
 export interface BootPhase1 {
   /** 立即回复（发给用户） */
@@ -141,29 +156,62 @@ export async function beginBoot(client: CodespaceClient): Promise<BootPhase1> {
   if (st.state === "Deleted" || st.state === "Failed") {
     return { reply: `开发机状态异常（${describeState(st.state)}），需要到 GitHub 页面处理。`, scheduleCheck: false, wasAvailable: false };
   }
+  // 已经在启动途中（连发两次 /boot / GitHub 侧刚拉起）：不要再 POST start（会 409），
+  // 直接进入观察模式——用户真正想要的是「好了没」的答案。
+  if (BOOTING_STATES.has(st.state)) {
+    return {
+      reply: `开发机${describeState(st.state)} ⏳ 启动完成后我会告诉你。`,
+      scheduleCheck: true,
+      wasAvailable: false,
+    };
+  }
 
   try {
     await client.start();
   } catch (e) {
     return { reply: `启动请求失败：${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
   }
-  return { reply: "开发机未开机，已发出启动指令，正在启动 ⏳（30 秒后自动确认）", scheduleCheck: true, wasAvailable: false };
+  return { reply: "开发机未开机，已发出启动指令，正在启动 ⏳（好了一定告诉你）", scheduleCheck: true, wasAvailable: false };
 }
 
-/** 阶段 2（alarm 回调）：二查状态并产出最终回复。ok=true 表示确已开机。 */
-export async function checkBoot(client: CodespaceClient): Promise<{ reply: string; ok: boolean }> {
+export interface BootCheck {
+  /** 给用户的最终文案；pending=true 时为空串（此时不要发消息） */
+  reply: string;
+  /** true = 确认已在运行 */
+  ok: boolean;
+  /** true = 还在启动途中，调用方应稍后重查（不是失败） */
+  pending: boolean;
+}
+
+/**
+ * 阶段 2（alarm 回调）：二查状态。
+ *
+ * 三种结局：Available → 成功（发消息）；仍在启动 → pending（静默重排，别骚扰用户）；
+ * 其余 → 失败（发消息）。早期版本只有「成功/失败」两态，30 秒时机器常卡在
+ * Provisioning，会被误报成开机失败。
+ */
+export async function checkBoot(client: CodespaceClient): Promise<BootCheck> {
   let state: CodespaceState;
   try {
     state = (await client.status()).state;
   } catch {
-    return { reply: "开机确认查询失败，稍后发「开发机状态」手动确认。", ok: false };
+    return { reply: "开机确认查询失败，稍后发「开发机状态」手动确认。", ok: false, pending: false };
   }
-  return state === "Available"
-    ? { reply: "开发机启动成功 ✓（运行中）", ok: true }
-    : { reply: `开机失败：30 秒后仍为「${describeState(state)}」，可再发一次「开始开发」。`, ok: false };
+  if (state === "Available") {
+    return { reply: "开发机启动成功 ✓ 运行中，可以发命令了（shell 大约 10~30 秒内连上）", ok: true, pending: false };
+  }
+  if (BOOTING_STATES.has(state)) {
+    return { reply: "", ok: false, pending: true };
+  }
+  return { reply: `开机失败：仍为「${describeState(state)}」，可再发一次 /boot。`, ok: false, pending: false };
 }
 
-/** 「停止开发」：幂等停机。 */
+/** 等太久仍未好时的收尾文案。 */
+export function bootTimeoutReply(): string {
+  return "开发机还在启动中（已等待约 2.5 分钟）。稍后发「开发机状态」确认，或再发一次 /boot。";
+}
+
+/** /halt：幂等停机。 */
 export async function stopCodespace(client: CodespaceClient): Promise<string> {
   let st: CodespaceStatus;
   try {

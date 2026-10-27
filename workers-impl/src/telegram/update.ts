@@ -7,6 +7,8 @@ export interface Incoming {
   chatId: string;
   /** 发送者 id（群聊时与 chatId 不同） */
   userId: string;
+  /** 消息 id（撤回/删除用：/gemini key 会把带密钥的那条消息删掉） */
+  messageId: number | null;
   /** 文本内容（text 或 caption），已 trim */
   text: string;
   /** 语音 file_id（有语音时非空） */
@@ -25,6 +27,7 @@ export function extractIncoming(update: TgUpdate): Incoming | null {
     updateId: update.update_id,
     chatId,
     userId: m.from ? String(m.from.id) : chatId,
+    messageId: typeof m.message_id === "number" ? m.message_id : null,
     text: (m.text ?? m.caption ?? "").trim(),
     voiceFileId: voice?.file_id ?? null,
     voiceMime: voice?.mime_type ?? null,

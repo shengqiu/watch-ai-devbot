@@ -29,6 +29,11 @@ crons = ["*/30 * * * *"]
 
 [vars]
 BOT_IDENTITY = "devbot" # /healthz 与 /status 里显示，区分主/副 bot
+# webhook 入口白名单：只接受 Telegram 官宣的两个网段
+# （149.154.160.0/20、91.108.4.0/22）。CF-Connecting-IP 由边缘写入，伪造不了。
+# on（默认）= 非 Telegram 来源直接 403；warn = 只记日志；off = 关闭（不推荐）。
+# 官方文档明说网段「可能变」——真变了的表现是 bot 完全收不到消息，此时先切 warn。
+TELEGRAM_IP_GUARD = "on"
 DEFAULT_CODING_PROVIDER = "gemini"
 DEFAULT_CHAT_PROVIDER = "gemini"
 MAX_OUTPUT_TOKENS = "4096"
@@ -40,8 +45,8 @@ REPLY_CHUNK_SIZE = "800"
 #   npx wrangler secret put ALLOWED_USERS    # 逗号分隔 chat_id 白名单
 #   npx wrangler secret put VERIFY_ANSWER    # 验证答案
 #   npx wrangler secret put ADMIN_KEY        # 管理端点密钥
-GH_CODESPACE_NAME = "24h-jwp7vwxvx6hpp7" # 远程开关的 codespace（与主 bot 同一台）
-VERIFY_SESSION_MIN = "30"          # 「爸爸」验证会话时长（分钟，滑动延续）
+GH_CODESPACE_NAME = "24h-977gg5v9vcp5wq" # 远程开关的 codespace（与主 bot 同一台；2026-10-27 重建后短名变更）
+VERIFY_SESSION_MIN = "30"          # 验证会话时长（分钟，滑动延续）；验证词本身走 secret VERIFY_ANSWER
 # 省额度看门狗：25 分钟无互动提醒，55 分钟自动关机（bot 开的机才自动关）
 CS_WATCH_REMIND_MIN = "25"
 CS_WATCH_AUTOSTOP_MIN = "55"
@@ -50,10 +55,29 @@ CS_MONTHLY_BUDGET_HOURS = "60"     # 免费额度（2 核机 120 core-hours ÷ 2
 CS_GH_CAP_MIN = "180"              # GH 连续活跃上限（分钟）：防 dev server 刷日志无限续命
 CS_GH_CAP_ACTION = "stop"          # 触达上限后：stop=警告+宽限后关机 | notify=只提醒永不动手
 CS_GH_CAP_GRACE_MIN = "15"         # stop 模式宽限期（分钟）：警告后给多久让你回一个字取消
+# 联机 shell：未识别文本 → 下发到开发机里的长驻 bash（agent 反向 SSE 连接）
+SHELL_ENABLED = "1"                # "0" = 关闭 shell 转发（未识别文本退回 LLM/提示）
+SHELL_FLUSH_MS = "1200"            # 增量输出静默多久就推一条消息（毫秒）
+SHELL_MAX_CHARS = "24000"          # 单条命令输出上限（超出掐头尾）
+# agent 通道鉴权（HMAC 双向签名，见 src/agent-auth.ts）：
+#   AGENT_KEY 只用来算签名，**不再随请求明文传输**；请求带 ts+nonce 防重放，
+#   下行命令由 Worker 签名、agent 验签后才执行。
+AGENT_LEGACY_KEY = "0"             # "1" = 仍接受明文 X-Agent-Key（仅旧 agent 未升级时临时开）
+AGENT_ID = ""                      # 期望的 agent 身份（codespace 名）；空 = 只记录不强制
+# Gemini CLI（/gemini）：默认模型。必须显式给——CLI 自带的默认是 2.5 系列，
+# 对 2026 年新发的 key 会返回「no longer available to users」直接 404。
+# 单聊里可用 /gemini model <名字> 覆盖；换默认值改这里即可，无需动代码。
+GEMINI_MODEL = "gemini-3.6-flash"
+# 强制换版开关：DO 被 SSE 钉住时 deploy 不生效（healthz 的 build 不翻）。
+# 改这里的值 = 路由到一个全新 DO 实例，立刻跑新代码，不用等连接断开。
+# 代价：新实例没有旧 storage —— 验证会话重打一次、/gemini 会话模式与暂存提问清零。
+# 只在需要强制换版时改；平时保持不动。
+DO_KEY = "singleton-s10"
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）
 #   GEMINI_API_KEY（聊天/编程能力用；不配则只有开发机指令可用）
 #   GH_CODESPACE_PAT（Codespaces REST 调用凭证）
+#   AGENT_KEY（shell agent 反连密钥；与 codespace 侧 Codespaces secret 同值）
 #   （可选）TELEGRAM_WEBHOOK_SECRET —— webhook 防伪密钥
 #   （可选）STT_BASE_URL / STT_API_KEY / STT_MODEL —— 语音转写

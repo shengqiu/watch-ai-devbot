@@ -43,7 +43,7 @@ export interface WatchInput {
   lastActivity: number;
   /** 上次开机时间（本轮运行窗口的起点；无记录 = 0） */
   bootAt: number;
-  /** 本轮运行是否由 bot 指令发起（开始开发） */
+  /** 本轮运行是否由 bot 指令发起（/boot） */
   botStarted: boolean;
   /** 提醒阈值分钟（vars CS_WATCH_REMIND_MIN，默认 25） */
   remindMin: number;
@@ -157,10 +157,10 @@ export function evalWatch(w: WatchInput): WatchDecision {
     const later = Math.max(0, w.autostopMin - idleMin);
     // GH 侧活跃时不承诺自动关机会不会执行——它会被无限推迟，说了不算
     const tail = ghFresh
-      ? `看起来你还在别处（VS Code／网页／SSH）干活，先不打扰。不用了记得发「停止开发」省额度。`
+      ? `看起来你还在别处（VS Code／网页／SSH）干活，先不打扰。不用了记得发 /halt 省额度。`
       : w.botStarted && w.autostopEnabled
         ? `再不理我就自动关机（约 ${fmtDur(later)}后）。在干活就随便回我一个字。`
-        : `不用了就发「停止开发」，我帮你关机省额度。`;
+        : `不用了就发 /halt，我帮你关机省额度。`;
     return {
       notify: `⏰ 开发机已运行 ${fmtDur(runMin)}，你已 ${fmtDur(idleMin)} 没和我说过话。\n` + tail,
       stop: false,
@@ -204,7 +204,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
         return {
           notify:
             `🛑 疑似闲置：GH 显示活跃但你 ${fmtDur(idleMin)} 无互动，已过 ${fmtDur(w.graceMin)} 宽限期，强制关机` +
-            `（本轮共运行 ${fmtDur(runMin)}）。需要时发「开始开发」重新开机。`,
+            `（本轮共运行 ${fmtDur(runMin)}）。需要时发 /boot 重新开机。`,
           stop: true,
           nextCheck: null,
           markReminded: false,
@@ -231,7 +231,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
         notify:
           `⚠️ 开发机显示「持续活跃」已 ${fmtDur(freshMin)}，但你 ${fmtDur(idleMin)} 没和我说过话` +
           `（疑似 dev server 刷日志在给 GitHub 的活跃信号续命）。\n` +
-          `当前为「只提醒、不自动关机」模式，我不会动手；不用了请发「停止开发」省额度。`,
+          `当前为「只提醒、不自动关机」模式，我不会动手；不用了请发 /halt 省额度。`,
         stop: false,
         nextCheck: w.now + 60 * MIN,
         markReminded: true,
@@ -256,7 +256,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
   // 4) 双信号都空闲 → 重置 GH 追踪，执行关机策略
   if (w.botStarted && w.autostopEnabled) {
     return {
-      notify: `🛑 闲置超时：已 ${fmtDur(idleMin)} 无互动，自动关机（本轮共运行 ${fmtDur(runMin)}）。需要时发「开始开发」重新开机。`,
+      notify: `🛑 闲置超时：已 ${fmtDur(idleMin)} 无互动，自动关机（本轮共运行 ${fmtDur(runMin)}）。需要时发 /boot 重新开机。`,
       stop: true,
       nextCheck: null,
       markReminded: false,
@@ -282,8 +282,8 @@ export function evalWatch(w: WatchInput): WatchDecision {
     notify:
       `⏰ 开发机已闲置 ${fmtDur(idleMin)}（本轮运行 ${fmtDur(runMin)}），仍在运行。\n` +
       (w.autostopEnabled
-        ? `这轮不是通过我开的机，我不敢自动关。不用了请发「停止开发」。`
-        : `自动关机未启用。不用了请发「停止开发」。`),
+        ? `这轮不是通过我开的机，我不敢自动关。不用了请发 /halt。`
+        : `自动关机未启用。不用了请发 /halt。`),
     stop: false,
     nextCheck: w.now + 120 * MIN, // 2 小时静默期后再提醒
     markReminded: true,
@@ -318,8 +318,8 @@ export function fmtDur(minutes: number): string {
 export interface AlarmTask {
   /** 到期时间戳（ms） */
   due: number;
-  /** 任务种类：boot_check | watch */
-  kind: "boot_check" | "watch";
+  /** 任务种类：boot_check | watch | gemini_prep（等 shell 连上后准备/启动 Gemini） */
+  kind: "boot_check" | "watch" | "gemini_prep";
   /** 附带数据（如 boot_check 的 chat_id） */
   payload?: Record<string, unknown>;
 }

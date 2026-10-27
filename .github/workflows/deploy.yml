@@ -129,3 +129,15 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+
+      # 关键是这一步：wrangler deploy 只是上传新版本，被 SSE 长连接钉住的 DO 实例
+      # 仍在跑旧代码（部署「成功」但线上版本号不变）。调 /admin/reload 让它 abort 自己，
+      # 下次请求就用新代码创建实例。
+      - name: Reload Durable Object（让新代码立即生效）
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != 'true'
+        continue-on-error: true
+        run: |
+          echo "GET ${{ vars.WORKER_BASE_URL }}/admin/reload"
+          curl -sS --max-time 20 "${{ vars.WORKER_BASE_URL }}/admin/reload?key=${{ secrets.DEPLOY_KEY }}" || true
+          echo
+          echo "（401 = DEPLOY_KEY 未配置；这步失败不影响部署本身）"

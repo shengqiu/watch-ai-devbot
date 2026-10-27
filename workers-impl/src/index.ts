@@ -110,6 +110,12 @@ export default {
         );
       }
 
+      // 部署后重载：让 DO 换到新构建。鉴权在 DO 内用独立的 DEPLOY_KEY（只给 CI），
+      // 不套 ADMIN_KEY —— 这样 CI 不需要拿到管理全站的那把钥匙。
+      if (url.pathname === "/admin/reload") {
+        return stub.fetch(`http://do/admin/reload?${url.searchParams.toString()}`);
+      }
+
       // DO 内部路由透传（管理端点，统一 ADMIN_KEY 鉴权）
       if (
         url.pathname === "/csdebug" ||

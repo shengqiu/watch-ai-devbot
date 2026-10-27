@@ -67,6 +67,13 @@ export interface Env {
   // 管理端点鉴权（/setup /send /csdebug）：secret；未配置 = 全部管理端点 403（默认安全）
   ADMIN_KEY?: string;
 
+  /**
+   * 部署后重载用的密钥（secret，只给 GitHub Actions）。
+   * 部署完成后 CI 调一次 /admin/reload?key=... 让 DO 立刻换到新构建；
+   * 不复用 ADMIN_KEY —— CI 不该拿到管理全站的那把钥匙。未配置 = 该端点 401。
+   */
+  DEPLOY_KEY?: string;
+
   // Shell 通道（Telegram ⇄ codespace 内持久 bash）
   AGENT_KEY?: string; // secret：agent 与 Worker 的共享密钥（只用于算 HMAC，不再上行文）
   AGENT_LEGACY_KEY?: string; // var："1" = 仍接受明文 X-Agent-Key（仅 agent 未升级时的过渡，默认关）

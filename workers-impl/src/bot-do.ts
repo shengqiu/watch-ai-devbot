@@ -187,6 +187,26 @@ export class AssistantDO extends DurableObject<Env> {
       switch (url.pathname) {
         case "/status":
           return Response.json(await this.status());
+        case "/admin/reload": {
+          // 部署后强制切到新代码。
+          // 为什么需要：wrangler deploy 之后，已有 DO 实例仍跑旧构建（被 agent 的 SSE
+          // 长连接钉住），于是「部署成功、线上版本号不变」。ctx.abort() 直接终止实例，
+          // 下一次请求就会用新代码创建新实例 —— 这是 CI 里「部署完调一次」的那一步。
+          // 鉴权用独立的 DEPLOY_KEY（只给 CI），不复用 ADMIN_KEY。
+          const k = url.searchParams.get("key") ?? "";
+          if (!this.env.DEPLOY_KEY || !timingSafeEq(k, this.env.DEPLOY_KEY)) {
+            return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
+          }
+          // 先让响应发出去，再自毁：abort 会立刻中断所有在途请求（包括这个响应）
+          setTimeout(() => {
+            try {
+              this.ctx.abort();
+            } catch {
+              /* 已被驱逐，无妨 */
+            }
+          }, 150);
+          return Response.json({ ok: true, build: BUILD, reloading: true });
+        }
         case "/csdebug": {
           // 调试：直接调 GitHub API 查 codespace 状态（绕过消息流水线，定位 PAT/网络问题）
           const client = this.codespaceClient();

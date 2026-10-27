@@ -137,7 +137,9 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.dry_run != 'true'
         continue-on-error: true
         run: |
-          echo "GET ${{ vars.WORKER_BASE_URL }}/admin/reload"
-          curl -sS --max-time 20 "${{ vars.WORKER_BASE_URL }}/admin/reload?key=${{ secrets.DEPLOY_KEY }}" || true
+          echo "POST ${{ vars.WORKER_BASE_URL }}/admin/reload (DEPLOY_KEY 走 Authorization 头，不进 URL)"
+          curl -sS --max-time 20 -X POST \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_KEY }}" \
+            "${{ vars.WORKER_BASE_URL }}/admin/reload" || true
           echo
           echo "（401 = DEPLOY_KEY 未配置；这步失败不影响部署本身）"

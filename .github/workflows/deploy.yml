@@ -143,3 +143,34 @@ jobs:
             "${{ vars.WORKER_BASE_URL }}/admin/reload" || true
           echo
           echo "（401 = DEPLOY_KEY 未配置；这步失败不影响部署本身）"
+
+      # 光有 reload 不够：它带 continue-on-error，401 会被吞掉。
+      # 踩过的坑（v4.10）：reload 一直 401，CI 全绿，但线上其实还停在旧版本好几个小时。
+      # 所以用 reload 响应里自带的 build 字段做闭环校验 —— 拿不到就降级成 warning
+      # （DEPLOY_KEY 没配时别把 CI 卡红），拿到了就必须和源码里的 BUILD 对得上。
+      - name: Verify 线上确实是新版本（防止部署静默失效）
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != 'true'
+        run: |
+          EXPECTED=$(sed -n 's/^const BUILD = "\(.*\)";.*/\1/p' src/bot-do.ts | head -1)
+          echo "期望 BUILD: $EXPECTED"
+          # reload 的响应带的是「处理该请求的那个实例」的 BUILD。实例自毁后
+          # 下一次请求才建新实例，所以先 reload 触发换版，等一下再取一次，
+          # 第二次拿到的才是新实例的版本号。
+          curl -sS --max-time 20 -X POST \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_KEY }}" \
+            "${{ vars.WORKER_BASE_URL }}/admin/reload" >/dev/null 2>&1 || true
+          sleep 5
+          ACTUAL=$(curl -sS --max-time 20 -X POST \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_KEY }}" \
+            "${{ vars.WORKER_BASE_URL }}/admin/reload" 2>/dev/null | jq -r '.build // empty')
+          if [ -z "$ACTUAL" ]; then
+            echo "::warning::拿不到线上 BUILD（DEPLOY_KEY 未配置或鉴权失败），跳过校验"
+            exit 0
+          fi
+          echo "线上 BUILD: $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::部署未生效：线上跑的是 $ACTUAL，期望 $EXPECTED"
+            echo "::error::常见原因：DO 被 SSE 长连接钉住且 reload 没生效 —— 考虑 bump wrangler.toml 的 DO_KEY 强制换版"
+            exit 1
+          fi
+          echo "OK 线上已是 $ACTUAL"

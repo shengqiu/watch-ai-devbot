@@ -392,6 +392,7 @@ check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
 
 // ---- 省额度看门狗（watch.ts）----
 import { evalWatch, fmtDur, pushAlarm, drainAlarms } from "../src/watch.js";
+import { adminDenied, reloadVerdict, bearerToken } from "../src/admin-auth.js";
 
 const W = (over = {}) => ({
   running: true,
@@ -1360,6 +1361,113 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("清单标 ✅", models.includes('echo "  ✅ $m"'), true);
   check("清单过滤 embedding", models.includes("embedding"), true);
   check("清单走 REST 列表", models.includes("generativelanguage.googleapis.com/v1beta/models"), true);
+}
+
+// ---- 管理端点鉴权（安全审查 #8 的回归保护）----
+// 这些是安全关键路径：密钥只能走请求头，绝不能退回 ?key= 查询串。
+// index.ts 的路由依赖 DO stub 没法在纯 node 测，所以鉴权逻辑抽成了纯函数放 admin-auth.ts。
+{
+  const ADMIN = "adm1n-s3cret";
+  const DEPLOY = "d3ploy-s3cret";
+
+  // 构造请求的小工具
+  const req = (opts = {}) =>
+    new Request(opts.url ?? "https://x.dev/status", {
+      method: opts.method ?? "GET",
+      headers: opts.headers ?? {},
+    });
+  const envAdmin = { ADMIN_KEY: ADMIN };
+  const envDeploy = { DEPLOY_KEY: DEPLOY };
+
+  // --- bearerToken 提取 ---
+  check(
+    "Bearer 头取值",
+    bearerToken(req({ headers: { Authorization: `Bearer ${ADMIN}` } }), "X-Admin-Key"),
+    ADMIN,
+  );
+  check(
+    "备用头取值",
+    bearerToken(req({ headers: { "X-Admin-Key": ADMIN } }), "X-Admin-Key"),
+    ADMIN,
+  );
+  check(
+    "Bearer 带多余空白也认",
+    bearerToken(req({ headers: { Authorization: `Bearer   ${ADMIN}  ` } }), "X-Admin-Key"),
+    ADMIN,
+  );
+  check("无头 → 空串", bearerToken(req(), "X-Admin-Key"), "");
+
+  // --- adminDenied 正常路径 ---
+  check(
+    "admin: Bearer 正确 → 放行",
+    adminDenied(envAdmin, req({ headers: { Authorization: `Bearer ${ADMIN}` } })),
+    false,
+  );
+  check(
+    "admin: X-Admin-Key 正确 → 放行",
+    adminDenied(envAdmin, req({ headers: { "X-Admin-Key": ADMIN } })),
+    false,
+  );
+
+  // --- 核心回归：查询串密钥必须被拒绝（安全审查 #8）---
+  check(
+    "admin: ?key= 查询串 → 拒绝（密钥不得进 URL）",
+    adminDenied(envAdmin, req({ url: `https://x.dev/status?key=${ADMIN}` })),
+    true,
+  );
+  check(
+    "admin: 头错 → 拒绝",
+    adminDenied(envAdmin, req({ headers: { Authorization: "Bearer wrong" } })),
+    true,
+  );
+  check("admin: 无任何凭据 → 拒绝", adminDenied(envAdmin, req()), true);
+  // 默认安全：ADMIN_KEY 没配 = 全部拒绝，绝不裸奔
+  check(
+    "admin: ADMIN_KEY 未配置 → 全部拒绝（默认安全）",
+    adminDenied({ ADMIN_KEY: undefined }, req({ headers: { "X-Admin-Key": ADMIN } })),
+    true,
+  );
+
+  // --- reloadVerdict ---
+  check(
+    "reload: POST + Bearer 正确 → 放行",
+    reloadVerdict(envDeploy, req({ method: "POST", headers: { Authorization: `Bearer ${DEPLOY}` } })).ok,
+    true,
+  );
+  check(
+    "reload: GET → 405（状态变更不能用 GET）",
+    reloadVerdict(envDeploy, req({ method: "GET", headers: { Authorization: `Bearer ${DEPLOY}` } })).status,
+    405,
+  );
+  // 即使密钥正确，非 POST 也必须先判 405，不能因为密钥对就放行
+  check(
+    "reload: GET 即使带正确密钥也 405",
+    reloadVerdict(envDeploy, req({ method: "GET", headers: { Authorization: `Bearer ${DEPLOY}` } })).ok,
+    false,
+  );
+  check(
+    "reload: ?key= 查询串 → 401（密钥不得进 URL）",
+    reloadVerdict(
+      envDeploy,
+      req({ method: "POST", url: `https://x.dev/admin/reload?key=${DEPLOY}` }),
+    ).status,
+    401,
+  );
+  check(
+    "reload: POST 无鉴权 → 401",
+    reloadVerdict(envDeploy, req({ method: "POST" })).status,
+    401,
+  );
+  check(
+    "reload: DEPLOY_KEY 未配置 → 401",
+    reloadVerdict({ DEPLOY_KEY: undefined }, req({ method: "POST", headers: { Authorization: "Bearer x" } })).status,
+    401,
+  );
+  check(
+    "reload: X-Deploy-Key 备用头 → 放行",
+    reloadVerdict(envDeploy, req({ method: "POST", headers: { "X-Deploy-Key": DEPLOY } })).ok,
+    true,
+  );
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

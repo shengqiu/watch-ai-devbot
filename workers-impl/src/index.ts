@@ -17,20 +17,14 @@ import type { Env } from "./env";
 import { endpoints } from "./config";
 import { TelegramClient } from "./telegram/client";
 import { guardMode, webhookVerdict } from "./telegram-ip";
+import { adminDenied, reloadVerdict, reloadErrorResponse } from "./admin-auth";
 
 // Durable Object 必须从入口导出（wrangler 据此注册绑定）
 export { AssistantDO } from "./bot-do";
 
-/** 管理端点鉴权：ADMIN_KEY secret 未配置 = 全部管理端点拒绝（默认安全）。
- *  密钥只认请求头（Authorization: Bearer <ADMIN_KEY> 或 X-Admin-Key），绝不接受 URL 查询串，
- *  避免密钥被访问日志 / 代理遥测记录（安全审查 #8）。 */
-function adminDenied(env: Env, request: Request): boolean {
-  const key = env.ADMIN_KEY;
-  if (!key) return true;
-  const auth = request.headers.get("Authorization") ?? request.headers.get("X-Admin-Key") ?? "";
-  const got = auth.startsWith("Bearer ") ? auth.slice(7).trim() : auth;
-  return got !== key;
-}
+// 管理端点鉴权抽到 admin-auth.ts（纯函数，可单测）：
+//   密钥只认请求头（Authorization: Bearer <ADMIN_KEY> 或 X-Admin-Key），绝不接受 URL 查询串，
+//   避免密钥被访问日志 / 代理遥测记录（安全审查 #8）。
 
 /**
  * 取单例 DO 的 stub。
@@ -126,13 +120,12 @@ export default {
         );
       }
 
-      // 部署后重载：让 DO 换到新构建。鉴权在 DO 内用独立的 DEPLOY_KEY（只给 CI），
+      // 部署后重载：让 DO 换到新构建。鉴权用独立的 DEPLOY_KEY（只给 CI），
       // 不套 ADMIN_KEY —— 这样 CI 不需要拿到管理全站的那把钥匙。
-      // 安全：只接受 POST（状态变更操作），密钥走 Authorization 头（见 bot-do.ts），绝不进 URL。
+      // 安全（安全审查 #8）：只接受 POST，密钥走 Authorization 头，绝不进 URL。
       if (url.pathname === "/admin/reload") {
-        if (request.method !== "POST") {
-          return new Response("method not allowed", { status: 405 });
-        }
+        const v = reloadVerdict(env, request);
+        if (!v.ok) return reloadErrorResponse(v);
         return stub.fetch(
           new Request("http://do/admin/reload", {
             method: "POST",

@@ -90,7 +90,7 @@ export const COMMANDS: CommandSpec[] = [
       "/gemini off —— 退出会话模式，回到「发文字 = shell 命令」。",
       "/gemini key <KEY> —— 写入 Gemini API key（存开发机 ~/.config/watch-ai/gemini-key，chmod 600）。",
       "/gemini new —— 开新会话（清掉 -r latest 续用标记）。",
-      "/gemini model flash|pro —— 换模型（默认 auto）。",
+      "/gemini model flash|pro —— 换模型（默认 gemini-3.6-flash，发 /gemini status 看当前值）。",
       "/gemini status —— 查 CLI 安装 / 认证 / 会话状态。",
       "",
       "会话模式下：直接发文字 = 问 Gemini；行首加 ! = 仍然执行 shell 命令。",

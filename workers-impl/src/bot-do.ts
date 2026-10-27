@@ -125,7 +125,7 @@ import {
 //       带时间窗 + nonce 防重放；下行命令由 Worker 签名、agent 验签后才执行，
 //       并绑定 codespace 身份（X-Agent-Id）。另加失败次数封禁，回到「只有这台
 //       Worker 能和这台开发机通信」。
-const BUILD = "devbot-20261027-v4.3";
+const BUILD = "devbot-20261027-v4.4";
 
 /**
  * 未识别输入时的兜底提示。

@@ -1199,6 +1199,13 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("status 与执行共用同一套解析", st.includes("GEMINI_KEY_SRC"), true);
   check("status 说明 secrets 兜底来源", st.includes("从 .env-secrets 现取"), true);
   check("status 保留模型行（回归）", st.includes("模型："), true);
+  check("status 无 key 时点明三处都空", st.includes("三处都没有 key"), true);
+
+  // 报错文案必须「直接给出下一步」，不能只说没有 key
+  check("报错点明三处来源", run.includes("三处都没有 key"), true);
+  check("报错给出补 secret 的路径", run.includes("Settings → Codespaces → GEMINI_API_KEY"), true);
+  check("报错给出临时替代命令", run.includes("/gemini key <KEY>"), true);
+  check("报错不再说「还没有 Gemini API key」", run.includes("还没有 Gemini API key"), false);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

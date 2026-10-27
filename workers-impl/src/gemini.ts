@@ -123,9 +123,12 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
   // key 三级来源：环境变量 → 持久卷文件 → .env-secrets（见 resolveKeyLines 注释）
   L.push(...resolveKeyLines());
   L.push(`if [ -z "\${GEMINI_API_KEY:-}" ]; then`);
-  L.push(`  echo "❌ 还没有 Gemini API key。"`);
-  L.push(`  echo "   发 /gemini key <你的key>（在 aistudio.google.com 申请）。"`);
-  L.push(`  echo "   或确认 Codespaces secret GEMINI_API_KEY 还在（改完 secret 要重启机器才生效）。"`);
+  // 走到这里 = 环境变量、持久卷文件、.env-secrets 三处都空。
+  // 不要把「下一步该做什么」藏在提示里：三处都空只有一个现实原因（secret 被删/改名，
+  // 或从来没配过），所以直接给出补 secret 的路径 + 临时替代方案，不再提「重启机器看看」。
+  L.push(`  echo "❌ Gemini 没认证：三处都没有 key（环境变量 / ~/.config/watch-ai/gemini-key / .env-secrets）。"`);
+  L.push(`  echo "   补 secret：GitHub → Settings → Codespaces → GEMINI_API_KEY（改完要重启这台机器才进容器）。"`);
+  L.push(`  echo "   或者现在就发：/gemini key <KEY>（aistudio.google.com 申请）。"`);
   L.push(`  exit 2`);
   L.push(`fi`);
 
@@ -218,7 +221,7 @@ export function buildStatusScript(model?: string): string {
     `  env)     echo "认证：✓ 环境变量 GEMINI_API_KEY（$(printf %s "$GEMINI_API_KEY" | wc -c) 字节）" ;;`,
     `  file)    echo "认证：✓ 文件 $(ls -l "$KEYF" | awk '{print $1}')" ;;`,
     `  secrets) echo "认证：✓ 从 .env-secrets 现取（agent 未被 post-start 拉起，属正常兜底）" ;;`,
-    `  *)       echo "认证：✗ 没有 key（发 /gemini key <KEY>）" ;;`,
+    `  *)       echo "认证：✗ 三处都没有 key（secret 被删了？补 GEMINI_API_KEY，或发 /gemini key <KEY>）" ;;`,
     `esac`,
     `echo "模型：${model ? sanitizeModel(model).replace(/^-m\s+/, "") : DEFAULT_GEMINI_MODEL}（/gemini model <名字> 可换）"`,
     `if [ -f "${GEMINI_SESSION_MARK}" ]; then echo "会话：有（下条会用 -r latest 续）"; else echo "会话：无（下条开新会话）"; fi`,

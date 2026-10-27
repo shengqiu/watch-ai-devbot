@@ -88,7 +88,6 @@ export const COMMANDS: CommandSpec[] = [
       "/gemini —— 打开会话：机器关了自动开机，没装自动装，然后直接发问题即可。",
       "/gemini <问题> —— 只问一次，不进入会话模式。",
       "/gemini off —— 退出会话模式，回到「发文字 = shell 命令」。",
-      "/gemini key <KEY> —— 写入 Gemini API key（存开发机 ~/.config/watch-ai/gemini-key，chmod 600）。",
       "/gemini new —— 开新会话（清掉 -r latest 续用标记）。",
       "/gemini model <名字> —— 固定某个模型；/gemini model auto 回到自动链。",
       "/gemini models —— 列出账号可见的模型（✅ = 已在自动链里）。",

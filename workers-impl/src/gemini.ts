@@ -11,8 +11,10 @@
  *     - `--approval-mode=yolo` 让它能真正改文件 / 跑命令（无人值守下没人按 y）；
  *     - stdin 一律 `</dev/null`，防止它偷吃我们喂给 bash 的后续命令行。
  *
- * 认证只支持 headless 可行的两种：`GEMINI_API_KEY` 环境变量（Codespaces secret）
- * 或 `~/.config/watch-ai/gemini-key` 文件（/gemini key 写入，chmod 600）。
+ * 认证只支持 headless 可行的两种：`GEMINI_API_KEY` 环境变量（Codespaces secret，推荐）
+ * 或 `~/.config/watch-ai/gemini-key` 文件（out-of-band 写入，chmod 600）。
+ * **不在聊天里收 key**：Telegram 端到端之外还有通知/云端备份/webhook 日志会留下明文，
+ * 故已移除 /gemini key，统一走 GitHub Codespaces secret 或 set-gemini-key.sh。
  * Google 账号 OAuth 需要浏览器，在 codespace 里没法点，故不实现。
  */
 
@@ -120,7 +122,7 @@ export interface GeminiRunOpts {
 /**
  * 解析 API key 的 bash 片段。三级来源，任一命中就 `export`：
  *   1. `$GEMINI_API_KEY`            —— post-start.sh 从 secret 注入的环境变量
- *   2. `~/.config/watch-ai/gemini-key` —— `/gemini key` 写入（持久卷，重启不丢）
+ *   2. `~/.config/watch-ai/gemini-key` —— out-of-band 写入（持久卷，重启不丢）
  *   3. `.env-secrets`（base64）      —— 兜底：agent 被手动拉起时环境里没有 #1
  *
  * 抽成函数是为了让 buildGeminiScript 和 buildStatusScript 用**同一套**判定，
@@ -162,11 +164,10 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
   L.push(...resolveKeyLines());
   L.push(`if [ -z "\${GEMINI_API_KEY:-}" ]; then`);
   // 走到这里 = 环境变量、持久卷文件、.env-secrets 三处都空。
-  // 不要把「下一步该做什么」藏在提示里：三处都空只有一个现实原因（secret 被删/改名，
-  // 或从来没配过），所以直接给出补 secret 的路径 + 临时替代方案，不再提「重启机器看看」。
+  // 直接给出补 secret 的路径（推荐）与 out-of-band 写文件的方式，绝不在聊天里收 key。
   L.push(`  echo "❌ Gemini 没认证：三处都没有 key（环境变量 / ~/.config/watch-ai/gemini-key / .env-secrets）。"`);
-  L.push(`  echo "   补 secret：GitHub → Settings → Codespaces → GEMINI_API_KEY（改完要重启这台机器才进容器）。"`);
-  L.push(`  echo "   或者现在就发：/gemini key <KEY>（aistudio.google.com 申请）。"`);
+  L.push(`  echo "   推荐：GitHub → Settings → Codespaces → GEMINI_API_KEY（改完要重启这台机器才进容器）。"`);
+  L.push(`  echo "   或本地跑 set-gemini-key.sh 一键写入；手动则 ssh 进机器后写 ~/.config/watch-ai/gemini-key（chmod 600）。"`);
   L.push(`  exit 2`);
   L.push(`fi`);
 
@@ -277,20 +278,6 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
   return L.join("\n");
 }
 
-/** 写入 API key 的脚本。整条命令不回显、不写日志（见 ShellHub 的 quiet 选项）。 */
-export function buildKeyScript(key: string): string {
-  const b64 = b64Utf8(key.trim());
-  return [
-    "(",
-    `umask 077`,
-    `mkdir -p "$HOME/.config/watch-ai"`,
-    `printf %s '${b64}' | base64 -d > "${GEMINI_KEY_FILE}"`,
-    `chmod 600 "${GEMINI_KEY_FILE}"`,
-    `echo "🔑 已保存到 ~/.config/watch-ai/gemini-key（chmod 600，长度 $(wc -c <"${GEMINI_KEY_FILE}") 字节）"`,
-    ")",
-  ].join("\n");
-}
-
 /** 环境自检：装没装 / 有没有 key / 模型链 / 有没有可续的会话。 */
 export function buildStatusScript(model?: string, chain?: string[]): string {
   const pinned = model ? sanitizeModel(model).replace(/^-m\s+/, "") : "";
@@ -307,7 +294,7 @@ export function buildStatusScript(model?: string, chain?: string[]): string {
     `  env)     echo "认证：✓ 环境变量 GEMINI_API_KEY（$(printf %s "$GEMINI_API_KEY" | wc -c) 字节）" ;;`,
     `  file)    echo "认证：✓ 文件 $(ls -l "$KEYF" | awk '{print $1}')" ;;`,
     `  secrets) echo "认证：✓ 从 .env-secrets 现取（agent 未被 post-start 拉起，属正常兜底）" ;;`,
-    `  *)       echo "认证：✗ 三处都没有 key（secret 被删了？补 GEMINI_API_KEY，或发 /gemini key <KEY>）" ;;`,
+    `  *)       echo "认证：✗ 三处都没有 key（secret 被删了？补 GEMINI_API_KEY，或本地跑 set-gemini-key.sh 写入）" ;;`,
     `esac`,
     pinned
       ? `echo "模型：固定 ${pinned}（不自动切换；/gemini model auto 回到链）"`
@@ -330,7 +317,7 @@ export function buildModelsScript(chain?: string[]): string {
   return [
     "(",
     ...resolveKeyLines(),
-    `if [ -z "\${GEMINI_API_KEY:-}" ]; then echo "❌ 没有 key，先发 /gemini key <KEY>"; exit 2; fi`,
+    `if [ -z "\${GEMINI_API_KEY:-}" ]; then echo "❌ 没有 key，先补 GEMINI_API_KEY（GitHub → Settings → Codespaces）"; exit 2; fi`,
     `echo "链（自动切换顺序）：${list.join(" → ")}"`,
     `last="$(cat ${GEMINI_MODEL_FILE} 2>/dev/null)"; [ -n "$last" ] && echo "上次成功：$last"`,
     `echo ""; echo "账号可见的对话模型（✅ = 已在链中）："`,
@@ -358,7 +345,6 @@ export type GeminiAction =
   | { kind: "off" }
   | { kind: "status" }
   | { kind: "new" }
-  | { kind: "key"; key: string }
   | { kind: "model"; model: string }
   | { kind: "models" }
   | { kind: "help" };
@@ -371,7 +357,6 @@ export type GeminiAction =
  *   status          → 自检
  *   models          → 列出账号可见的模型（标出链中的）
  *   new / reset     → 新会话
- *   key <KEY>       → 写 key
  *   model <名字>    → 固定模型；`model auto` 回到自动链
  *   help            → 单条帮助
  *   其它任何文本     → 当作一次性提问
@@ -387,7 +372,8 @@ export function parseGeminiArgs(args: string): GeminiAction {
   if (key === "models" || key === "ls") return { kind: "models" };
   if (key === "new" || key === "reset") return { kind: "new" };
   if (key === "help") return { kind: "help" };
-  if (key === "key" || key === "auth") return tail ? { kind: "key", key: tail } : { kind: "help" };
+  // key / auth 不再支持聊天输入（避免密钥经 Telegram 泄露）；回 help 告知正确途径
+  if (key === "key" || key === "auth") return { kind: "help" };
   if (key === "model" || key === "m") {
     if (!tail) return { kind: "help" };
     // auto = 交还给免费链（与「固定某个模型」相对）

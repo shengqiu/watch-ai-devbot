@@ -7,7 +7,7 @@ export interface Incoming {
   chatId: string;
   /** 发送者 id（群聊时与 chatId 不同） */
   userId: string;
-  /** 消息 id（撤回/删除用：/gemini key 会把带密钥的那条消息删掉） */
+  /** 消息 id（回执/编辑用；密钥不再经聊天发送，故不再有删除带密钥消息的逻辑） */
   messageId: number | null;
   /** 文本内容（text 或 caption），已 trim */
   text: string;

@@ -10,7 +10,6 @@ import { extractIncoming } from "../src/telegram/update.js";
 import {
   buildGeminiScript,
   DEFAULT_GEMINI_MODEL,
-  buildKeyScript,
   buildStatusScript,
   buildModelsScript,
   buildNewSessionScript,
@@ -986,7 +985,9 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("gem exit 等价 off", parseGeminiArgs("exit").kind, "off");
   check("gem status", parseGeminiArgs("status").kind, "status");
   check("gem new", parseGeminiArgs("new").kind, "new");
-  check("gem key 取值", parseGeminiArgs("key AIza123").key, "AIza123");
+  // 安全：key/auth 不再经聊天收密钥，统一回 help（绝不把密钥透传给 ask）
+  check("gem key 不再收密钥", parseGeminiArgs("key AIza123").kind, "help");
+  check("gem auth 不再收密钥", parseGeminiArgs("auth AIza123").kind, "help");
   check("gem key 无值 → help", parseGeminiArgs("key").kind, "help");
   check("gem model", parseGeminiArgs("model pro").model, "pro");
   const ask = parseGeminiArgs("把 README 第 3 节改成中文");
@@ -1019,15 +1020,7 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
     "hi",
   );
 
-  // 写 key 的脚本绝不能出现明文
-  const keyCmd = buildKeyScript("AIzaSECRET123");
-  check("key 不落明文", keyCmd.includes("AIzaSECRET123"), false);
-  check("key 落 chmod 600", keyCmd.includes("chmod 600"), true);
-  check(
-    "key 可还原",
-    Buffer.from(/printf %s '([^']+)'/.exec(keyCmd)[1], "base64").toString("utf8"),
-    "AIzaSECRET123",
-  );
+  // 写 key 的脚本已移除（密钥不再经聊天发送，避免 Telegram 通知/备份/日志留明文）
 
   check("状态脚本查 CLI", buildStatusScript().includes("command -v gemini"), true);
   check("状态脚本查 key", buildStatusScript().includes("GEMINI_API_KEY"), true);
@@ -1310,7 +1303,7 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   // 报错文案必须「直接给出下一步」，不能只说没有 key
   check("报错点明三处来源", run.includes("三处都没有 key"), true);
   check("报错给出补 secret 的路径", run.includes("Settings → Codespaces → GEMINI_API_KEY"), true);
-  check("报错给出临时替代命令", run.includes("/gemini key <KEY>"), true);
+  check("报错不再引导聊天输 key（防泄露）", run.includes("/gemini key <KEY>"), false);
   check("报错不再说「还没有 Gemini API key」", run.includes("还没有 Gemini API key"), false);
 }
 

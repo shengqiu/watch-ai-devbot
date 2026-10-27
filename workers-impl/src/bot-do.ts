@@ -49,7 +49,6 @@ import { ShellHub, type ShellOutMsg, type ShellPing } from "./shell";
 import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest } from "./agent-auth";
 import {
   buildGeminiScript,
-  buildKeyScript,
   buildStatusScript,
   buildModelsScript,
   buildNewSessionScript,
@@ -132,7 +131,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261027-v4.7";
+const BUILD = "devbot-20261027-v4.8";
 
 /**
  * 未识别输入时的兜底提示。
@@ -870,29 +869,6 @@ export class AssistantDO extends DurableObject<Env> {
           "🔍 gemini status",
         );
         return;
-      case "key": {
-        // 带密钥的那条消息先删掉（私聊里 bot 可以删自己的消息与用户刚发的消息）
-        if (messageId) {
-          try {
-            await this.tg.call("deleteMessage", { chat_id: chatId, message_id: messageId });
-          } catch (e) {
-            console.warn("[gemini] 删除含密钥的消息失败", e);
-          }
-        }
-        // echo=false + quiet=true：命令原文既不回显到 Telegram，也不写 agent 日志
-        const res = this.shell.enqueue(chatId, buildKeyScript(act.key), {
-          label: "🔑 写入 Gemini API key",
-          echo: false,
-          quiet: true,
-        });
-        await this.reply(
-          chatId,
-          res.ok
-            ? "🔑 已发往开发机写入 ~/.config/watch-ai/gemini-key（chmod 600）。回复里不会出现明文。"
-            : (res.message ?? "写入失败，稍后再试。"),
-        );
-        return;
-      }
       case "ask":
         // 一次性提问不动模式开关：在会话里临时问一句不该把你踢出会话
         await this.startGemini(chatId, act.prompt);

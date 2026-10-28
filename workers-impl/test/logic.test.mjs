@@ -463,6 +463,18 @@ check("关机：不动作", evalWatch(W({ running: false })), {
   check("新鲜互动：不标记提醒", d.markReminded, false);
 }
 
+// 有命令在跑（busy）：就算闲置已久也不关机 —— codebuddy 长任务保护
+// 场景：/buddy 触发一个 40 分钟任务，期间 Telegram 一条消息都没有；
+// 没有这个判据，第 55 分钟机器被整个停掉，任务随之中断、输出全丢。
+{
+  const now = 10_000_000 + 60 * MIN;
+  const d = evalWatch(W({ now, busy: true }));
+  check("busy：超时也不关机", d.stop, false);
+  check("busy：不打扰", d.notify, null);
+  check("busy：5 分钟后复查", d.nextCheck, now + 5 * MIN);
+  check("busy：GH 追踪重置", d.ghFreshSince, null);
+}
+
 // 不变量：机器刚起来时不可能「已经闲置很久」（2026-10-28 事故回归）
 // 场景：上一轮窗口的 lastActivity 是一小时前，/buddy 刚把机器拉起来，
 // 一轮已经到期的 watchdog alarm 正好落在这几十秒里 → 旧算法算出 idle=60min →
@@ -856,6 +868,67 @@ const {
   await new Promise((r) => setTimeout(r, 20));
   check("epoch 变化 → 立刻解锁", hub.pending(), 0);
   check("说明是 agent 重启导致", sent.join("").includes("agent 重启过"), true);
+}
+
+// ---- ShellHub：心跳带 proc 字段 → snapshot/procLine 能答「进程在干什么」----
+{
+  const hub = new ShellHub(async () => {}, { staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  check("没在跑：procLine 说没有命令", hub.procLine(), "（当前没有命令在跑）");
+  hub.onPing({ epoch: 300, running: null, proc: null });
+  const q = hub.enqueue("c1", "ls");
+  hub.onPing({ epoch: 300, running: q.id, proc: "codebuddy[84] S 睡眠（等 IO/网络，正常） · CPU 3.4s" });
+  check("proc 报上来", hub.snapshot().proc, "codebuddy[84] S 睡眠（等 IO/网络，正常） · CPU 3.4s");
+  check("procLine 用心跳里的", hub.procLine(), "codebuddy[84] S 睡眠（等 IO/网络，正常） · CPU 3.4s");
+  hub.onPing({ epoch: 300, running: q.id, proc: null });
+  check("心跳有 proc 字段但为空 → 报「刚启动」而不是「版本太老」", hub.procLine(), "（agent 未报告，可能刚启动）");
+}
+
+// ---- ShellHub：老 agent 不发 proc → 明确提示要升级，而不是含糊的「未知」----
+{
+  const hub = new ShellHub(async () => {}, { staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  hub.onPing({ epoch: 400, running: null });
+  const q = hub.enqueue("c1", "ls");
+  hub.onPing({ epoch: 400, running: q.id }); // 老 agent：只报 running
+  check("老 agent → 提示升级", hub.procLine(), "进程状态未知（agent 版本太老，需 git pull）");
+}
+
+// ---- ShellHub：幽灵输出 —— 命令登记被清了，但输出还在来 → 至少说一声 ----
+// 场景：TTL 清掉了长任务的登记（或 DO 被回收），机器上它还在跑，输出进黑洞。
+{
+  const sent = [];
+  const hub = new ShellHub(async (_c, t) => sent.push(t), { ackMs: 60000, staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  hub.onPing({ epoch: 500 });
+  const q = hub.enqueue("c1", "codebuddy 大活", { label: "🧩 大活" });
+  await hub.onOutput({ id: q.id, ack: true });
+  // 模拟：命令被 dropLost（比如发下一条命令触发 reapLost 清掉）
+  hub.onPing({ epoch: 500, running: null });
+  hub.reapLost(Date.now() + 10 * 60_000); // idleMs 默认 45s，10 分钟足够
+  check("被清理了", hub.pending(), 0);
+  // 迟到的输出包：以前直接 return（黑洞），现在要通知到人
+  await hub.onOutput({ id: q.id, text: "partial result..." });
+  check("幽灵输出 → 通知到人", sent.some((t) => t.includes("可能还在跑")), true);
+  // 重复的幽灵包只通知一次，不轰炸
+  const n = sent.length;
+  await hub.onOutput({ id: q.id, text: "more output" });
+  check("幽灵输出只通知一次", sent.length, n);
+}
+
+// ---- ShellHub：TTL 从最后一次活动起算（长任务不再被 15 分钟误杀）----
+{
+  const hub = new ShellHub(async () => {}, { ackMs: 60000, idleMs: 45_000, staleMs: 600000 });
+  hub.attach({ enqueue: () => {} });
+  hub.onPing({ epoch: 600 });
+  const q = hub.enqueue("c1", "long task");
+  await hub.onOutput({ id: q.id, ack: true });
+  // 默认 TTL 60 分钟；从下发时刻算的话 20 分钟就该过期 —— 从最后活动算就不该
+  check(
+    "下发了 20 分钟且一直在跑 → 不算过期",
+    hub.reapLost(q.at + 20 * 60_000).length,
+    0,
+  );
 }
 
 // ---- ShellHub：发下一条命令时自动清掉失联的那条（用户不用记得 /ctrlc）----

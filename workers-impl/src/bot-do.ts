@@ -175,7 +175,17 @@ import {
 //       「机器在跑，但 shell 通道还没连上」。现在 evalWatch 里加了不变量
 //       「空闲 ≤ 本轮已运行」（active = max(lastActivity, bootAt)），并有回归测试；
 //       AI 等待通道时 60 秒也会先回一句，不再让人干等 5 分钟。
-const BUILD = "devbot-20261028-v4.19";
+// v4.20：长任务生存 + 进程可见性（用户问「codebuddy 长任务会不会被杀」—— 会，一次
+//       排出 5 条杀手路径，本版砍掉其中 3 条）：
+//       · agent 侧（watch-ai-assistant 仓）：看门狗从「4/8 分钟零输出即杀」改为读
+//         /proc 看证据（zombie/never-moved/cpu-frozen 才杀；suspended/io 只报不杀；
+//         其余继续等并周期播报），心跳带 proc 状态行；
+//       · 命令 TTL：从下发时刻 → 最后一次活动时刻（心跳说在跑 = 活动），兜底
+//         15 → 60 分钟；
+//       · 省额度看门狗：开发机上有命令在跑（busy）= 正在用，不打扰不关机；
+//       · /cs：有命令在跑时显示进程状态行（agent 太老会明说需 git pull）；
+//       · 幽灵输出：登记被清后迟到的输出不再静默丢弃，会提示「它可能还在跑」。
+const BUILD = "devbot-20261028-v4.20";
 
 /**
  * 「AI 编程会话」的两种 provider。/gemini 与 /buddy 除脚本生成外流程完全一致
@@ -834,7 +844,10 @@ export class AssistantDO extends DurableObject<Env> {
       if (st.state === "Available") await this.ensureWatch(null, "bot");
       // 顺带报联机通道：用户看完「运行中」的下一句必然是「那我能发命令了吗」
       const shell = this.shell.online() ? "已连接 ✓ 可以直接发命令" : "未连接（开机后约 10~30 秒自动连上）";
-      return `开发机状态：${describeState(st.state)}\nshell 通道：${shell}`;
+      const s = this.shell.snapshot();
+      // 有命令在跑时把进程状态一并报出来：这才是「到底在等 / 被挂起 / 已死」的答案
+      const proc = s.agentRunning ? `\n当前命令：${this.shell.procLine()}` : "";
+      return `开发机状态：${describeState(st.state)}\nshell 通道：${shell}${proc}`;
     } catch (e) {
       return `查询失败：${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
     }
@@ -1455,6 +1468,8 @@ export class AssistantDO extends DurableObject<Env> {
       ghCapMin: this.ghCapMin(),
       ghCapAction: this.ghCapAction(),
       graceMin: this.watchGraceMin(),
+      // 开发机上有命令在跑 = 正在用（长任务期间 Telegram 可能一条消息都没有）
+      busy: this.shell.snapshot().agentRunning !== null,
     });
     // 写回第三信号追踪状态（ghFreshSince/capNotified/capNotifiedAt）
     ep.ghFreshSince = decision.ghFreshSince;

@@ -68,6 +68,15 @@ export interface WatchInput {
   ghCapAction: "notify" | "stop";
   /** "stop" 模式下的宽限期（分钟，默认 15）：警告后给多久让你回一个字取消 */
   graceMin: number;
+  /**
+   * 开发机上此刻有没有命令在跑（agent 心跳报告 running 非空）。
+   *
+   * 为什么必须单独传进来：一条 codebuddy 长任务可以跑 40 分钟，期间 Telegram
+   * 一条消息都没有（`/buddy <问题>` 只在发出时算一次互动）。只看「距上次互动」
+   * 就会把它当成闲置，55 分钟后整台机器被停 —— 任务随之中断、输出全丢。
+   * 有命令在跑 = 正在用，跟「你刚说过话」是同一级别的活跃证据。
+   */
+  busy?: boolean;
 }
 
 /** 看门狗决策输出。 */
@@ -115,6 +124,20 @@ export function evalWatch(w: WatchInput): WatchDecision {
       ghFreshSince: null,
       capNotified: false,
       capNotifiedAt: null,
+    };
+  }
+
+  // 0.5) 有命令在跑：机器正在干活，一律不打扰、不关机。
+  //      5 分钟后复查 —— 命令一结束，闲置倒计时自然从那一刻重新开始。
+  if (w.busy) {
+    return {
+      notify: null,
+      stop: false,
+      nextCheck: w.now + 5 * MIN,
+      markReminded: false,
+      ghFreshSince: null, // 正在干活：GH 活跃追踪重置
+      capNotified: w.capNotified, // 保留，别重复轰炸
+      capNotifiedAt: w.capNotifiedAt,
     };
   }
 

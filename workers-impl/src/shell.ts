@@ -203,6 +203,12 @@ export interface ShellPing {
   gen?: number;
   /** 此刻真正在跑的命令 id；null = 空闲。 */
   running?: string | null;
+  /**
+   * 在跑的那条命令的进程状态（一行人话，由 agent 读 /proc 拼出来）。
+   * 例：`codebuddy[8341] S 睡眠（等 IO/网络，正常）· 等 ep_poll · CPU 3.4s`
+   * 老 agent 不发这个字段 → 显示「进程状态未知（agent 版本太老）」。
+   */
+  proc?: string | null;
 }
 
 export interface ShellHubOpts {
@@ -262,6 +268,14 @@ export class ShellHub {
   /** 未收到 ack 的重发定时器（命令 id → timer） */
   private readonly ackTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
+   * 「已经清理掉、但机器上可能还在跑」的命令（id → 记录）。
+   * 只保留最近 20 条：用途是给迟到的输出包一个能通知到的人，不是审计日志。
+   */
+  private readonly ghosts = new Map<
+    string,
+    { chatId: string; label: string; at: number; notified: boolean }
+  >();
+  /**
    * 是否见过 agent 的心跳。
    *
    * 老版本 agent 不会 ping，此时只能沿用「SSE 写成功 = 在线」的旧判据；
@@ -273,6 +287,10 @@ export class ShellHub {
   private agentEpoch = 0;
   /** agent 最近一次心跳里报告的在跑命令（null = 空闲）。 */
   private agentRunning: string | null = null;
+  /** agent 最近一次心跳里报告的进程状态（一行人话；null = 没在跑 / 老 agent）。 */
+  private agentProc: string | null = null;
+  /** 是否见过带 proc 字段的心跳（用来区分「老 agent」和「当前没在跑」）。 */
+  private procSeen = false;
 
   private readonly flushMs: number;
   private readonly chunkLimit: number;
@@ -294,7 +312,9 @@ export class ShellHub {
     this.chunkLimit = opts.chunkLimit ?? 3400;
     this.maxChars = opts.maxChars ?? 24000;
     this.staleMs = opts.staleMs ?? 90_000;
-    this.cmdTtlMs = opts.cmdTtlMs ?? 900_000;
+    // 60 分钟：长任务（codebuddy 改一整个项目）必须活得过它。
+    // 真正的卡死由 agent 侧的进程探针判定，这里只兜「彻底失联」。
+    this.cmdTtlMs = opts.cmdTtlMs ?? 3_600_000;
     this.ackMs = opts.ackMs ?? 12_000;
     this.maxTries = opts.maxTries ?? 3;
     this.idleMs = opts.idleMs ?? 45_000;
@@ -325,6 +345,8 @@ export class ShellHub {
     cwd: string | null;
     pingSeen: boolean;
     agentRunning: string | null;
+    proc: string | null;
+    procSeen: boolean;
   } {
     return {
       online: this.online(),
@@ -333,7 +355,19 @@ export class ShellHub {
       cwd: this.lastCwd,
       pingSeen: this.pingSeen,
       agentRunning: this.agentRunning,
+      proc: this.agentProc,
+      procSeen: this.procSeen,
     };
+  }
+
+  /**
+   * 当前命令的进程状态说明（给 /cs 用）。
+   * 区分三种「不知道」：没在跑、agent 太老、真的读不到 —— 别混成一句话。
+   */
+  procLine(): string {
+    if (!this.agentRunning) return "（当前没有命令在跑）";
+    if (this.agentProc) return this.agentProc;
+    return this.procSeen ? "（agent 未报告，可能刚启动）" : "进程状态未知（agent 版本太老，需 git pull）";
   }
 
   /**
@@ -483,10 +517,44 @@ export class ShellHub {
     return dropped;
   }
 
+  /** 记住一条被清理掉的命令（上限 20 条，超出淘汰最老的）。 */
+  private rememberGhost(id: string, chatId: string, label: string): void {
+    this.ghosts.set(id, { chatId, label, at: Date.now(), notified: false });
+    while (this.ghosts.size > 20) {
+      const oldest = [...this.ghosts.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (!oldest) break;
+      this.ghosts.delete(oldest[0]);
+    }
+  }
+
+  /**
+   * 收到一条「已经不认识的命令」的输出。
+   *
+   * 以前这里直接 `return` —— 于是出现最难受的一类事故：命令在开发机上还活着，
+   * Worker 侧的登记被清掉了（超时 / DO 回收），后面所有输出全部静默消失，
+   * 用户盯着一个再也不会更新的气泡干等，而 Worker 一句话都不说。
+   * 现在改为「至少告诉你发生了什么」。
+   */
+  private async onGhostOutput(msg: ShellOutMsg): Promise<void> {
+    const g = this.ghosts.get(msg.id);
+    if (!g || g.notified) return;
+    g.notified = true;
+    const chars = msg.text?.length ?? 0;
+    await this.send(
+      g.chatId,
+      `⚠️「${g.label}」的登记已经不在了（超时清理或 DO 被回收），但它**在开发机上可能还在跑** —— ` +
+        `刚收到它 ${chars} 字节的输出，无法投递。\n` +
+        `发 /cs 看进程状态；确认卡住就 /ctrlc，或重发一次。`,
+    );
+  }
+
   /** agent 回传输出（可能是增量片段，也可能是 done 收尾包）。 */
   async onOutput(msg: ShellOutMsg): Promise<void> {
     const rec = this.queue.get(msg.id);
-    if (!rec) return; // 命令已被清理/超时，忽略迟到的包
+    if (!rec) {
+      await this.onGhostOutput(msg);
+      return;
+    }
     const b = this.buf.get(msg.id);
     if (!b) return;
 
@@ -537,6 +605,8 @@ export class ShellHub {
 
     const run = typeof info.running === "string" && info.running ? info.running : null;
     this.agentRunning = run;
+    if (typeof info.proc === "string" || info.proc === null) this.procSeen = true;
+    this.agentProc = typeof info.proc === "string" && info.proc ? info.proc : null;
     if (run) {
       const c = this.queue.get(run);
       if (c) {
@@ -568,7 +638,10 @@ export class ShellHub {
       // 老 agent 不发 ping：agentRunning 恒为 null，此时不能拿它当证据，
       // 只能退回「长时间无任何输出」（给足 10 分钟，别误杀静默安装）。
       const abandoned = c.ackedAt && idle > (this.pingSeen ? this.idleMs : Math.max(this.idleMs, 600_000));
-      const expired = now - c.at > this.cmdTtlMs;
+      // 兜底从「最后一次有动静」起算，不再从下发时刻起算：
+      // 以前一条 20 分钟的 codebuddy 长任务会在第 15 分钟被判超时（agent 明明还报着
+      // 「在跑」，只是那 15 秒的 ping 还没到），队列被解锁、输出进黑洞。
+      const expired = idle > this.cmdTtlMs;
       if (!neverAcked && !abandoned && !expired) continue;
       lost.push(c);
       const why = neverAcked
@@ -586,6 +659,8 @@ export class ShellHub {
     const c = this.queue.get(id);
     if (!c) return;
     this.clearAck(id);
+    // 留一张「名片」：万一它其实还在开发机上跑，迟到的输出能找到人通知
+    this.rememberGhost(id, c.chatId, c.label ?? c.cmd.split("\n")[0].slice(0, 40));
     const b = this.buf.get(id);
     if (b?.timer) clearTimeout(b.timer);
     this.buf.delete(id);

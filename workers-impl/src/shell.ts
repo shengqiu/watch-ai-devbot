@@ -156,6 +156,12 @@ export interface ShellCmd {
   /** true = 不把命令原文写进 agent 日志（含密钥时） */
   quiet?: boolean;
   /**
+   * true = 输出按 markdown 渲染（LLM 回答：代码块/粗体/斜体）。
+   * AI 会话（/gemini、/buddy）的输出是 LLM 生成，走 MarkdownV2；
+   * 普通 shell 命令的输出是任意字节流，保持纯文本（乱转义反而毁输出）。
+   */
+  markdown?: boolean;
+  /**
    * true = 收尾小注只留 `— exit 0`，不报目录。给 AI 会话（/gemini、/buddy）用：
    * 它们的脚本整体跑在子 shell 里（避免 exit 杀掉长驻 shell），`cd` 不外泄，
    * 报出来的目录是**父 shell** 的位置，跟「AI 在哪个目录干活」不是一回事，
@@ -178,6 +184,8 @@ export interface ShellOpts {
   quiet?: boolean;
   /** 收尾小注里不报目录（只留 `— exit 0`），见 ShellCmd.hideCwd */
   hideCwd?: boolean;
+  /** 输出按 markdown 渲染（AI 会话），见 ShellCmd.markdown */
+  markdown?: boolean;
 }
 
 export interface ShellOutMsg {
@@ -242,7 +250,11 @@ export interface ShellHubOpts {
   signer?: (id: string, cmd: string) => Promise<string>;
 }
 
-type Sender = (chatId: string, text: string) => Promise<void>;
+/**
+ * 输出发送端。opts.markdown = 该条命令标记了 markdown（AI 会话），
+ * 发送端应按 MarkdownV2 渲染（TelegramClient.sendMessage 自带转义和降级兜底）。
+ */
+type Sender = (chatId: string, text: string, opts?: { markdown?: boolean }) => Promise<void>;
 
 const enc = new TextEncoder();
 
@@ -463,6 +475,7 @@ export class ShellHub {
     if (opts.echo === false) rec.echo = false;
     if (opts.quiet) rec.quiet = true;
     if (opts.hideCwd) rec.hideCwd = true;
+    if (opts.markdown) rec.markdown = true;
     this.queue.set(id, rec);
     this.buf.set(id, { parts: [], chars: 0, timer: null, echoed: false });
     this.push(rec);
@@ -807,8 +820,11 @@ export class ShellHub {
       return;
     }
 
+    // markdown 命令（AI 会话）的输出走 MarkdownV2；代码块被 chunkOutput 劈开时
+    // 单条消息里的未闭合 ``` 会被发送端的转义器当普通文本降级 —— sendMessage
+    // 自带「V2 被拒 → 纯文本重发」兜底，不会 400，最差退化为字面量（与现状一致）。
     for (const part of chunkOutput(capOutput(out, this.maxChars), this.chunkLimit)) {
-      if (part.trim()) await this.send(cmd.chatId, part);
+      if (part.trim()) await this.send(cmd.chatId, part, { markdown: cmd.markdown === true });
     }
     if (done) {
       this.clearAck(id);

@@ -757,8 +757,8 @@ const {
 // ---- ShellHub 状态机：离线/排队/输出刷写/串行 ----
 {
   const sent = [];
-  const hub = new ShellHub(async (chatId, text) => {
-    sent.push({ chatId, text });
+  const hub = new ShellHub(async (chatId, text, opts) => {
+    sent.push({ chatId, text, markdown: opts?.markdown === true });
   }, { flushMs: 10, maxChars: 100 });
 
   check("初始离线", hub.online(), false);
@@ -798,6 +798,20 @@ const {
   const last3 = sent[sent.length - 1];
   check("hideCwd 保留 exit", last3.text.includes("— exit 0"), true);
   check("hideCwd 不报目录", last3.text.includes("/workspaces"), false);
+  check("普通命令不带 markdown 标记", last3.markdown, false);
+
+  // AI 会话命令带 markdown：发送端收到的每一段都带标记（渲染层据此选 MarkdownV2）
+  const q4 = hub.enqueue("c1", "bash /tmp/buddy.sh", { label: "🧩 提问", hideCwd: true, markdown: true });
+  await hub.onOutput({
+    id: q4.id,
+    text: "​```python\nprint('hi')\n```\n**结论**：好了\n",
+    done: true,
+    exit: 0,
+    cwd: null,
+  });
+  const last4 = sent[sent.length - 1];
+  check("markdown 命令的输出带标记", last4.markdown, true);
+  check("markdown 内容原样到达发送端", last4.text.includes("**结论**"), true);
 
   // 输出超限截断
   const sent2 = [];

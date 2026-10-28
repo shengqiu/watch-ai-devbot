@@ -190,7 +190,12 @@ import {
 //       Worker SHELL_MAX_CHARS 2.4 万 → 200 万（旧值掐头尾丢中间）；Telegram
 //       4096/条的分块保留（物理上限），sendMessage 429 限速改为按 retry_after
 //       重试（完整回传后一次连发几十条是常态，429 从异常变成预期内）。
-const BUILD = "devbot-20261028-v4.21";
+// v4.22：AI 会话输出走 MarkdownV2（用户反馈「buddy 的输出没有 markdown 高亮」）。
+//       sendShellChunk 之前是纯文本直发，``` 代码块和 **粗体** 全部原样显示。
+//       现在 ShellCmd 加 markdown 标志（六个 AI 下发点全带），发送端按该标志
+//       走 TelegramClient.sendMessage（mdToV2 转换 + 400 降级纯文本兜底）；
+//       普通 shell 命令保持纯文本（任意字节流，乱转义反而毁输出）。
+const BUILD = "devbot-20261028-v4.22";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -999,7 +1004,7 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   private async enqueueBuddy(chatId: string, script: string, label: string): Promise<void> {
-    const res = this.shell.enqueue(chatId, script, { label, hideCwd: true });
+    const res = this.shell.enqueue(chatId, script, { label, hideCwd: true, markdown: true });
     if (res.ok) return;
     await this.reply(chatId, res.message ?? "shell 通道不可用。");
   }
@@ -1083,6 +1088,7 @@ export class AssistantDO extends DurableObject<Env> {
       const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt, model }), {
         label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
         hideCwd: true,
+        markdown: true,
       });
       if (modeHint) await this.reply(chatId, modeHint);
       if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
@@ -1197,7 +1203,7 @@ export class AssistantDO extends DurableObject<Env> {
 
   /** 简单脚本（status / new）：通道不在线就别假装成功。 */
   private async enqueueGemini(chatId: string, script: string, label: string): Promise<void> {
-    const res = this.shell.enqueue(chatId, script, { label, hideCwd: true });
+    const res = this.shell.enqueue(chatId, script, { label, hideCwd: true, markdown: true });
     if (res.ok) return;
     await this.reply(chatId, res.message ?? "shell 通道不可用。");
   }
@@ -1217,6 +1223,7 @@ export class AssistantDO extends DurableObject<Env> {
       const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt, model, chain: this.geminiChain() }), {
         label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
         hideCwd: true,
+        markdown: true,
       });
       if (modeHint) await this.reply(chatId, modeHint);
       if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
@@ -1326,6 +1333,7 @@ export class AssistantDO extends DurableObject<Env> {
       const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt: prompt ?? undefined, model }), {
         label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
         hideCwd: true,
+        markdown: true,
       });
       if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
       return;
@@ -1336,6 +1344,7 @@ export class AssistantDO extends DurableObject<Env> {
     const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt: prompt ?? undefined, model, chain: this.geminiChain() }), {
       label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
       hideCwd: true,
+      markdown: true,
     });
     if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
   }
@@ -1930,20 +1939,24 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /** shell 输出回传：纯文本发送，不走 MarkdownV2（命令输出里转义符太多，容易 400/渲染乱）。 */
-  private async sendShellChunk(chatId: string, text: string): Promise<void> {
+  private async sendShellChunk(chatId: string, text: string, opts?: { markdown?: boolean }): Promise<void> {
     // Telegram 对连续 sendMessage 限速（~1msg/s，突发 ~30）。完整回传长输出时
     // 一次可能连发几十条，429 是常态而不是异常 —— 按 retry_after 等待后重发。
     for (let attempt = 1; ; attempt++) {
       try {
-        await this.tg.call("sendMessage", {
-          chat_id: chatId,
-          text,
-          disable_web_page_preview: true,
-        });
+        if (opts?.markdown) {
+          // AI 会话输出：走 sendMessage 的 MarkdownV2（自带 mdToV2 转义 + 400 降级纯文本）
+          await this.tg.sendMessage(chatId, text);
+        } else {
+          await this.tg.call("sendMessage", {
+            chat_id: chatId,
+            text,
+            disable_web_page_preview: true,
+          });
+        }
         return;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        const m = /HTTP 429.*retry after (\d+)/i.exec(msg) ?? /HTTP 429/i.exec(msg) ? null : null;
         const retryAfter = /retry after (\d+)/i.exec(msg)?.[1];
         const waitMs = retryAfter ? Number(retryAfter) * 1000 + 500 : 1500;
         if (/HTTP 429/.test(msg) && attempt <= 5) {

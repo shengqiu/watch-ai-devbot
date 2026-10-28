@@ -61,6 +61,18 @@ function doStub(env: Env): DurableObjectStub {
   return env.BOT.get(env.BOT.idFromName(env.DO_KEY || "singleton"));
 }
 
+/** 需要走 ADMIN_KEY 鉴权再透传给 DO 的管理端点（含机器密钥管理）。 */
+function isAdminProxy(pathname: string): boolean {
+  return (
+    pathname === "/csdebug" ||
+    pathname === "/send" ||
+    pathname === "/patrol" ||
+    pathname === "/shell/status" ||
+    pathname === "/admin/agents" ||
+    pathname.startsWith("/admin/agents/")
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     // 顶层 try/catch：任何未捕获异常都转成可读 JSON，而不是 opaque 的 1101
@@ -162,15 +174,16 @@ export default {
       }
 
       // DO 内部路由透传（管理端点，统一 ADMIN_KEY 鉴权）
-      if (
-        url.pathname === "/csdebug" ||
-        url.pathname === "/send" ||
-        url.pathname === "/patrol" ||
-        url.pathname === "/shell/status"
-      ) {
+      if (isAdminProxy(url.pathname)) {
         const d = adminAdmit(ip, env, request);
         if (d) return d;
-        return stub.fetch(`http://do${url.pathname}?${url.searchParams.toString()}`);
+        // GET/HEAD 走查询串；POST/DELETE 转发请求体（机器密钥管理需要 body）
+        const forwardBody = request.method === "POST" || request.method === "DELETE";
+        return stub.fetch(`http://do${url.pathname}?${url.searchParams.toString()}`, {
+          method: request.method,
+          headers: request.headers,
+          body: forwardBody ? request.body : undefined,
+        });
       }
 
       return new Response("watch-ai assistant (telegram). try /healthz", { status: 200 });

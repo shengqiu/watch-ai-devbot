@@ -66,7 +66,8 @@ export interface Env {
   // 部署身份标识（var）：主 bot 不设（显示 main）；devbot 部署设为 "devbot"
   BOT_IDENTITY?: string;
 
-  // 身份验证会话：VERIFY_ANSWER 为 secret（必配，未配 = 服务锁定）；会话时长分钟（默认 30）
+  // 身份验证会话：VERIFY_ANSWER 为 secret（必配，未配 = 服务锁定）；
+  // 会话时长分钟，默认 10（滑动窗口：连续 10 分钟不交互即失效，须重新验证）
   VERIFY_ANSWER?: string;
   VERIFY_SESSION_MIN?: string;
 
@@ -82,9 +83,18 @@ export interface Env {
   DEPLOY_KEY?: string;
 
   // Shell 通道（Telegram ⇄ codespace 内持久 bash）
-  AGENT_KEY?: string; // secret：agent 与 Worker 的共享密钥（只用于算 HMAC，不再上行文）
+  /**
+   * 每台机器独立密钥的静态注册表（secret，JSON 对象 `{"machine-id":"key", ...}`，
+   * 也支持行式 `machine-id:key` 每行一条）。这是「区分 / 吊销单台机器」的核心：
+   * Worker 按 X-Agent-Id 在这里查这台机器专用的密钥，未知 id 或已吊销 id 一律 401。
+   * 它存于 Worker secret（不是 DO storage），所以扛得过 DO_KEY 换版带来的 storage 清空。
+   * 未配时回退到旧的单共享 AGENT_KEY（过渡期，不推荐长期保留）。
+   */
+  AGENT_KEYS?: string;
+  AGENT_KEY?: string; // secret：过渡期单共享密钥（AGENT_KEYS 未配时作回退；配了 AGENT_KEYS 后应停用）
   AGENT_LEGACY_KEY?: string; // var："1" = 仍接受明文 X-Agent-Key（仅 agent 未升级时的过渡，默认关）
-  AGENT_ID?: string; // var：期望的 agent 身份（codespace 名）；空 = 只记录不强制
+  // AGENT_ID 已由 AGENT_KEYS 注册表的成员资格取代：未知 id 直接拒，无需再单独声明期望 id。
+  AGENT_ID?: string; // var（已废弃）：旧的单期望身份；保留字段仅为兼容，不再强制校验
   SHELL_ENABLED?: string; // var："1"（默认）启用；"0" = 未识别文本不做 shell 转发
   SHELL_FLUSH_MS?: string; // var：增量输出静默刷写窗口（毫秒，默认 1200）
   SHELL_MAX_CHARS?: string; // var：单条命令输出上限（字符，默认 24000）

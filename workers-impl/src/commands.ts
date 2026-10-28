@@ -265,7 +265,8 @@ export function renderHelp(): string {
   lines.push("（长驻 bash：cd / export / 后台进程都会保留）");
   lines.push("");
   lines.push("单独发验证词 = 开机口令（机器在跑就只回一句确认）；");
-  lines.push("会话过期会先要验证词，通过后 30 分钟内免验证；");
+  lines.push("会话过期会先要验证词，通过后 10 分钟内互动免验证；");
+  lines.push("（10 分钟不说话就失效，下一条消息要重新验证）");
   lines.push("验证前发的那条命令会自动补执行，不用重发。");
   lines.push("");
   lines.push("细节看 /help <指令>，例如 /help boot");

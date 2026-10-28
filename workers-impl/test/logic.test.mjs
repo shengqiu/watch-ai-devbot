@@ -314,6 +314,7 @@ import {
   PENDING_CMD_TTL_MS,
   answerFingerprint,
   looksLikeCommand,
+  VERIFY_SESSION_DEFAULT_MIN,
 } from "../src/verify.js";
 
 const T0 = 1_000_000;
@@ -356,6 +357,23 @@ check("归一化保留中间标点", normalizeAnswer("爸。爸"), "爸。爸");
 }
 check("续期计算", nextExpiry(T0, HALF_H), T0 + HALF_H);
 check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
+
+// ---- 会话窗口 = 10 分钟（2026-10-28 用户要求「严格的 10 分钟不交互就验证」）----
+{
+  const TEN = VERIFY_SESSION_DEFAULT_MIN * 60_000;
+  check("默认会话时长 10 分钟", VERIFY_SESSION_DEFAULT_MIN, 10);
+  check("默认窗口毫秒数", TEN, 600_000);
+  const exp = nextExpiry(T0, TEN);
+  check("第 9 分 59 秒仍有效", isVerified({ exp }, T0 + TEN - 1000), true);
+  check("差 1 毫秒到期仍有效", isVerified({ exp }, T0 + TEN - 1), true);
+  check("刚好 10 分钟 → 失效", isVerified({ exp }, T0 + TEN), false);
+  check("超过 10 分钟 → 失效", isVerified({ exp }, T0 + TEN + 1), false);
+  // 滑动语义：中途任何交互都重新拿到完整 10 分钟
+  const exp2 = nextExpiry(T0 + 9 * 60_000, TEN);
+  check("第 9 分钟交互 → 续到 +19 分钟", exp2, T0 + 19 * 60_000);
+  check("续期后跨过原到期点仍有效", isVerified({ exp: exp2 }, T0 + TEN), true);
+  check("但续期也要重新数满 10 分钟", isVerified({ exp: exp2 }, T0 + 19 * 60_000), false);
+}
 
 // ---- 验证前命令暂存（shouldReplay / previewCmd）----
 {
@@ -1163,10 +1181,12 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
     return { headers: h, bodyText: o.bodyText ?? body };
   };
 
-  const base = { secret, legacyAllowed: false, method: "POST", path: "/shell/out", now, expectedId: "cs-1" };
+  // 每台机器独立密钥：agentKeyFor 按 X-Agent-Id 选密钥（cs-1 → secret，其它 → 无）
+  const keyFor = (id) => (id === "cs-1" ? secret : undefined);
+  const base = { agentKeyFor: keyFor, legacyKey: secret, legacyAllowed: false, method: "POST", path: "/shell/out", now };
   const okReq = await mk();
   const r1 = await A.verifyAgentRequest({ ...base, ...okReq, nonces: new A.NonceCache() });
-  check("合法签名通过", r1.ok && r1.mode, "hmac");
+  check("合法签名通过（按 id 选密钥）", r1.ok && r1.mode, "hmac");
 
   const r2 = await A.verifyAgentRequest({ ...base, ...okReq, bodyText: '{"id":"c1","text":"evil"}', nonces: new A.NonceCache() });
   check("改包体 → 拒绝", r2.ok, false);
@@ -1179,17 +1199,41 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   const stale = await mk({ ts: now - 600_000, nonce: "stale0000000000" });
   check("过期时间戳 → 拒绝", (await A.verifyAgentRequest({ ...base, ...stale, nonces: new A.NonceCache() })).ok, false);
 
+  // 身份（X-Agent-Id）决定用哪把密钥：别的机器 id → 查不到密钥 → 401（无法冒充）
   const otherId = await mk({ nonce: "otherid00000000", id: "someone-else" });
-  check("身份不符 → 拒绝", (await A.verifyAgentRequest({ ...base, ...otherId, nonces: new A.NonceCache() })).ok, false);
+  check("未知机器 id → 拒绝（无法冒充别人）", (await A.verifyAgentRequest({ ...base, ...otherId, nonces: new A.NonceCache() })).ok, false);
+
+  // 已知 id 但用错密钥（密钥泄漏后拿别人的 id 连，却没有那把密钥）→ 拒绝
+  {
+    const fakeKey = "deadbeef".repeat(4);
+    const badSig = await A.signRequest(fakeKey, {
+      ts: String(now),
+      nonce: "wrongkey0000000",
+      method: "POST",
+      path: "/shell/out",
+      bodyText: JSON.stringify({ id: "c1", text: "hi" }),
+    });
+    const h = new Headers({
+      "X-Agent-Sig": badSig,
+      "X-Agent-Ts": String(now),
+      "X-Agent-Nonce": "wrongkey0000000",
+      "X-Agent-Id": "cs-1",
+    });
+    check(
+      "已知 id + 错密钥 → 拒绝",
+      (await A.verifyAgentRequest({ ...base, headers: h, bodyText: JSON.stringify({ id: "c1", text: "hi" }), nonces: new A.NonceCache() })).ok,
+      false,
+    );
+  }
 
   check(
-    "没配 AGENT_KEY → 一律拒绝",
-    (await A.verifyAgentRequest({ ...base, secret: "", ...okReq, nonces: new A.NonceCache() })).ok,
+    "没有任何密钥来源 → 一律拒绝（fail-closed）",
+    (await A.verifyAgentRequest({ agentKeyFor: () => undefined, legacyKey: undefined, legacyAllowed: false, ...okReq, nonces: new A.NonceCache() })).ok,
     false,
   );
 
-  // 旧的明文密钥：默认拒绝，只有显式放开过渡才通
-  const legacyHeaders = new Headers({ "X-Agent-Key": secret });
+  // 旧的明文密钥：默认拒绝，只有显式放开过渡才通（仍需带 X-Agent-Id）
+  const legacyHeaders = new Headers({ "X-Agent-Key": secret, "X-Agent-Id": "cs-1" });
   const l1 = await A.verifyAgentRequest({ ...base, headers: legacyHeaders, bodyText: "", nonces: new A.NonceCache() });
   check("明文密钥 默认拒绝", l1.ok, false);
   const l2 = await A.verifyAgentRequest({
@@ -1200,6 +1244,45 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
     nonces: new A.NonceCache(),
   });
   check("过渡开关打开才放行", l2.ok && l2.mode, "legacy");
+
+  // parseAgentKeys：静态注册表解析（JSON 与行式两种格式）
+  check(
+    "AGENT_KEYS JSON 解析",
+    JSON.stringify([...A.parseAgentKeys('{"a":"k1","b":"k2"}').entries()]),
+    JSON.stringify([["a", "k1"], ["b", "k2"]]),
+  );
+  check(
+    "AGENT_KEYS 行式解析（# 注释忽略）",
+    JSON.stringify([...A.parseAgentKeys("a:k1\nb:k2\n#c:ignored").entries()]),
+    JSON.stringify([["a", "k1"], ["b", "k2"]]),
+  );
+  check("AGENT_KEYS 空 → null（走过渡）", A.parseAgentKeys(""), null);
+  check("AGENT_KEYS 非法 JSON → null", A.parseAgentKeys("{not json"), null);
+  check("AGENT_KEYS 数组 → null（非对象）", A.parseAgentKeys("[1,2]"), null);
+
+  // 过渡期：未配 AGENT_KEYS 时，agentKeyFor 回退到共享 AGENT_KEY，空 id 也能连
+  {
+    const transFor = () => secret; // 过渡：任何 id（含空）都用共享密钥
+    const hdrs = new Headers({
+      "X-Agent-Sig": await A.signRequest(secret, { ts: String(now), nonce: "trans000000000000", method: "POST", path: "/shell/out", bodyText: "{}" }),
+      "X-Agent-Ts": String(now),
+      "X-Agent-Nonce": "trans000000000000",
+      // 不带 X-Agent-Id
+    });
+    const rt = await A.verifyAgentRequest({ agentKeyFor: transFor, legacyKey: secret, legacyAllowed: false, headers: hdrs, method: "POST", path: "/shell/out", bodyText: "{}", now, nonces: new A.NonceCache() });
+    check("过渡期空 id（回退共享密钥）→ 放行", rt.ok && rt.mode, "hmac");
+  }
+  // 严格模式（AGENT_KEYS 已配，agentKeyFor 仅认注册 id）：空 id → 拒绝
+  {
+    const strictFor = (id) => (id === "cs-1" ? secret : undefined);
+    const hdrs = new Headers({
+      "X-Agent-Sig": await A.signRequest(secret, { ts: String(now), nonce: "strict0000000000", method: "POST", path: "/shell/out", bodyText: "{}" }),
+      "X-Agent-Ts": String(now),
+      "X-Agent-Nonce": "strict0000000000",
+    });
+    const rs = await A.verifyAgentRequest({ agentKeyFor: strictFor, legacyKey: secret, legacyAllowed: false, headers: hdrs, method: "POST", path: "/shell/out", bodyText: "{}", now, nonces: new A.NonceCache() });
+    check("严格模式空 id → 拒绝", rs.ok, false);
+  }
 
   // 下行命令签名：帧里必须带 sig，且等于 HMAC(v1\\n<id>\\n<cmd>)
   const frames = [];

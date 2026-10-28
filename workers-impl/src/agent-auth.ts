@@ -19,6 +19,14 @@
  *
  * 时间窗 120s：允许机器时钟轻微漂移，同时把重放窗口压到两分钟内；配合
  * NonceCache（3 分钟），同一个签名只会被接受一次。
+ *
+ * 每台机器独立密钥（安全审查：agent 身份自声明）：
+ *   旧实现所有机器共用一把 AGENT_KEY，X-Agent-Id 由机器自己填、无法区分或吊销单台。
+ *   现在改为**按 id 查密钥**——`verifyAgentRequest` 用 `agentKeyFor(id)` 解析这台
+ *   机器该用的那把密钥。未知 id 或已吊销 id → 一律 401（fail-closed）。
+ *   密钥来源两路：① `AGENT_KEYS` 静态注册表（Worker secret，JSON `id→key`，
+ *   是权威且能扛过 DO_KEY 换版的安全边界）；② DO storage 里的运行期增/删/吊销覆盖
+ *   （让「吊销单台机器」可以即时生效，不必重新部署）。详见 bot-do.ts 的 agentKeyFor。
  */
 
 /** 请求头（agent → Worker）。名字都带 X-Agent- 前缀，方便在 CF 日志里定位。 */
@@ -192,8 +200,15 @@ export class FailWindow {
 export type AuthResult = { ok: true; mode: "hmac" | "legacy" } | { ok: false; reason: string };
 
 export interface VerifyOpts {
-  /** Worker 侧 secret（AGENT_KEY）。空 = 一律拒绝（fail-closed）。 */
-  secret: string | undefined;
+  /**
+   * 按 agent id 解析这台机器该用的密钥。返回 undefined = 未知机器或已吊销 → 拒绝
+   * （fail-closed）。Worker 侧实现见 bot-do.ts 的 agentKeyFor：先在 DO storage 的
+   * 运行期覆盖里查（支持即时吊销），再回退到 AGENT_KEYS 静态注册表，最后（仅当
+   * 没配 AGENT_KEYS 的过渡期）回退到旧的单共享密钥 AGENT_KEY。
+   */
+  agentKeyFor: (id: string) => string | undefined;
+  /** 过渡期明文 X-Agent-Key 的对照密钥（旧单共享密钥 AGENT_KEY）。仅 legacyAllowed 时生效。 */
+  legacyKey?: string | undefined;
   /** 过渡开关：仍接受明文 X-Agent-Key（仅用于 agent 还没升级的那段时间）。 */
   legacyAllowed: boolean;
   headers: Headers;
@@ -201,25 +216,76 @@ export interface VerifyOpts {
   /** 只取 pathname，不含 query。 */
   path: string;
   bodyText: string;
-  /** 期望的 agent 身份（codespace 名）。空 = 不校验。 */
-  expectedId?: string;
   now?: number;
   nonces: NonceCache;
 }
 
 /**
- * 校验一次 agent 请求。顺序刻意如此：密钥缺失 → 直接拒绝（绝不「没配就当通过」）。
+ * 解析 AGENT_KEYS 静态注册表（Worker secret）。
+ *   · 支持 JSON 对象：`{"machine-1":"keyA","machine-2":"keyB"}`
+ *   · 也支持行式（方便手动维护 / wrangler secret put 直接粘）：`id:key` 每行一条，
+ *     `#` 开头为注释。
+ * 返回 null = 未配置（走单密钥过渡模式）；否则 id→key 的 Map。
+ * 任一条目非法 / 整段解析失败 → 该条目或整段忽略，绝不因为格式错就裸奔放行。
+ */
+export function parseAgentKeys(text: string | undefined | null): Map<string, string> | null {
+  if (!text || !text.trim()) return null;
+
+  // 先试 JSON 对象
+  if (text.trim().startsWith("{")) {
+    let obj: unknown;
+    try {
+      obj = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
+    const m = new Map<string, string>();
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof k === "string" && k && typeof v === "string" && v) m.set(k, v);
+    }
+    return m.size ? m : null;
+  }
+
+  // 否则按行式解析
+  const m = new Map<string, string>();
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const i = t.indexOf(":");
+    if (i <= 0) continue;
+    const id = t.slice(0, i).trim();
+    const key = t.slice(i + 1).trim();
+    if (id && key) m.set(id, key);
+  }
+  return m.size ? m : null;
+}
+
+/**
+ * 校验一次 agent 请求。顺序刻意如此：身份缺失 → 直接拒绝；密钥缺失 → 直接拒绝
+ * （绝不「没配就当通过」）。身份（X-Agent-Id）现在用于「选哪把密钥」，不再是
+ * 可被任意伪造的装饰——拿不到对应 id 的密钥，签名就对不上。
  */
 export async function verifyAgentRequest(o: VerifyOpts): Promise<AuthResult> {
-  if (!o.secret) return { ok: false, reason: "AGENT_KEY 未配置" };
   const now = o.now ?? Date.now();
+
+  const agentId = o.headers.get(AGENT_HDR.id) ?? "";
 
   const sig = o.headers.get(AGENT_HDR.sig) ?? "";
   if (!sig) {
     // 没有签名：只有显式打开的过渡窗口才接受明文密钥
     if (!o.legacyAllowed) return { ok: false, reason: "缺少签名头" };
     const got = o.headers.get(AGENT_HDR.legacyKey) ?? "";
-    return timingSafeEq(got, o.secret) ? { ok: true, mode: "legacy" } : { ok: false, reason: "密钥不匹配" };
+    const key = o.legacyKey ?? "";
+    return timingSafeEq(got, key) ? { ok: true, mode: "legacy" } : { ok: false, reason: "密钥不匹配" };
+  }
+
+  // 按 id 选密钥：未知机器 / 已吊销 / 没配任何密钥 → undefined → 拒绝（fail-closed）。
+  // 空 id 在过渡期（未配 AGENT_KEYS，agentKeyFor 回退到共享 AGENT_KEY）仍能连；
+  // 配了 AGENT_KEYS 后空 id 查不到密钥 → 拒绝，从而强制每台机器带自己的身份。
+  const key = o.agentKeyFor(agentId);
+  if (!key) {
+    return { ok: false, reason: agentId ? `未知或已吊销的机器（${agentId}）` : "缺少 agent 身份（X-Agent-Id）" };
   }
 
   const ts = o.headers.get(AGENT_HDR.ts) ?? "";
@@ -227,11 +293,8 @@ export async function verifyAgentRequest(o: VerifyOpts): Promise<AuthResult> {
   if (!nonce || nonce.length < 16) return { ok: false, reason: "缺少或过短的 nonce" };
   if (!tsFresh(ts, now)) return { ok: false, reason: "时间戳超出窗口" };
 
-  const agentId = o.headers.get(AGENT_HDR.id) ?? "";
-  if (o.expectedId && agentId !== o.expectedId) return { ok: false, reason: `身份不匹配（${agentId || "空"}）` };
-
   const bodySha = await sha256Hex(o.bodyText);
-  const want = await hmacHex(o.secret, requestInput(ts, nonce, o.method, o.path, bodySha));
+  const want = await hmacHex(key, requestInput(ts, nonce, o.method, o.path, bodySha));
   if (!timingSafeEq(sig, want)) return { ok: false, reason: "签名不匹配" };
 
   // 签名先验、再记 nonce：否则攻击者随便发个假签名就能把缓存灌满

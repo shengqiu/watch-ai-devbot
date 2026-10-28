@@ -46,7 +46,7 @@ REPLY_CHUNK_SIZE = "800"
 #   npx wrangler secret put VERIFY_ANSWER    # 验证答案
 #   npx wrangler secret put ADMIN_KEY        # 管理端点密钥
 GH_CODESPACE_NAME = "24h-977gg5v9vcp5wq" # 远程开关的 codespace（与主 bot 同一台；2026-10-27 重建后短名变更）
-VERIFY_SESSION_MIN = "30"          # 验证会话时长（分钟，滑动延续）；验证词本身走 secret VERIFY_ANSWER
+VERIFY_SESSION_MIN = "10"          # 验证会话时长（分钟，滑动延续）；连续这么久不交互就要重新验证。验证词走 secret VERIFY_ANSWER
 # 省额度看门狗：25 分钟无互动提醒，55 分钟自动关机（bot 开的机才自动关）
 CS_WATCH_REMIND_MIN = "25"
 CS_WATCH_AUTOSTOP_MIN = "55"
@@ -64,10 +64,17 @@ CS_SHELL_ALERT = "1"               # "0" = 关闭（只记日志，不打扰）
 CS_SHELL_ALERT_GRACE_MIN = "5"     # 断线宽限（分钟）：躲开 DO 重载 / agent 重启的瞬断
 CS_SHELL_ALERT_REPEAT_MIN = "120"  # 持续断线的重复告警间隔（分钟）；0 = 一段离线只告一次
 # agent 通道鉴权（HMAC 双向签名，见 src/agent-auth.ts）：
-#   AGENT_KEY 只用来算签名，**不再随请求明文传输**；请求带 ts+nonce 防重放，
-#   下行命令由 Worker 签名、agent 验签后才执行。
+#   推荐每台机器独立密钥 —— 配 AGENT_KEYS（JSON 对象 id→key，如 {"my-cs":"k1","lab":"k2"}，
+#   也支持行式 `id:key` 每行一条）。Worker 按 X-Agent-Id 查这台机器专用的密钥，
+#   未知 / 已吊销的 id 一律 401，从而「区分单台机器 + 即时吊销」。
+#   AGENT_KEY 退化为过渡期单共享密钥：只在 AGENT_KEYS 未配时作回退，配了 AGENT_KEYS 后应停用。
+#
+# ⚠️ AGENT_KEYS / AGENT_KEY 都是 secret，用 `wrangler secret put` 注入，**不要**写进 [vars]：
+#    同名 var 会和 secret 打架（空串尤其危险——可能把正在用的共享密钥盖掉，
+#    导致已连接的 agent 全部 401）。这里只留说明，不写赋值。
 AGENT_LEGACY_KEY = "0"             # "1" = 仍接受明文 X-Agent-Key（仅旧 agent 未升级时临时开）
-AGENT_ID = ""                      # 期望的 agent 身份（codespace 名）；空 = 只记录不强制
+# AGENT_ID 已由 AGENT_KEYS 注册表的成员资格取代（未知 id 直接拒），此字段仅兼容保留。
+AGENT_ID = ""                      # 已废弃：旧单期望身份；保留仅为兼容
 # Gemini CLI（/gemini）：默认模型。必须显式给——CLI 自带的默认是 2.5 系列，
 # 对 2026 年新发的 key 会返回「no longer available to users」直接 404。
 # 单聊里可用 /gemini model <名字> 覆盖；换默认值改这里即可，无需动代码。
@@ -79,14 +86,20 @@ GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
 # 强制换版开关：DO 被 SSE 钉住时 deploy 不生效（healthz 的 build 不翻）。
 # 改这里的值 = 路由到一个全新 DO 实例，立刻跑新代码，不用等连接断开。
-# 代价：新实例没有旧 storage —— 验证会话重打一次、/gemini 会话模式与暂存提问清零。
-# 只在需要强制换版时改；平时保持不动。
-DO_KEY = "singleton-s11"
+# 代价：新实例没有旧 storage —— 验证会话重打一次、/gemini 会话模式与暂存提问清零；
+#   机器密钥的运行期覆盖（agent_keys 表）也会清空，但 AGENT_KEYS secret 注册表
+#   不受影响（它在 Worker secret 里，不在 DO storage），所以按 id 注册过的机器仍能连。
+# 本次 v4.15 改了 shell 鉴权的密钥来源（按 id 查密钥），旧 DO 实例不认识新代码，
+# 故 bump 到 s12 强制换版。平时保持不动。
+DO_KEY = "singleton-s12"
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）
 #   GEMINI_API_KEY（聊天/编程能力用；不配则只有开发机指令可用）
 #   GH_CODESPACE_PAT（Codespaces REST 调用凭证）
-#   AGENT_KEY（shell agent 反连密钥；与 codespace 侧 Codespaces secret 同值）
+#   AGENT_KEYS（每台机器独立密钥注册表；JSON 对象 `{"id":"key"}` 或行式 `id:key`。
+#             与 codespace 侧各自的环境变量 WATCH_AI_AGENT_KEY / WATCH_AI_AGENT_ID 同值。
+#             配了它之后旧的单共享 AGENT_KEY 即停用 —— 这是区分/吊销单台机器的核心）
+#   AGENT_KEY（过渡期单共享密钥；仅在 AGENT_KEYS 未配时作回退）
 #   （可选）TELEGRAM_WEBHOOK_SECRET —— webhook 防伪密钥
 #   （可选）STT_BASE_URL / STT_API_KEY / STT_MODEL —— 语音转写

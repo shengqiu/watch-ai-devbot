@@ -41,6 +41,7 @@ import {
   shouldReplay,
   previewCmd,
   looksLikeCommand,
+  VERIFY_SESSION_DEFAULT_MIN,
   type VerifyState,
   type PendingCmd,
 } from "./verify";
@@ -55,7 +56,7 @@ import {
   type ShellAlertDecision,
 } from "./watch";
 import { ShellHub, type ShellOutMsg, type ShellPing } from "./shell";
-import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest } from "./agent-auth";
+import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest, parseAgentKeys } from "./agent-auth";
 import { reloadVerdict, reloadErrorResponse } from "./admin-auth";
 import {
   buildGeminiScript,
@@ -141,7 +142,16 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261028-v4.14";
+// v4.15：每台机器独立密钥（安全审查：agent 身份自声明）。旧实现所有机器共用一把
+//       AGENT_KEY、X-Agent-Id 由机器自己填、无法区分/吊销单台。现在按 id 查密钥
+//       —— AGENT_KEYS 静态注册表（Worker secret，JSON id→key，扛得过 DO_KEY 换版）
+//       + DO storage 运行期覆盖（POST/DELETE /admin/agents 即时增/吊销）。未知或
+//       已吊销 id 一律 401；下行命令签名改用「已连接机器的那把密钥」，不再用共享密钥。
+// v4.16：验证会话窗口 30 → 10 分钟（用户要求「严格的 10 分钟不交互就验证」）。
+//       滑动语义不变（任何交互续期 10 分钟），只是连续 10 分钟没消息就失效、
+//       下一条消息重新走验证词。默认值抽成 VERIFY_SESSION_DEFAULT_MIN 并有单测锁住，
+//       防止以后被人顺手改回 30 —— 那样不会有任何测试变红。
+const BUILD = "devbot-20261028-v4.16";
 
 /**
  * 未识别输入时的兜底提示。
@@ -169,6 +179,13 @@ export class AssistantDO extends DurableObject<Env> {
   private readonly authFails = new Map<string, { n: number; first: number; until: number }>();
   /** 最近一次通过鉴权的 agent 连接（诊断用：能看出走的是签名还是旧的明文密钥）。 */
   private lastAuth: { mode: "hmac" | "legacy"; at: number; id: string } | null = null;
+  /** 当前已连接的机器 id（来自 /shell/stream 的 X-Agent-Id，经签名验证）。下行命令按它选密钥。 */
+  private agentId = "";
+  /** AGENT_KEYS 静态注册表解析结果（构造时解析一次；undefined = 尚未解析）。 */
+  private agentKeysMapCache: Map<string, string> | null | undefined = undefined;
+  /** 运行期密钥覆盖（DO storage 里的增/吊销），加载后常驻内存，增删时同步刷新。 */
+  private agentOverridesLoaded = false;
+  private agentOverrides = new Map<string, string | null>(); // null = 已吊销
   /** 最近一条 webhook 的来源 IP（应始终落在 Telegram 网段内，仅 /status（需 ADMIN_KEY）可见）。 */
   private lastWebhookIp = "";
 
@@ -182,8 +199,9 @@ export class AssistantDO extends DurableObject<Env> {
       maxChars: Number(env.SHELL_MAX_CHARS ?? 24000),
       // Gemini 会边想边改文件，一条命令跑十几分钟是正常的；15 分钟就放弃太急
       cmdTtlMs: 45 * 60_000,
-      // 下行命令签名：agent 只执行签名对得上的命令，见 src/agent-auth.ts
-      signer: env.AGENT_KEY ? (id, cmd) => signCommand(env.AGENT_KEY as string, id, cmd) : undefined,
+      // 下行命令签名：agent 只执行签名对得上的命令，见 src/agent-auth.ts。
+      // 按「当前已连接机器」的密钥签名（每台机器独立密钥），不再用共享密钥。
+      signer: (cmdId, cmd) => this.signDownlink(cmdId, cmd),
     });
     // SQLite 建表（幂等）；schema 版本标记避免每次唤醒都跑 DDL。
     // v1→v2：新增 cs_runtime 表（看门狗运行时长账本）。DDL 全部 IF NOT EXISTS，
@@ -281,6 +299,7 @@ export class AssistantDO extends DurableObject<Env> {
             /* 空 body 也允许：至少说明 agent 活着 */
           }
           this.shell.onPing(ping);
+          void this.touchAgentSeen(this.agentId); // 刷新已连接机器的 last_seen（仅运行期管理的）
           return Response.json({ ok: true, pending: this.shell.pending() });
         }
         case "/shell/status":
@@ -300,7 +319,22 @@ export class AssistantDO extends DurableObject<Env> {
           await this.reply(chatId, text);
           return Response.json({ ok: true });
         }
+        case "/admin/agents": {
+          // 机器密钥管理（列/增）。鉴权在 index.ts 用 ADMIN_KEY 完成，这里只管业务逻辑。
+          // 吊销单台机器走 DELETE /admin/agents/:id（见 default 分支）—— 即时生效，
+          // 不用重新部署，也不用等 DO_KEY 换版。
+          if (request.method === "GET") return this.listAgents();
+          if (request.method === "POST") return this.upsertAgent(request);
+          return new Response("method not allowed", { status: 405 });
+        }
         default:
+          // /admin/agents/:id —— 吊销单台机器：把覆盖表里这条标记吊销，
+          // agentKeyFor 下次请求就返回 undefined → 该机器立刻 401、再也连不上。
+          if (url.pathname.startsWith("/admin/agents/")) {
+            const id = decodeURIComponent(url.pathname.slice("/admin/agents/".length));
+            if (request.method === "DELETE") return this.revokeAgent(id);
+            return new Response("method not allowed", { status: 405 });
+          }
           return new Response("not found", { status: 404 });
       }
     } catch (e) {
@@ -414,12 +448,13 @@ export class AssistantDO extends DurableObject<Env> {
     }
     console.log(`[tg] 消息 chat=${m.chatId} source=${source} text=${text.slice(0, 80)}`);
 
-    // 5.5) 身份验证（30 分钟滑动会话）：
+    // 5.5) 身份验证（10 分钟滑动会话）：
     //   - 未验证：一切问题/指令都不转发 LLM / Codespace，只回验证问题；
-    //     若这条消息本身就是正确答案 → 通过并延续 30 分钟。
+    //     若这条消息本身就是正确答案 → 通过并延续 10 分钟。
     //   - 未验证时收到的那条命令会暂存（10 分钟保鲜）→ 验证通过后自动补执行，
     //     用户不必重复输入（2026-10-27 用户要求）。
-    //   - 已验证：任何交互把会话滑动延续 30 分钟。
+    //   - 已验证：任何交互把会话滑动延续 10 分钟；**连续 10 分钟不交互即失效**，
+    //     下一条消息重新走验证（2026-10-28 用户要求「严格 10 分钟」，原为 30）。
     //   - 答案 VERIFY_ANSWER 走 secret（不在公开源码里）；未配置 = 服务锁定（默认安全）。
     //   - 设备限制由「白名单账号」达成（Telegram 不提供设备信息）。
     const now = Date.now();
@@ -432,7 +467,7 @@ export class AssistantDO extends DurableObject<Env> {
         await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
         const pending = await this.takePendingCmd(m.chatId, now);
         if (!pending) {
-          await this.reply(m.chatId, "验证通过 ✓（半小时内互动免验证）");
+          await this.reply(m.chatId, "验证通过 ✓（10 分钟内互动免验证）");
           // 「哈哈」同时是开机口令（用户 2026-10-27 定）：验证完顺手把机器拉起来
           await this.bootOnPassword(m.chatId);
           return;
@@ -440,7 +475,7 @@ export class AssistantDO extends DurableObject<Env> {
         // 有暂存命令：告知 + 落回正常流水线执行（不 return）
         await this.reply(
           m.chatId,
-          `验证通过 ✓（半小时内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
+          `验证通过 ✓（10 分钟内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
         );
         text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
         source = `${source}+replay`;
@@ -1396,12 +1431,15 @@ export class AssistantDO extends DurableObject<Env> {
    * 三道关：
    *   ① 封禁表 —— 同一 IP 10 分钟内撞 8 次 401 就静默 10 分钟（防暴力试探密钥）；
    *   ② HMAC 签名 —— 密钥不上行文、带时间窗、带 nonce（见 src/agent-auth.ts）；
-   *   ③ 身份绑定 —— 配了 AGENT_ID 时，X-Agent-Id 必须等于它（防「密钥泄漏后被
-   *      别的机器拿来冒充你这台开发机」；没配则只记录不拦截）。
+   *   ③ 按 id 选密钥 —— X-Agent-Id 决定用哪把密钥（每台机器独立）；未知 id 或已
+   *      吊销 id 在 agentKeyFor 里就返回 undefined，签名根本不会验（防「一把密钥
+   *      泄漏后所有机器跟着沦陷」，以及「冒充别人的机器 id 但没那把密钥」）。
    *
-   * fail-closed：AGENT_KEY 未配置时一律 401，不存在「没配就放行」的分支。
+   * fail-closed：AGENT_KEYS 未配且 AGENT_KEY 也未配时，agentKeyFor 对所有 id 都返回
+   * undefined → 一律 401，不存在「没配就放行」的分支。
    */
   private async guardAgent(request: Request, bodyText: string, path: string): Promise<Response | null> {
+    await this.ensureAgentOverrides(); // 加载运行期密钥覆盖（含即时吊销）
     const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
     const now = Date.now();
     const rec = this.authFails.get(ip);
@@ -1413,13 +1451,13 @@ export class AssistantDO extends DurableObject<Env> {
     }
 
     const r = await verifyAgentRequest({
-      secret: this.env.AGENT_KEY,
+      agentKeyFor: (id) => this.agentKeyFor(id),
+      legacyKey: this.env.AGENT_KEY,
       legacyAllowed: this.env.AGENT_LEGACY_KEY === "1",
       headers: request.headers,
       method: request.method,
       path,
       bodyText,
-      expectedId: this.env.AGENT_ID || "",
       nonces: this.nonces,
     });
 
@@ -1428,8 +1466,147 @@ export class AssistantDO extends DurableObject<Env> {
       return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
     }
     this.authFails.delete(ip);
-    this.lastAuth = { mode: r.mode, at: now, id: request.headers.get("X-Agent-Id") ?? "" };
+    this.agentId = request.headers.get("X-Agent-Id") ?? "";
+    this.lastAuth = { mode: r.mode, at: now, id: this.agentId };
     return null;
+  }
+
+  // ---------------------------------------------------------------- 机器密钥解析
+
+  /** 解析 AGENT_KEYS 静态注册表（构造时解析一次后缓存）。 */
+  private agentKeysMap(): Map<string, string> | null {
+    if (this.agentKeysMapCache === undefined) this.agentKeysMapCache = parseAgentKeys(this.env.AGENT_KEYS);
+    return this.agentKeysMapCache;
+  }
+
+  /** 懒加载运行期密钥覆盖（DO storage 的 agent_keys 表）。加载一次后常驻内存。 */
+  private async ensureAgentOverrides(): Promise<void> {
+    if (this.agentOverridesLoaded) return;
+    try {
+      const rows = this.ctx.storage.sql.exec<{ agent_id: string; agent_key: string | null; revoked: number }>(
+        "SELECT agent_id, agent_key, revoked FROM agent_keys",
+      ).toArray();
+      for (const r of rows) this.agentOverrides.set(r.agent_id, r.revoked ? null : (r.agent_key ?? null));
+    } catch {
+      // 表还没建（迁移前老实例）/ SQL 异常 → 视为无覆盖，不阻塞鉴权
+    }
+    this.agentOverridesLoaded = true;
+  }
+
+  /**
+   * 按机器 id 解析该用的密钥（优先级从高到低）：
+   *   ① 运行期覆盖（DO storage）—— 支持即时增/吊销；
+   *   ② AGENT_KEYS 静态注册表（secret，扛得过 DO_KEY 换版）；
+   *   ③ 过渡期：未配 AGENT_KEYS 时回退旧单共享密钥 AGENT_KEY（任何 id 都认）。
+   * 返回 undefined = 这台机器无权连（未知 / 已吊销 / 没配任何密钥）。
+   */
+  private agentKeyFor(id: string): string | undefined {
+    if (this.agentOverrides.has(id)) {
+      const v = this.agentOverrides.get(id);
+      if (v === null) return undefined; // 已吊销
+      return v || undefined;
+    }
+    const map = this.agentKeysMap();
+    if (map) return map.get(id);
+    return this.env.AGENT_KEY; // 过渡期回退
+  }
+
+  /**
+   * 下行命令签名：用「当前已连接机器」的密钥签名，agent 用它自己的同 id 密钥验签。
+   * 每台机器独立密钥 → 一个机器的密钥泄漏不会让别的机器收到伪造命令。
+   */
+  private async signDownlink(cmdId: string, cmd: string): Promise<string> {
+    const id = this.agentId;
+    const key = id ? this.agentKeyFor(id) : undefined;
+    if (!key) throw new Error("未识别已连接的机器，无法下发签名命令");
+    return signCommand(key, cmdId, cmd);
+  }
+
+  /** 周期刷新已连接机器的 last_seen（仅运行期管理的机器，便于 /admin/agents 列出时看到）。 */
+  private async touchAgentSeen(id: string): Promise<void> {
+    if (!id || !this.agentOverrides.has(id)) return;
+    try {
+      this.ctx.storage.sql.exec(
+        "UPDATE agent_keys SET last_seen = ? WHERE agent_id = ? AND revoked = 0",
+        Date.now(),
+        id,
+      );
+    } catch {
+      /* 忽略：诊断信息而已 */
+    }
+  }
+
+  // ---------------------------------------------------------------- 机器密钥管理（admin 端点）
+
+  /** GET /admin/agents：列出所有已注册/已吊销的机器（不回显密钥）。 */
+  private async listAgents(): Promise<Response> {
+    await this.ensureAgentOverrides();
+    const rows = this.ctx.storage.sql
+      .exec<{ agent_id: string; label: string | null; created_at: number | null; last_seen: number | null; revoked: number }>(
+        "SELECT agent_id, label, created_at, last_seen, revoked FROM agent_keys",
+      )
+      .toArray();
+    const overrides = rows.map((r) => ({
+      id: r.agent_id,
+      label: r.label ?? null,
+      createdAt: r.created_at,
+      lastSeen: r.last_seen,
+      revoked: !!r.revoked,
+      source: "override",
+    }));
+    const map = this.agentKeysMap();
+    const staticEntries = map ? [...map.keys()].map((id) => ({ id, source: "static", revoked: false })) : [];
+    const seen = new Set(overrides.map((o) => o.id));
+    const all = [...overrides, ...staticEntries.filter((s) => !seen.has(s.id))];
+    return Response.json({ ok: true, agents: all, connected: this.agentId || null, strictMode: !!map });
+  }
+
+  /** POST /admin/agents {id, key, label?}：注册或轮换一台机器的密钥。 */
+  private async upsertAgent(request: Request): Promise<Response> {
+    let body: { id?: unknown; key?: unknown; label?: unknown };
+    try {
+      body = (await request.json()) as { id?: unknown; key?: unknown; label?: unknown };
+    } catch {
+      return Response.json({ ok: false, error: "bad json" }, { status: 400 });
+    }
+    const id = typeof body.id === "string" ? body.id.trim() : "";
+    const key = typeof body.key === "string" ? body.key : "";
+    const label = typeof body.label === "string" ? body.label.trim() : null;
+    if (!id || !key) return Response.json({ ok: false, error: "需要 {id, key}" }, { status: 400 });
+    if (key.length < 32) return Response.json({ ok: false, error: "key 至少 32 字符" }, { status: 400 });
+    await this.ensureAgentOverrides();
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO agent_keys (agent_id, agent_key, label, created_at, revoked)
+       VALUES (?, ?, ?, ?, 0)
+       ON CONFLICT(agent_id) DO UPDATE SET
+         agent_key = excluded.agent_key,
+         label = excluded.label,
+         revoked = 0,
+         created_at = COALESCE(agent_keys.created_at, excluded.created_at)`,
+      id,
+      key,
+      label,
+      now,
+    );
+    this.agentOverrides.set(id, key); // 同步内存缓存：立刻生效
+    console.log(`[agent] 注册/轮换机器 ${id}`);
+    return Response.json({ ok: true, id, label, createdAt: now });
+  }
+
+  /** DELETE /admin/agents/:id：吊销单台机器（即时生效，不用重新部署）。 */
+  private async revokeAgent(id: string): Promise<Response> {
+    if (!id) return Response.json({ ok: false, error: "missing id" }, { status: 400 });
+    await this.ensureAgentOverrides();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO agent_keys (agent_id, agent_key, revoked) VALUES (?, ?, 1)
+       ON CONFLICT(agent_id) DO UPDATE SET revoked = 1`,
+      id,
+      "",
+    );
+    this.agentOverrides.set(id, null); // 同步内存缓存：下次请求即 401
+    console.log(`[agent] 吊销机器 ${id}`);
+    return Response.json({ ok: true, id, revoked: true });
   }
 
   /** 记账一次鉴权失败；短时间内连续失败就临时封禁这个 IP。 */
@@ -1638,10 +1815,10 @@ export class AssistantDO extends DurableObject<Env> {
   private dailyBudget(): number {
     return Number(this.env.DAILY_CALL_BUDGET ?? 200);
   }
-  /** 验证会话时长（分钟，默认 30） */
+  /** 验证会话时长（分钟，默认 10 = 无交互 10 分钟即失效，见 verify.ts） */
   private verifySessionMs(): number {
-    const min = Number(this.env.VERIFY_SESSION_MIN ?? 30);
-    return (Number.isFinite(min) && min > 0 ? min : 30) * 60_000;
+    const min = Number(this.env.VERIFY_SESSION_MIN ?? VERIFY_SESSION_DEFAULT_MIN);
+    return (Number.isFinite(min) && min > 0 ? min : VERIFY_SESSION_DEFAULT_MIN) * 60_000;
   }
 
   // 看门狗配置（vars）
@@ -1760,6 +1937,14 @@ CREATE INDEX IF NOT EXISTS idx_history ON history(chat_id, ts);
 CREATE TABLE IF NOT EXISTS rate (chat_id TEXT, minute INTEGER, n INTEGER, PRIMARY KEY(chat_id, minute));
 CREATE TABLE IF NOT EXISTS budget (day TEXT, n INTEGER, PRIMARY KEY(day));
 CREATE TABLE IF NOT EXISTS cs_runtime (day TEXT PRIMARY KEY, minutes REAL);
+CREATE TABLE IF NOT EXISTS agent_keys (
+  agent_id TEXT PRIMARY KEY,
+  agent_key TEXT NOT NULL,
+  label TEXT,
+  created_at INTEGER,
+  last_seen INTEGER,
+  revoked INTEGER NOT NULL DEFAULT 0
+);
 `;
 
 /** 看门狗运行窗口：一次「开机→关机」的生命周期（DO storage 单值，键 cs_episode）。 */

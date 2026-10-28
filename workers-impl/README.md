@@ -61,20 +61,28 @@ npx wrangler deploy
 
 ### 3. 注册 webhook（一次性）
 
-部署后浏览器打开或 curl：
+`/setup` 是**管理端点**，必须带 `ADMIN_KEY`（安全审查 #7/#8：密钥只走请求头、绝不进
+URL；浏览器发不出自定义头，所以不能直接打开链接，要用 curl）：
 
 ```bash
-curl https://watch-ai-qqbot.<你的子域>.workers.dev/setup
+curl -X POST -H "X-Admin-Key: $ADMIN_KEY" \
+  https://watch-ai-devbot.<你的子域>.workers.dev/setup
 ```
 
 这会用本次请求的公网地址自动 `setWebhook` 指向本 Worker 的 `/webhook`，并回显
 `getWebhookInfo`（`url` 正确、`pending_update_count` 正常即成功）。
 
-验证 Worker 活着：
+验证 Worker 活着（**公开探针，只回 liveness**）：
 
 ```bash
-curl https://watch-ai-qqbot.<你的子域>.workers.dev/healthz
-# → {"ok":true,"build":"telegram-20261025-v16","channel":"telegram"}
+curl https://watch-ai-devbot.<你的子域>.workers.dev/healthz
+# → {"ok":true}
+```
+
+要看 build / shell 在线 / 鉴权模式 / 来源 IP 这些诊断，走需 `ADMIN_KEY` 的 `/status`：
+
+```bash
+curl -H "X-Admin-Key: $ADMIN_KEY" https://watch-ai-devbot.<你的子域>.workers.dev/status
 ```
 
 看实时日志：`npx wrangler tail`。
@@ -155,7 +163,7 @@ npx wrangler secret list                       # 查看已注入的密钥名
 
 | 现象 | 原因与处理 |
 |---|---|
-| 发消息完全没反应 | webhook 没注册成功 → 重新 `curl .../setup`，看返回的 `getWebhookInfo.url` 是否正确 |
+| 发消息完全没反应 | webhook 没注册成功 → 重新 `curl -X POST -H "X-Admin-Key: $ADMIN_KEY" .../setup`，看返回的 `getWebhookInfo.url` 是否正确 |
 | 日志出现 `非白名单 chat=...，忽略` | 命中白名单；把该 chat_id 加进 `ALLOWED_USERS`，或清空白名单 |
 | 能收但不回 | Gemini key 没配/配额耗尽 → 日志里 `[agent]` 有报错；`providers.json` 里没 key 的厂商自动禁用 |
 | 回复要等几十秒 | 思考模型默认档太慢 → 已默认压档（闲聊 minimal/代码 low）；日志 `via` 行看实际耗时与模型，仍慢就说「flash 快点」 |

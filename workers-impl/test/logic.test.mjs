@@ -186,6 +186,110 @@ check("语音 mime", v?.voiceMime, "audio/ogg");
 // 非消息类 update（如 callback_query）→ null
 check("无 message 返回 null", extractIncoming({ update_id: 102 }), null);
 
+// ---- Slack 通道（v4.22：提取/握手/提及归一化/mrkdwn/通道路由）----
+import {
+  isUrlVerification,
+  extractSlackEvent,
+  extractSlackCommand,
+  normalizeSlackText,
+} from "../src/slack/update.js";
+import { mdToSlack } from "../src/slack/markdown.js";
+import { verifySlackRequest, SLACK_TS_WINDOW_SEC } from "../src/slack/verify.js";
+import { channelOf } from "../src/telegram/update.js";
+
+// 测试侧自算签名用的 HMAC（Web Crypto，Node 18+ 全局可用；与 verify.ts 同算法）
+async function testHmacHex(secret, msg) {
+  const te = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", te.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, te.encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// 握手识别
+check("url_verification 识别", isUrlVerification({ type: "url_verification", challenge: "abc123" }), true);
+check("普通事件不是握手", isUrlVerification({ type: "event_callback", event: {} }), false);
+
+// 事件提取：chatId 命名空间前缀 + bot 过滤 + 子事件过滤
+const slackEvent = {
+  token: "xx",
+  team_id: "T000",
+  api_app_id: "A000",
+  event_id: "Ev111",
+  type: "event_callback",
+  event: { type: "message", ts: "1690000000.000100", text: "  /boot  ", channel: "C123", user: "U9", subtype: undefined, bot_id: undefined },
+};
+const se = extractSlackEvent(slackEvent);
+check("slack 事件 chatId 前缀", se?.chatId, "slack:C123");
+check("slack 事件 userId", se?.userId, "U9");
+check("slack 事件 trim", se?.text, "/boot");
+check("slack 去重键带前缀", se?.updateId.startsWith("slack:"), true);
+
+// bot 自己的消息必须忽略（自言自语死循环防护）
+check(
+  "bot 消息忽略",
+  extractSlackEvent({ ...slackEvent, event: { ...slackEvent.event, bot_id: "B123", text: "hi" } }),
+  null,
+);
+// message_changed 等子事件忽略
+check(
+  "message_changed 忽略",
+  extractSlackEvent({ ...slackEvent, event: { ...slackEvent.event, subtype: "message_changed" } }),
+  null,
+);
+// 空文本忽略
+check("空文本忽略", extractSlackEvent({ ...slackEvent, event: { ...slackEvent.event, text: "   " } }), null);
+// 非 event_callback 忽略
+check("非事件回调忽略", extractSlackEvent({ type: "url_verification", challenge: "x" }), null);
+
+// Slash 指令提取：command 去斜杠 + text 拼接（与指令注册表同构）
+const slash1 = extractSlackCommand({ command: "/boot", text: "", channel_id: "C123", user_id: "U9" });
+check("slash 指令文本", slash1?.text, "boot");
+check("slash 指令 chatId", slash1?.chatId, "slack:C123");
+const slash2 = extractSlackCommand({ command: "/gemini", text: "写个爬虫", channel_id: "C123", user_id: "U9" });
+check("slash 带参数拼接", slash2?.text, "gemini 写个爬虫");
+check("slash 缺频道 → null", extractSlackCommand({ command: "/boot", text: "", user_id: "U9" }), null);
+check("非斜杠 → null", extractSlackCommand({ command: "boot", text: "", channel_id: "C123" }), null);
+
+// 提及归一化（<@U123> → @user_U123；<!here> → @here；<#C1|general> → #channel）
+check("用户提及归一化", normalizeSlackText("<@U123ABC> 你好"), "@user_U123ABC 你好");
+check("特殊提及归一化", normalizeSlackText("Attention <!here>"), "Attention @here");
+check("频道提及归一化", normalizeSlackText("去 <#C012ABC|general> 看"), "去 #channel 看");
+check("普通文本不动", normalizeSlackText("ls -la"), "ls -la");
+
+// mrkdwn 转换：代码块原样、粗体/斜体/删除线/链接/标题映射
+check("代码块原样保留", mdToSlack("看这个：\n```python\nprint(1)\n```").includes("```python"), true);
+check("粗体映射", mdToSlack("**重要**"), "*重要*");
+check("斜体映射", mdToSlack("*斜*"), "_斜_");
+check("删除线保留", mdToSlack("~~没了~~"), "~没了~");
+check("链接映射", mdToSlack("[点我](https://a.b)"), "<https://a.b|点我>");
+check("标题转粗体", mdToSlack("## 标题"), "*标题*");
+check("行内代码保留", mdToSlack("用 `npm i` 装"), "用 `npm i` 装");
+check("数字不误判斜体", mdToSlack("2 * 3 * 4"), "2 * 3 * 4");
+check("空串安全", mdToSlack(""), "");
+
+// 验签：构造合法签名 → 通过；篡改 body / 旧时间戳 / 未配 secret → 拒绝
+const ss = "8f742231b10e8888abcd99";
+const rawBody = JSON.stringify({ type: "event_callback", event: { text: "hi" } });
+const tsOk = String(Math.floor(Date.now() / 1000));
+const sigOk = "v0=" + (await testHmacHex(ss, `v0:${tsOk}:${rawBody}`));
+check("合法签名通过", (await verifySlackRequest(ss, sigOk, tsOk, rawBody)) === null, true);
+check("未配 secret 拒绝", (await verifySlackRequest(undefined, sigOk, tsOk, rawBody)) !== null, true);
+check("缺签名头拒绝", (await verifySlackRequest(ss, null, tsOk, rawBody)) !== null, true);
+check(
+  "篡改 body 拒绝",
+  (await verifySlackRequest(ss, sigOk, tsOk, rawBody + "x")) !== null,
+  true,
+);
+const tsOld = String(Math.floor(Date.now() / 1000) - SLACK_TS_WINDOW_SEC - 60);
+check("旧时间戳拒绝（防重放）", (await verifySlackRequest(ss, sigOk, tsOld, rawBody)) !== null, true);
+const sigBad = "v0=" + "0".repeat(64);
+check("假签名拒绝", (await verifySlackRequest(ss, sigBad, tsOk, rawBody)) !== null, true);
+
+// 通道路由：chatId 前缀判定（DO reply/sendShellChunk 按它选客户端）
+check("slack 前缀识别", channelOf("slack:C123"), "slack");
+check("裸数字 = telegram", channelOf("555"), "telegram");
+check("slack: 空后缀也是 slack", channelOf("slack:"), "slack");
+
 // ---- Codespace 开发机（beginBoot / checkBoot / stopCodespace / describeState）----
 import {
   describeState,

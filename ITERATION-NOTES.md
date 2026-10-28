@@ -1,14 +1,30 @@
 # Watch AI 编程助手 — 部署与迭代纪要
 
-> Apple Watch 语音 → 云端 AI 编程助手（Telegram 通道 / Cloudflare Workers 免费档）
-> 纪要截至 2026-10-28，仓库 BUILD `devbot-20261028-v4.22`。
+> Apple Watch 语音 → 云端 AI 编程助手（Telegram + Slack 双通道 / Cloudflare Workers 免费档）
+> 纪要截至 2026-10-28，仓库 BUILD `devbot-20261028-v4.23`。
 > 线上实际版本用**带 ADMIN_KEY 的 `/status`** 查（`/healthz` 自安全审查 #7 起只回 `{"ok":true}`，不再带 build）。
 > 验证会话窗口自 v4.16 起为 **10 分钟滑动**（任何交互续期 10 分钟；连续 10 分钟无消息即失效，须重新回答验证词）。
 > 下文 v16 及更早的条目是历史记录，部署方式与鉴权已改为 header（见 README / DEPLOY.md）。
 
 ## 架构一句话
 
-Apple Watch 发语音/文字 → Telegram → webhook POST 到 Cloudflare Worker → 唤醒 Durable Object（SQLite 存会话/限流/额度）→ 语音走 STT 转写 → 意图解析（点名厂商/任务类型/思考档位）→ Gemini 多模型路由（失败自动降级）→ MarkdownV2 渲染分段回包。
+Apple Watch 发语音/文字 → Telegram → webhook POST 到 Cloudflare Worker → 唤醒 Durable Object（SQLite 存会话/限流/额度）→ 语音走 STT 转写 → 意图解析（点名厂商/任务类型/思考档位）→ Gemini 多模型路由（失败自动降级）→ MarkdownV2 渲染分段回包。v4.23 起 Slack（Events API + Slash 指令）经同一 DO 流水线接入（chatId `slack:` 前缀隔离状态），agent/codespace 通信零改动。
+
+## v4.23：Slack 通道（2026-10-28）
+
+- 需求原文：「增加一个跟 cfworker 和 codespace 沟通的前端：slack……所有的更改均不需要更改 cfworker 和 codespace 的沟通，只需要建立 slack 和 cfworker 的沟通，保证和 telegram 线路的后端同质化」。
+- 落地：`src/slack/`（types/verify/client/markdown/update，与 `src/telegram/` 同构）；
+  index.ts 增 `/slack/events` `/slack/commands`（v0 HMAC 验签 + 5 分钟时间窗，fail-closed）；
+  DO 增握手（url_verification 回 challenge）、`handleSlackMessage` → 共享 `handleMessage`；
+  `reply`/`sendShellChunk` 按 chatId 前缀路由（Slack：mrkdwn + 429 退避，Telegram 不变）。
+- 状态隔离：`slack:<channel_id>` 前缀——验证会话/历史/限流/暂存命令/看门狗推送全部按通道独立；
+  白名单独立（`SLACK_ALLOWED_USERS`），验证词共用（同一个 VERIFY_ANSWER）。
+- 指令：Slash 指令与私聊文本共用 `commands.ts` 注册表（单一真相源）；`/slackstatus` 管理端点自检。
+- 与远端 v4.22（AI 会话 MarkdownV2）合并：`ShellCmd.markdown` 标志在 Slack 侧同样透传——
+  `/gemini`、`/buddy` 的输出在 Slack 走 mrkdwn 富文本，普通 shell 命令保持纯文本。
+- 语音条不转写（Slack file share 是 mp4/m4a 容器，v1 提示发文字；手表语音场景继续走 Telegram）。
+- 配置：`slack-app-manifest.yml`（一键建 App）+ DEPLOY.md「Slack 通道」节 + ADR-14。
+- 测试：700/700（新增 37 项：提取/握手/提及归一化/mrkdwn/验签/通道路由）。
 
 ## 踩坑记录（按解决顺序）
 

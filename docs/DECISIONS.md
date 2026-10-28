@@ -125,3 +125,32 @@
 **理由**：误杀的代价是正在写的文件只写一半、git 停在中间态；而「读不到证据」绝不能当成「卡死」。判据分级让 2026-10-27 那种「进程活着但 12 分钟零反应」仍能被回收（never-moved），同时 codebuddy 思考 10 分钟不再陪葬。
 
 **代价**：探针只认 Linux /proc（macOS 退回纯时间判据）；`sleep >10 分钟` 这类真零 CPU 的命令会在 10 分钟被回收（旧版 4 分钟就会，严格更宽松）；`S` 状态无法区分「等一个会回来的响应」和「等一个不会回来的」，只能靠 CPU 增量旁证。
+
+## ADR-14 多通道前端：Slack 与 Telegram 共用同一条 DO 流水线（2026-10-28）
+
+**背景**：用户要求增加一个跟 cfworker 和 codespace 沟通的前端：Slack，且「所有更改均不需要更改 cfworker 和 codespace 的沟通，只需要建立 slack 和 cfworker 的沟通，保证和 telegram 线路的后端同质化」。即 Slack 是纯前端通道，agent/codespace 侧（/shell/*、HMAC 签名、SSE 反连、看门狗）零改动。
+
+**结论**：
+1. **同 Worker、同 DO、同流水线**：`/slack/events`（Events API）与 `/slack/commands`（Slash 指令）验签后进 `handleMessage`——去重、白名单、验证门（VERIFY_ANSWER 同词）、限流、额度、意图路由、指令派发、联机 shell 全部复用，一行不改 agent 协议。
+2. **chatId 命名空间隔离**：Slack 消息的 chatId 带 `slack:<channel_id>` 前缀（Telegram 保持裸数字兼容历史 storage）。DO 内所有按 chatId 的状态（验证会话/历史/限流/暂存命令/看门狗推送目标）天然分通道；`reply()` / `sendShellChunk()` 按前缀选客户端（SlackClient vs TelegramClient）。
+3. **回包通道同构**：Slack 侧 mrkdwn 渲染（`mdToSlack`，与 `mdToV2` 同策略）+ 发送失败降级纯文本 + 429 退避重试（Slack ~1msg/s；Telegram v4.21 的 retry_after 同问题）。
+4. **白名单独立**：`SLACK_ALLOWED_USERS`（Slack user id 体系与 Telegram 数字 id 不同）；验证词共用（安全口令只有一个，换词两通道一起失效）。
+5. **Slash 指令 = 指令注册表**：`/boot` 等去斜杠后与 text 拼接，走与 Telegram 完全相同的 `matchCommand`（commands.ts 仍是单一真相源）；另支持频道里直接发文本（message.im 私聊为主场景）。
+6. **验签 fail-closed**：X-Slack-Signature（v0 HMAC）+ 5 分钟时间窗；secret 未配 = `/slack/*` 全拒 403。`url_verification` 握手回 challenge 完成配置。bot 自己的消息（bot_id）必须忽略——否则回包→自事件→再回包死循环。
+7. **fail-open 边界**：`SLACK_BOT_TOKEN` 未配 = 通道整体关闭（404），Telegram 完全不受影响；两通道独立演进、互不拖累。
+
+**理由**：DO 是单例状态机（会话/看门狗/shell 队列都在一个实例里），把通道判定收敛到「chatId 前缀 + reply 路由」两个点，是改动面最小、与既有架构最同质的接入方式；Slack 出站（chat.postMessage）与 Telegram 一样是纯 HTTPS REST，CF Workers 免费档零额外成本（Socket Mode 才需要常驻连接，已显式排除）。
+
+**代价**：Slack 语音条（file share）v1 不转写（回提示让用户发文字；手表语音场景继续走 Telegram）；`url_verification` 只认配置那一刻的 secret（换 secret 后要到 App 页面重存一次 Request URL 触发重新握手）；Events API 免费版有少量投递延迟（秒级，无感知）。
+
+**通道对比**：
+
+| | Telegram（现役） | Slack（v4.22） |
+|---|---|---|
+| 事件入口 | /webhook（IP 网段 + secret_token） | /slack/events、/slack/commands（v0 HMAC 验签） |
+| 后端流水线 | DO handleMessage | 同一个（chatId `slack:` 前缀隔离） |
+| 渲染 | MarkdownV2 + 400 降级 | mrkdwn + 429 退避 |
+| 语音 | OGG/Opus → STT | 不转写（提示发文字） |
+| 指令 | 文本/slash 同注册表 | 同一张（slash + 私聊文本） |
+| 白名单 | ALLOWED_USERS | SLACK_ALLOWED_USERS（独立） |
+| agent/codespace | /shell/* HMAC+SSE | **零改动（共用）** |

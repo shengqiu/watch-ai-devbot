@@ -15,8 +15,20 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { endpoints } from "./config";
 import { TelegramClient } from "./telegram/client";
-import { extractIncoming, type Incoming } from "./telegram/update";
+import { extractIncoming, channelOf, type Incoming } from "./telegram/update";
 import type { TgUpdate } from "./telegram/types";
+import { SlackClient } from "./slack/client";
+import {
+  isUrlVerification,
+  extractSlackEvent,
+  extractSlackCommand,
+  normalizeSlackText,
+  type SlackIncoming,
+} from "./slack/update";
+import type {
+  SlackCommandForm,
+  SlackEventWrapper,
+} from "./slack/types";
 import { parseIntent, effortFor, type Intent } from "./router/intent";
 import { chatChain, loadProviders, type ChatResult } from "./router/providers";
 import { chunkText, transcribeBytes } from "./asr";
@@ -195,7 +207,16 @@ import {
 //       现在 ShellCmd 加 markdown 标志（六个 AI 下发点全带），发送端按该标志
 //       走 TelegramClient.sendMessage（mdToV2 转换 + 400 降级纯文本兜底）；
 //       普通 shell 命令保持纯文本（任意字节流，乱转义反而毁输出）。
-const BUILD = "devbot-20261028-v4.22";
+// v4.23：Slack 通道（用户要求「加一个跟 cfworker 和 codespace 沟通的前端：slack，
+//       与 telegram 线路的后端同质化」）。同一个 Worker、同一条 DO 流水线：
+//       /slack/events（Events API）与 /slack/commands（Slash 指令）验签后进
+//       handleMessage，chatId 用 `slack:<channel>` 前缀隔离状态（验证/历史/限流/
+//       看门狗推送）；reply/sendShellChunk 按前缀路由到 SlackClient（mrkdwn 渲染
+//       + 429 退避，与 Telegram 的 MarkdownV2 + retry_after 同构；markdown 标志
+//       在 Slack 侧同样生效）。Slash 指令（/boot 等）与 Telegram 共用同一张指令
+//       注册表（单一真相源）。agent/codespace 通信（/shell/*、HMAC、SSE）零改动；
+//       Telegram 线路行为不变。
+const BUILD = "devbot-20261028-v4.23";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -232,6 +253,12 @@ const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能
 
 export class AssistantDO extends DurableObject<Env> {
   private readonly tg: TelegramClient;
+  /**
+   * Slack 客户端（v4.22）。token 未配置时仍构造（空 token），发送前由
+   * slackOn() 判定通道是否可用——与 Telegram「白名单未配 = 放开」的语义不同，
+   * Slack 通道是「没配 = 整体关闭」，不影响 Telegram 线路。
+   */
+  private readonly slack: SlackClient;
   /** Shell 网关：agent SSE 连接 + 命令队列 + 输出缓冲（内存态，DO 驱逐即失效） */
   private readonly shell: ShellHub;
   /** 已用过的请求 nonce（防重放）。DO 驱逐即清空——那时连接也断了，窗口自然关闭。 */
@@ -255,6 +282,7 @@ export class AssistantDO extends DurableObject<Env> {
     // 端点集中解析（默认官方地址，可用环境变量覆盖，见 src/config.ts）
     const ep = endpoints(env);
     this.tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN ?? "", ep.telegramApiBase);
+    this.slack = new SlackClient(env.SLACK_BOT_TOKEN ?? "", ep.slackApiBase);
     this.shell = new ShellHub((chatId, text) => this.sendShellChunk(chatId, text), {
       flushMs: Number(env.SHELL_FLUSH_MS ?? 1200),
       // 完整回传：用户要求「codebuddy 的 stdout 全部发给我」。旧默认 24000 会
@@ -375,6 +403,15 @@ export class AssistantDO extends DurableObject<Env> {
           });
         case "/webhook":
           return await this.handleWebhook(request);
+        case "/slack/events":
+          return await this.handleSlackEvents(request);
+        case "/slack/commands":
+          return await this.handleSlackCommand(request);
+        case "/slackstatus": {
+          // 诊断（需 ADMIN_KEY，走 index 鉴权）：Slack 通道配置状态 + auth.test
+          const r = await this.slack.authTest();
+          return Response.json({ ok: r.ok, bot: r.user ?? null, team: r.team ?? null });
+        }
         case "/send": {
           // 调试用：主动推一条文本到指定 chat_id
           const text = url.searchParams.get("text") ?? "";
@@ -461,20 +498,116 @@ export class AssistantDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
+  // ---------------------------------------------------------------- Slack 入口
+
+  /**
+   * Slack Events API（v4.22）。
+   *
+   * 验签在 index.ts 完成（签名覆盖原始 body，必须先 text() 再 parse——这里收到的
+   * 已是验签通过的原始文本）。三种 body：
+   *   1. url_verification —— 配置 Request URL 时的握手，回 challenge 即完成配置；
+   *   2. event_callback   —— 真正的事件；只认 message，提取后进与 Telegram
+   *                          完全相同的流水线（handleMessage）；
+   *   3. 其它             —— 200 空回（Slack 只认 HTTP 层）。
+   */
+  private async handleSlackEvents(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = JSON.parse(await request.text());
+    } catch {
+      return Response.json({ ok: true }); // 坏 JSON 也回 200：别让 Slack 重试风暴
+    }
+    // 握手：回 challenge（Slack 用它确认 URL 属于我们）
+    if (isUrlVerification(body)) {
+      return new Response(body.challenge, { headers: { "Content-Type": "text/plain" } });
+    }
+    const m = extractSlackEvent(body as SlackEventWrapper);
+    if (m) {
+      const text = normalizeSlackText(m.text);
+      if (text) {
+        this.ctx.waitUntil(
+          this.handleSlackMessage({ ...m, text }).catch((e) => console.error("[slack]", e)),
+        );
+      }
+    }
+    return Response.json({ ok: true });
+  }
+
+  /**
+   * Slash Commands（/boot /halt /cs …）。
+   * 表单编码；command 去斜杠后与 text 拼成一条指令文本，走同一张指令注册表。
+   * 同步 200 空回（处理放 waitUntil）——Slack 要求 3 秒内应答，慢了会重发。
+   */
+  private async handleSlackCommand(request: Request): Promise<Response> {
+    let form: SlackCommandForm = {};
+    try {
+      const params = new URLSearchParams(await request.text());
+      const obj: Record<string, string> = {};
+      params.forEach((v, k) => {
+        obj[k] = v;
+      });
+      form = obj as SlackCommandForm;
+    } catch {
+      return new Response("", { status: 200 });
+    }
+    const m = extractSlackCommand(form);
+    if (m) {
+      this.ctx.waitUntil(this.handleSlackMessage(m).catch((e) => console.error("[slack]", e)));
+    }
+    return new Response("", { status: 200 }); // 空回：回复走 chat.postMessage
+  }
+
+  /**
+   * Slack 消息 → 共享流水线。
+   *
+   * 与 Telegram 的 handleMessage 共用全部逻辑（去重/白名单/验证门/限流/额度/
+   * 意图/指令派发/shell/回包），差异只有三点：
+   *   1. updateId 是字符串（Telegram 是数字）——去重键空间本来就带 slack: 前缀；
+   *   2. 白名单走 SLACK_ALLOWED_USERS（两通道账号体系不同，独立配置）；
+   *   3. 无语音（Slack 语音条是 file share，v1 不转写，提示用户发文字）。
+   */
+  private async handleSlackMessage(m: SlackIncoming): Promise<void> {
+    await this.handleMessage(
+      {
+        updateId: 0, // Slack 的去重键在 text 前缀里，见 seenMsg 调用处
+        chatId: m.chatId,
+        userId: m.userId,
+        messageId: null,
+        text: m.text,
+        voiceFileId: null,
+        voiceMime: null,
+      },
+      { dedupeKey: m.updateId, channel: "slack" },
+    );
+  }
+
   // ---------------------------------------------------------------- 消息处理
 
-  private async handleMessage(m: Incoming): Promise<void> {
-    // 1) 去重：Telegram 重试时可能重推同一 update_id
-    const key = `u${m.updateId}`;
+  /**
+   * 共享消息流水线（Telegram 与 Slack 共用，v4.22 起多通道）。
+   *
+   * opts.channel：来源通道（默认 telegram）。
+   * opts.dedupeKey：去重键（Telegram 用 updateId 数字；Slack 用 `slack:<event_id>`
+   * 字符串，由 handleSlackMessage 传入——两套 id 空间不同，统一在这里收敛）。
+   */
+  private async handleMessage(
+    m: Incoming,
+    opts: { channel?: "telegram" | "slack"; dedupeKey?: string } = {},
+  ): Promise<void> {
+    const channel = opts.channel ?? "telegram";
+    // 1) 去重：Telegram 重试时可能重推同一 update_id；Slack 同样会重试（3s 超时）
+    const key = opts.dedupeKey ?? `u${m.updateId}`;
     if (await this.seenMsg(key)) return;
     await this.markSeen(key);
 
     // 2) 白名单（未配置 = 放开，仅建议开发期）。**只认 user_id（from.id）**，
     //    不认 chat_id——群聊里 chat_id 是群号不是人，按 chat_id 放行会把整个群放进来。
     //    拒绝时回报 user_id，方便管理员把该号加白（只回一次/分钟，避免被刷屏）。
-    const allowed = (this.env.ALLOWED_USERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    //    Slack 通道用独立的 SLACK_ALLOWED_USERS（两通道账号体系不同）。
+    const allowedRaw = channel === "slack" ? this.env.SLACK_ALLOWED_USERS : this.env.ALLOWED_USERS;
+    const allowed = (allowedRaw ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     if (allowed.length > 0 && !allowed.includes(m.userId)) {
-      console.log(`[tg] 非白名单 user=${m.userId}（chat=${m.chatId}），拒绝`);
+      console.log(`[${channel}] 非白名单 user=${m.userId}（chat=${m.chatId}），拒绝`);
       if (await this.allowRate(m.chatId)) {
         await this.reply(
           m.chatId,
@@ -1722,12 +1855,26 @@ export class AssistantDO extends DurableObject<Env> {
     }
   }
 
-  /** 分段发送（长回答拆成多条，手表端更好读）。 */
+  /**
+   * 分段发送（长回答拆成多条，手表端更好读）。
+   * v4.22 起多通道：chatId 带 `slack:` 前缀 → SlackClient（mrkdwn + 429 退避），
+   * 否则 → Telegram（MarkdownV2 + 400 降级 + retry_after 重试）。分块大小各按
+   * 平台上限（Telegram REPLY_CHUNK_SIZE 默认 800；Slack 3800 内部处理）。
+   */
   private async reply(chatId: string, text: string): Promise<void> {
+    if (channelOf(chatId) === "slack") {
+      if (this.slackOn()) await this.slack.sendMessage(chatId.slice("slack:".length), text);
+      return;
+    }
     const chunks = chunkText(text, Number(this.env.REPLY_CHUNK_SIZE ?? 800));
     for (const chunk of chunks) {
       await this.tg.sendMessage(chatId, chunk);
     }
+  }
+
+  /** Slack 通道是否可用（token 配置 + 总开关）。 */
+  private slackOn(): boolean {
+    return Boolean(this.env.SLACK_BOT_TOKEN) && this.env.SLACK_ENABLED !== "0";
   }
 
   // ---------------------------------------------------------------- Shell 通道
@@ -1938,8 +2085,19 @@ export class AssistantDO extends DurableObject<Env> {
     }
   }
 
-  /** shell 输出回传：纯文本发送，不走 MarkdownV2（命令输出里转义符太多，容易 400/渲染乱）。 */
+  /**
+   * shell 输出回传：普通命令纯文本发送，不走 MarkdownV2（命令输出里转义符太多，容易 400/渲染乱）。
+   * v4.22（远端）：AI 会话命令带 markdown 标志 → TelegramClient.sendMessage（mdToV2 + 400 降级）。
+   * v4.23（Slack）：chatId 带 `slack:` 前缀 → SlackClient（mrkdwn 渲染 + 429 退避，
+   *   markdown 标志同样生效——AI 会话在 Slack 里也走富文本）；Telegram 路径不变。
+   */
   private async sendShellChunk(chatId: string, text: string, opts?: { markdown?: boolean }): Promise<void> {
+    if (channelOf(chatId) === "slack") {
+      // markdown 标志透传：AI 会话（/gemini、/buddy）在 Slack 里也走 mrkdwn 富文本；
+      // 普通 shell 命令输出（任意字节流）传 false 保持纯文本，与 Telegram 侧语义一致。
+      if (this.slackOn()) await this.slack.sendMessage(chatId.slice("slack:".length), text, opts);
+      return;
+    }
     // Telegram 对连续 sendMessage 限速（~1msg/s，突发 ~30）。完整回传长输出时
     // 一次可能连发几十条，429 是常态而不是异常 —— 按 retry_after 等待后重发。
     for (let attempt = 1; ; attempt++) {
@@ -2243,9 +2401,11 @@ export class AssistantDO extends DurableObject<Env> {
     return {
       ok: true,
       build: BUILD,
-      channel: "telegram",
+      channel: "telegram+slack",
       // 部署身份（wrangler.toml [vars] BOT_IDENTITY）：主 bot 缺省 main；devbot 部署显示 devbot
       identity: this.env.BOT_IDENTITY || "main",
+      // Slack 通道是否启用（token 配置 + 总开关）
+      slack: this.slackOn() ? "on" : "off",
       // shell agent 是否反连在线（诊断用：不在线说明 codespace 里 agent 没起来）
       shell: this.shell.online() ? "online" : "offline",
       // 最近一次 agent 鉴权用的方式：hmac = 签名通道（正常）；legacy = 明文密钥（该升级了）

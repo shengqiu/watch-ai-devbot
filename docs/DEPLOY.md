@@ -136,3 +136,46 @@ curl "http://localhost:8787/send?text=hi&chat_id=<你的chat_id>"
 | 回复报「所有厂商均失败」 | 所有厂商 key 无效/配额耗尽 | 日志 `[agent]` 详细报错；换 key 或配 fallback 厂商 |
 | 手表收不到推送 | 手表 Telegram 通知权限 / 手机登录状态 | Watch App → 通知 → Telegram 允许通知 |
 | 想跑 Claude Code / 本地 Whisper | Workers 不能跑任意进程 | 当前仓库未内置 VPS 执行体；需要时自建（意图路由/厂商 fallback 设计参照 `workers-impl/src/router/`） |
+
+## Slack 通道（v4.22，可选）
+
+Slack 与 Telegram 共用同一个 Worker、同一条 DO 流水线（验证门/白名单/限流/指令/联机 shell 全部同质）；agent/codespace 通信零改动。不配密钥 = 通道关闭，Telegram 不受影响。
+
+### 1. 创建 Slack App（10 分钟）
+
+1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From an app manifest** → 粘贴 `workers-impl/slack-app-manifest.yml`（先把 manifest 里两个 Request URL 换成你的 Worker 地址）。
+2. **OAuth & Permissions** → Install to Workspace → 复制 **Bot User OAuth Token**（`xoxb-...`）。
+3. **Basic Information** → App Credentials → 复制 **Signing Secret**。
+4. **Event Subscriptions** → 开启 → Request URL 填 `https://<worker>/slack/events`（此刻 Slack 发 url_verification 握手，Worker 自动回 challenge，显示 Verified 即成功）。
+5. **Slash Commands** → 逐条登记（Request URL 都填 `https://<worker>/slack/commands`）：`boot` `halt` `cs` `usage` `gemini` `buddy` `ctrlc` `help` `diag`。
+
+### 2. 注入密钥
+
+```bash
+npx wrangler secret put SLACK_BOT_TOKEN        # xoxb-...
+npx wrangler secret put SLACK_SIGNING_SECRET   # App Credentials 页
+npx wrangler secret put SLACK_ALLOWED_USERS    # 逗号分隔 Slack user id（Uxxxx；空 = 放开）
+```
+
+> 白名单与 Telegram 的 `ALLOWED_USERS` 独立（两通道账号体系不同）。留空放开后发一条消息，从 `wrangler tail` 日志里找 `user=Uxxxx` 再收紧。
+
+### 3. 验证
+
+```bash
+npx wrangler tail                       # 盯日志
+# Slack 里给 bot 发私聊：/help 或随便一句话
+curl -H "X-Admin-Key: $ADMIN_KEY" https://<worker>/slackstatus   # bot 身份自检（auth.test）
+```
+
+看到 `[slack] 消息 chat=slack:Cxxxx` 与回包即通。指令、验证词、shell、看门狗行为与 Telegram 完全一致（状态按 `slack:<channel>` 前缀隔离，互不串台）。
+
+### Slack 排障
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| Request URL 配不上（challenge 不回） | secret 未注入 / 路径不对 | 先 `wrangler secret put SLACK_SIGNING_SECRET` 再 deploy；确认 URL 是 `/slack/events` |
+| 发消息没反应 | SLACK_BOT_TOKEN 未配 / 通道关闭（404） | 注入 token；`SLACK_ENABLED` 保持 `"1"`；`/slackstatus` 自检 |
+| `非白名单 user=Uxxxx，拒绝` | 不在 Slack 白名单 | `wrangler secret put SLACK_ALLOWED_USERS` 填该 id |
+| bot 自己刷屏 | （不应发生）bot_id 过滤失效 | 确认部署的是 v4.22+；`extractSlackEvent` 的 bot_id 分支 |
+| 回复变慢/缺条 | Slack 429 限速（~1msg/s） | 已内置退避重试；超长输出等一会会补齐 |
+| 验证词不认 | 与 Telegram 共用 VERIFY_ANSWER | 同一个词；换词两通道一起重新验证 |

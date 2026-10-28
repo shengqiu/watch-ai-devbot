@@ -1,0 +1,44 @@
+# Slack App 一键配置清单（v4.22 Slack 通道）
+#
+# 用法：Slack API → Your Apps → Create New App → From an app manifest → 粘贴本文件
+# （把 <WORKER_BASE_URL> 换成你的 Worker 地址，如 https://watch-ai-devbot.<子域>.workers.dev）
+#
+# 装好后还差三步（见 DEPLOY.md「Slack 通道」节）：
+#   1. App Credentials 页复制 Signing Secret → wrangler secret put SLACK_SIGNING_SECRET
+#   2. OAuth & Permissions 页复制 Bot User OAuth Token → wrangler secret put SLACK_BOT_TOKEN
+#   3. Event Subscriptions 开启 → Request URL 填 <WORKER_BASE_URL>/slack/events
+#      （此时 Slack 会发 url_verification 握手，Worker 回 challenge 即配置成功）
+#   4. 把你的 Slack user id（U 开头）配进白名单：wrangler secret put SLACK_ALLOWED_USERS
+#      （或先留空放开，发一条消息后从 wrangler tail 日志里找 user=Uxxxx）
+
+display_information:
+  name: watch-ai-devbot
+  description: Codespace 远程开关 + AI 编程助手（与 Telegram 同一后端）
+  background_color: "#1a1a2e"
+
+features:
+  bot_user:
+    display_name: watch-ai-devbot
+    always_online: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write        # 发消息（chat.postMessage）
+      - chat:write.public  # 允许发到 bot 未加入的公开频道（可选，按需删）
+      - app_mentions:read  # 被 @提及时收事件（频道里使用）
+
+settings:
+  event_subscriptions:
+    request_url: "https://watch-ai-devbot.SHENGQIU-PURDUE.workERS.dev/slack/events" # ← 换成你的地址
+    bot_events:
+      - message.im      # 私聊消息（主场景）
+      - app_mention     # 频道 @提及（可选）
+  interactivity:
+    is_enabled: true
+    # Slash Commands 的 Request URL（逐条指令也要在 App → Slash Commands 页登记，
+    # 命令清单与 workers-impl/src/commands.ts 的注册表一致：boot halt cs usage gemini buddy ctrlc help diag）
+    request_url: "https://watch-ai-devbot.SHENGQIU-PURDUE.workERS.dev/slack/commands"
+  org_deploy_enabled: false
+  socket_mode_enabled: false   # 必须 false：Socket Mode 要常驻连接，与 CF Workers 免费档冲突
+  token_rotation_enabled: false

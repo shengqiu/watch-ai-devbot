@@ -7,9 +7,10 @@
  * 你通过 Telegram / SSH / 浏览器挂着的会话都可能让机器一直跑。
  *
  * 本模块职责：
- *   evalWatch   —— 核心决策：该提醒 / 该自动关机 / 该何时再查
- *   pushAlarm   —— DO alarm 单槽位软排队（boot 二查与看门狗共用一个 alarm 通道）
- *   fmtDur      —— 时长格式化（Telegram 回包用）
+ *   evalWatch      —— 核心决策：该提醒 / 该自动关机 / 该何时再查
+ *   evalShellAlert —— shell 离线告警：机器在跑但 agent 没连上时主动告知
+ *   pushAlarm      —— DO alarm 单槽位软排队（boot 二查与看门狗共用一个 alarm 通道）
+ *   fmtDur         —— 时长格式化（Telegram 回包用）
  *
  * 决策规则（三层防护）：
  *   ① 空闲提醒：机器运行中且距上次终端级 Telegram 互动 ≥ REMIND 分钟 → 发提醒
@@ -301,6 +302,97 @@ export function fmtDur(minutes: number): string {
   if (h === 0) return `${r}分钟`;
   if (r === 0) return `${h}小时`;
   return `${h}小时${r}分`;
+}
+
+// ---------------------------------------------------------------------------
+// shell 离线告警
+// ---------------------------------------------------------------------------
+
+/**
+ * shell 离线告警（纯逻辑，可单测）。
+ *
+ * 痛点：机器在跑（GitHub state=Available），但 codespace 里的 agent 没连上 SSE，
+ * 于是「发命令给 bot，它不回」——而你在 Telegram 侧完全看不到原因，只能自己发现。
+ * 巡检（cron 半小时）已经存在，这里补的是「离线时主动告诉你」。
+ *
+ * 三个必须处理的判据，否则要么漏报要么误报刷屏：
+ *   ① 机器没在跑 → shell 离线是预期的（关机了），不算故障，且状态一律复位；
+ *      否则下一次开机后会用「关机期间累积的离线时长」误告警一次。
+ *   ② 刚断线 ≠ 真故障：DO 重载 / 机器休眠恢复 / agent 重启都会瞬断，
+ *      给 graceMin 宽限期（默认 5 分钟）躲开，别一断就喊。
+ *   ③ 离线起点要用「最后一次心跳」而不是「本次巡检时刻」：巡检半小时一次，
+ *      用巡检时刻会把「agent 早已断线 40 分钟」算成「刚断线」，宽限期永远走不完 → 永远不告警。
+ *
+ * 防刷屏：一段离线只告一次；持续离线按 repeatMin（默认 120 分钟）重发，0 = 只告一次。
+ */
+export interface ShellAlertInput {
+  /** 机器是否在运行（GitHub state === "Available"） */
+  machineRunning: boolean;
+  /** shell 是否在线（SSE 连接 + 心跳未超时） */
+  shellOnline: boolean;
+  /** 当前时间戳（ms） */
+  now: number;
+  /** 最近一次 shell 心跳（ms；0 = 本实例从未见过 agent） */
+  lastSeen: number;
+  /** 上一次判定离线的起点（ms；null = 在线或未追踪）。跨巡检持久化 */
+  offlineSince: number | null;
+  /** 本段离线是否已告警过（防轰炸） */
+  alerted: boolean;
+  /** 上次告警时刻（ms；null = 没告过）。用于重复告警间隔 */
+  alertedAt: number | null;
+  /** 断线多久才认定「真离线」（分钟，默认 5） */
+  graceMin: number;
+  /** 持续离线时的重复告警间隔（分钟，默认 120；0 = 只告一次） */
+  repeatMin: number;
+}
+
+export interface ShellAlertDecision {
+  /** 发 Telegram 告警（null = 不打扰） */
+  notify: string | null;
+  /** 写回：离线起点（null = 复位） */
+  offlineSince: number | null;
+  /** 写回：本段离线是否已告警 */
+  alerted: boolean;
+  /** 写回：上次告警时刻 */
+  alertedAt: number | null;
+}
+
+export function evalShellAlert(s: ShellAlertInput): ShellAlertDecision {
+  // ① 机器没跑 / shell 在线 → 离线是预期的，状态全部复位
+  //    （漏了复位会攒出一次「开机即告警」的误报）
+  if (!s.machineRunning || s.shellOnline) {
+    return { notify: null, offlineSince: null, alerted: false, alertedAt: null };
+  }
+
+  // ③ 起点优先取最后心跳时刻；本实例从没见过 agent（DO 刚重载）才退化为 now
+  const since = s.offlineSince ?? (s.lastSeen > 0 ? s.lastSeen : s.now);
+  const offMin = Math.max(0, (s.now - since) / MIN);
+
+  // ② 宽限期内：可能只是瞬断，先记着起点，不打扰
+  if (offMin < s.graceMin) {
+    return { notify: null, offlineSince: since, alerted: false, alertedAt: null };
+  }
+
+  if (!s.alerted) {
+    return { notify: shellAlertText(offMin, false), offlineSince: since, alerted: true, alertedAt: s.now };
+  }
+  // 已告过：按间隔重发（0 = 永不重发），否则静默保持状态
+  if (s.repeatMin > 0 && s.alertedAt !== null && (s.now - s.alertedAt) / MIN >= s.repeatMin) {
+    return { notify: shellAlertText(offMin, true), offlineSince: since, alerted: true, alertedAt: s.now };
+  }
+  return { notify: null, offlineSince: since, alerted: true, alertedAt: s.alertedAt };
+}
+
+function shellAlertText(offMin: number, repeat: boolean): string {
+  const head = repeat
+    ? `🔁 shell 仍未连上（已断开 ${fmtDur(offMin)}）`
+    : `⚠️ shell 通道断开：开发机在运行，但里面的 agent 已 ${fmtDur(offMin)} 没心跳`;
+  return (
+    `${head}\n` +
+    `这个状态下我收不到命令回包，表现就是「发命令没反应」。\n` +
+    `常见原因：agent 进程崩了、机器刚从休眠恢复、或 Worker 刚重载（重载后会自动重连）。\n` +
+    `先发 /cs 看状态；确认一直连不上就 /halt 再 /boot 重启一轮（未提交的工作会丢，先确认）。`
+  );
 }
 
 // ---------------------------------------------------------------------------

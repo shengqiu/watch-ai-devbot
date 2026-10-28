@@ -44,7 +44,16 @@ import {
   type VerifyState,
   type PendingCmd,
 } from "./verify";
-import { evalWatch, fmtDur, pushAlarm, drainAlarms, type AlarmStore, type AlarmTask } from "./watch";
+import {
+  evalWatch,
+  evalShellAlert,
+  fmtDur,
+  pushAlarm,
+  drainAlarms,
+  type AlarmStore,
+  type AlarmTask,
+  type ShellAlertDecision,
+} from "./watch";
 import { ShellHub, type ShellOutMsg, type ShellPing } from "./shell";
 import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest } from "./agent-auth";
 import { reloadVerdict, reloadErrorResponse } from "./admin-auth";
@@ -132,7 +141,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261028-v4.11";
+const BUILD = "devbot-20261028-v4.12";
 
 /**
  * 未识别输入时的兜底提示。
@@ -1198,6 +1207,8 @@ export class AssistantDO extends DurableObject<Env> {
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
+    // shell 离线告警：机器在跑但 agent 没连上 → 主动发 Telegram（否则只能你自己发现）
+    const sa = await this.checkShellAlert(state === "Available");
     const ep = await this.getEpisode();
     if (state === "Available") {
       if (!ep || !ep.running) {
@@ -1207,18 +1218,74 @@ export class AssistantDO extends DurableObject<Env> {
         if (chat) {
           await this.reply(chat, `👀 巡检发现开发机在运行（不是我开的）。不用了发 /halt，或在 GitHub 页面关机。`);
         }
-        return { ok: true, state, note: "observed-new" };
+        return { ok: true, state, note: "observed-new", ...sa };
       }
       // 有窗口：借巡检跑一次看门狗检查（双重保险，alarm 丢了这个也兜底）
       const r = await this.runWatchCheck();
-      return { ok: true, state, ...r };
+      return { ok: true, state, ...r, ...sa };
     }
     // 机器没跑：若有残留 episode，落账清掉
     if (ep?.running) {
       await this.closeEpisode();
-      return { ok: true, state, note: "episode-closed" };
+      return { ok: true, state, note: "episode-closed", ...sa };
     }
-    return { ok: true, state, note: "idle" };
+    return { ok: true, state, note: "idle", ...sa };
+  }
+
+  // ---------------------------------------------------------------- shell 离线告警
+
+  /**
+   * shell 离线告警状态（跨巡检持久化于 DO storage）。
+   *
+   * 为什么要持久化：shell 的心跳时刻是 DO 内存里的，DO 一被驱逐/重载就归零，
+   * 而「离线起点」必须跨巡检记住，否则每次巡检都当成刚断线，宽限期永远走不完。
+   */
+  private async checkShellAlert(machineRunning: boolean): Promise<{ shellAlert: string | null }> {
+    if (!this.shellAlertEnabled()) return { shellAlert: null };
+    const key = "shell_alert";
+    const prev =
+      (await this.ctx.storage.get<Omit<ShellAlertDecision, "notify">>(key)) ??
+      { offlineSince: null, alerted: false, alertedAt: null };
+    const d = evalShellAlert({
+      machineRunning,
+      shellOnline: this.shell.online(),
+      now: Date.now(),
+      lastSeen: this.shell.seenAt(),
+      offlineSince: prev.offlineSince,
+      alerted: prev.alerted,
+      alertedAt: prev.alertedAt,
+      graceMin: this.shellAlertGraceMin(),
+      repeatMin: this.shellAlertRepeatMin(),
+    });
+    await this.ctx.storage.put(key, {
+      offlineSince: d.offlineSince,
+      alerted: d.alerted,
+      alertedAt: d.alertedAt,
+    });
+    if (!d.notify) return { shellAlert: null };
+    const chat = await this.getChatId();
+    if (!chat) {
+      console.warn("[shell-alert] 无 chat_id，告警发不出去");
+      return { shellAlert: "no-chat" };
+    }
+    await this.reply(chat, d.notify);
+    console.log(`[shell-alert] 已告警（机器运行=${machineRunning}）`);
+    return { shellAlert: "alerted" };
+  }
+
+  /** 离线告警开关（var CS_SHELL_ALERT，默认开） */
+  private shellAlertEnabled(): boolean {
+    return (this.env.CS_SHELL_ALERT ?? "1") !== "0";
+  }
+  /** 断线宽限（分钟，默认 5）：躲开 DO 重载 / agent 重启的瞬断 */
+  private shellAlertGraceMin(): number {
+    const v = Number(this.env.CS_SHELL_ALERT_GRACE_MIN ?? 5);
+    return Number.isFinite(v) && v > 0 ? v : 5;
+  }
+  /** 持续离线时的重复告警间隔（分钟，默认 120；0 = 只告一次） */
+  private shellAlertRepeatMin(): number {
+    const v = Number(this.env.CS_SHELL_ALERT_REPEAT_MIN ?? 120);
+    return Number.isFinite(v) && v >= 0 ? v : 120;
   }
 
   // ---------------------------------------------------------------- 运行时长账本

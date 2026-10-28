@@ -88,6 +88,9 @@ export interface Env {
   SHELL_ENABLED?: string; // var："1"（默认）启用；"0" = 未识别文本不做 shell 转发
   SHELL_FLUSH_MS?: string; // var：增量输出静默刷写窗口（毫秒，默认 1200）
   SHELL_MAX_CHARS?: string; // var：单条命令输出上限（字符，默认 24000）
+  CS_SHELL_ALERT?: string; // var："1"（默认）机器在跑但 shell 断线时主动告警；"0" = 关闭
+  CS_SHELL_ALERT_GRACE_MIN?: string; // var：断线宽限（分钟，默认 5）：躲开 DO 重载/agent 重启的瞬断
+  CS_SHELL_ALERT_REPEAT_MIN?: string; // var：持续断线时的重复告警间隔（分钟，默认 120；0 = 只告一次）
 
   /**
    * 单例 DO 的名字（var，默认 "singleton"）。**改这个值 = 立刻换一个全新实例**。

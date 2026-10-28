@@ -59,6 +59,10 @@ CS_GH_CAP_GRACE_MIN = "15"         # stop 模式宽限期（分钟）：警告�
 SHELL_ENABLED = "1"                # "0" = 关闭 shell 转发（未识别文本退回 LLM/提示）
 SHELL_FLUSH_MS = "1200"            # 增量输出静默多久就推一条消息（毫秒）
 SHELL_MAX_CHARS = "24000"          # 单条命令输出上限（超出掐头尾）
+# shell 离线告警：机器在跑但 agent 没连上 → 巡检时主动发 Telegram（否则只能自己发现 bot 不响应）
+CS_SHELL_ALERT = "1"               # "0" = 关闭（只记日志，不打扰）
+CS_SHELL_ALERT_GRACE_MIN = "5"     # 断线宽限（分钟）：躲开 DO 重载 / agent 重启的瞬断
+CS_SHELL_ALERT_REPEAT_MIN = "120"  # 持续断线的重复告警间隔（分钟）；0 = 一段离线只告一次
 # agent 通道鉴权（HMAC 双向签名，见 src/agent-auth.ts）：
 #   AGENT_KEY 只用来算签名，**不再随请求明文传输**；请求带 ts+nonce 防重放，
 #   下行命令由 Worker 签名、agent 验签后才执行。

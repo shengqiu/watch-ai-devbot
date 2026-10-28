@@ -391,7 +391,7 @@ check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
 }
 
 // ---- 省额度看门狗（watch.ts）----
-import { evalWatch, fmtDur, pushAlarm, drainAlarms } from "../src/watch.js";
+import { evalWatch, evalShellAlert, fmtDur, pushAlarm, drainAlarms } from "../src/watch.js";
 import { adminDenied, reloadVerdict, bearerToken } from "../src/admin-auth.js";
 
 const W = (over = {}) => ({
@@ -1468,6 +1468,90 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
     reloadVerdict(envDeploy, req({ method: "POST", headers: { "X-Deploy-Key": DEPLOY } })).ok,
     true,
   );
+}
+
+// ---------------------------------------------------------------- shell 离线告警
+{
+  const MIN = 60_000;
+  const base = {
+    machineRunning: true,
+    shellOnline: false,
+    now: 0,
+    lastSeen: 0,
+    offlineSince: null,
+    alerted: false,
+    alertedAt: null,
+    graceMin: 5,
+    repeatMin: 120,
+  };
+  const sa = (over) => evalShellAlert({ ...base, ...over });
+  const reset = JSON.stringify({ notify: null, offlineSince: null, alerted: false, alertedAt: null });
+
+  // ① 机器没跑：shell 离线是预期的。漏了复位会攒出一次「开机即告警」的误报
+  check(
+    "shell: 机器没跑 → 不告警且状态复位",
+    JSON.stringify(sa({ machineRunning: false, offlineSince: 1, alerted: true, alertedAt: 1 })),
+    reset,
+  );
+  // ② shell 在线：复位（否则上次离线的 alerted 会一直挡着下一段离线的告警）
+  check(
+    "shell: 在线 → 不告警且状态复位",
+    JSON.stringify(sa({ shellOnline: true, offlineSince: 1, alerted: true, alertedAt: 1 })),
+    reset,
+  );
+  // ③ 瞬断（DO 重载 / agent 重启）：宽限期内不打扰，但要记住起点
+  check(
+    "shell: 断线 2 分钟（< 宽限 5）→ 不告警，记住起点",
+    JSON.stringify(sa({ now: 2 * MIN, lastSeen: 0 })),
+    JSON.stringify({ notify: null, offlineSince: 2 * MIN, alerted: false, alertedAt: null }),
+  );
+  // ④ 真离线：超宽限就告（起点来自持久化的 offlineSince）
+  check(
+    "shell: 断线 10 分钟 → 首次告警",
+    sa({ now: 10 * MIN, offlineSince: 0 }).notify !== null,
+    true,
+  );
+  // ⑤ 已告过但未到重复间隔 → 静默（防刷屏）
+  check(
+    "shell: 已告过 + 未到重复间隔 → 静默且不改 alertedAt",
+    JSON.stringify(sa({ now: 30 * MIN, offlineSince: 0, alerted: true, alertedAt: 0 })),
+    JSON.stringify({ notify: null, offlineSince: 0, alerted: true, alertedAt: 0 }),
+  );
+  // ⑥ 到重复间隔 → 重发，并刷新 alertedAt
+  check(
+    "shell: 已告过 + 到重复间隔 → 重发并刷新 alertedAt",
+    sa({ now: 130 * MIN, offlineSince: 0, alerted: true, alertedAt: 0 }).alertedAt,
+    130 * MIN,
+  );
+  check(
+    "shell: 重发时确实有文案",
+    sa({ now: 130 * MIN, offlineSince: 0, alerted: true, alertedAt: 0 }).notify !== null,
+    true,
+  );
+  // ⑦ repeatMin=0 → 一段离线只告一次
+  check(
+    "shell: repeatMin=0 → 永不重发",
+    sa({ now: 500 * MIN, offlineSince: 0, alerted: true, alertedAt: 0, repeatMin: 0 }).notify,
+    null,
+  );
+  // ⑧ 关键回归：起点必须取 lastSeen 而不是 now。
+  //    巡检半小时一次，用 now 会把「40 分钟前就断了」算成「刚断」→ 宽限永远走不完 → 永远不告警
+  check(
+    "shell: 起点取最后心跳（40 分钟前断 → 立即告警，不能用巡检时刻）",
+    sa({ now: 40 * MIN, lastSeen: 1 * MIN }).notify !== null,
+    true,
+  );
+  // ⑨ 沿用持久化的 offlineSince（DO 刚重载，内存 lastSeen=0）
+  check(
+    "shell: 用持久化的 offlineSince 续算（lastSeen=0 时）",
+    sa({ now: 25 * MIN, lastSeen: 0, offlineSince: 20 * MIN }).notify !== null,
+    true,
+  );
+  // ⑩ 告警要给出可执行的下一步
+  const txt = sa({ now: 10 * MIN, offlineSince: 0 }).notify ?? "";
+  check("shell: 告警含 /cs 自查提示", txt.includes("/cs"), true);
+  check("shell: 告警含 /halt 重启提示", txt.includes("/halt"), true);
+  check("shell: 告警含断线时长", /已\s*\d+(分钟|小时)/.test(txt), true);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

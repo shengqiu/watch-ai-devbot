@@ -1,1 +1,10 @@
 node_modules/
+# 本地密钥文件（README 让你 cp .dev.vars.example .dev.vars 填真 token）
+# ——绝不能进仓库：.dev.vars 里是真实的 API key / bot token / signing secret
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+*.local
+# wrangler 本地状态目录（wrangler dev 生成）
+.wrangler/

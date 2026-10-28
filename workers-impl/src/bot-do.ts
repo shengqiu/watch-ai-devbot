@@ -651,7 +651,7 @@ export class AssistantDO extends DurableObject<Env> {
       await this.reply(m.chatId, "没听清⋯⋯换句话试试，或者直接发文字。");
       return;
     }
-    console.log(`[tg] 消息 chat=${m.chatId} source=${source} text=${text.slice(0, 80)}`);
+    console.log(`[${channel}] 消息 chat=${m.chatId} source=${source} text=${text.slice(0, 80)}`);
 
     // 5.5) 身份验证（10 分钟滑动会话）：
     //   - 未验证：一切问题/指令都不转发 LLM / Codespace，只回验证问题；
@@ -684,7 +684,7 @@ export class AssistantDO extends DurableObject<Env> {
         );
         text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
         source = `${source}+replay`;
-        console.log(`[tg] 验证通过后补执行暂存命令 chat=${m.chatId} cmd=${previewCmd(pending, 60)}`);
+        console.log(`[${channel}] 验证通过后补执行暂存命令 chat=${m.chatId} cmd=${previewCmd(pending, 60)}`);
       } else {
         // 未通过：像命令的才记下来（输错的验证词不该在验证后被当成命令执行）
         const remember = looksLikeCommand(text);
@@ -839,7 +839,7 @@ export class AssistantDO extends DurableObject<Env> {
     if (Object.keys(providers).length === 0) {
       await this.appendHistory(m.chatId, "user", text);
       await this.reply(m.chatId, shellRes === "disabled" ? terminalHint() : shellRes);
-      console.log(`[tg] shell 不可用且无 LLM 厂商，已回提示 chat=${m.chatId}`);
+      console.log(`[${channel}] shell 不可用且无 LLM 厂商，已回提示 chat=${m.chatId}`);
       return;
     }
 
@@ -863,7 +863,7 @@ export class AssistantDO extends DurableObject<Env> {
 
     // 8) 分段回包
     await this.reply(m.chatId, answer);
-    console.log(`[tg] 已回复 chat=${m.chatId} via ${via}`);
+    console.log(`[${channel}] 已回复 chat=${m.chatId} via ${via}`);
   }
 
   // ---------------------------------------------------------------- Codespace 开发机

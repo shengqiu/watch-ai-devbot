@@ -657,6 +657,7 @@ const {
   markerLine,
   parseMarkerLine,
   extractMarkers,
+  footerNote,
   ShellHub,
 } = await import("../src/shell.js");
 {
@@ -693,6 +694,13 @@ const {
     check("extractMarkers exit", r.exit, 0);
     check("extractMarkers cwd", r.cwd, "/tmp");
   }
+
+  // 收尾小注：普通命令带目录，AI 会话（/gemini、/buddy）只要退出码
+  check("footerNote 带目录", footerNote(0, "/workspaces/x"), "\n— exit 0 · /workspaces/x");
+  check("footerNote 无 cwd", footerNote(0, null), "\n— exit 0");
+  check("footerNote hideCwd 只留退出码", footerNote(0, "/workspaces/x", true), "\n— exit 0");
+  check("footerNote 非零退出码", footerNote(2, "/a", true), "\n— exit 2");
+  check("footerNote 未知退出码", footerNote(null, "/a"), "\n— exit ? · /a");
 }
 
 // ---- ShellHub 状态机：离线/排队/输出刷写/串行 ----
@@ -732,6 +740,13 @@ const {
   check("收尾含 exit", last.text.includes("exit 0"), true);
   check("收尾含 cwd", last.text.includes("/tmp"), true);
   check("命令完成后清空", hub.pending(), 0);
+
+  // AI 会话（/gemini、/buddy）用 hideCwd：收尾只留退出码，不报父 shell 的目录
+  const q3 = hub.enqueue("c1", "bash /tmp/buddy.sh", { label: "🧩 提问", hideCwd: true });
+  await hub.onOutput({ id: q3.id, text: "答案\n", done: true, exit: 0, cwd: "/workspaces/watch-ai-assistant" });
+  const last3 = sent[sent.length - 1];
+  check("hideCwd 保留 exit", last3.text.includes("— exit 0"), true);
+  check("hideCwd 不报目录", last3.text.includes("/workspaces"), false);
 
   // 输出超限截断
   const sent2 = [];

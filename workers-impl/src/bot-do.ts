@@ -164,7 +164,11 @@ import {
 //       （登录态在 ~/.codebuddy，不需要 API key），工作目录固定 /workspaces/codebuddy
 //       并 pre-trust。两边共用同一套「模式开关 + 待发提问 + prep alarm」，只在生成
 //       脚本处按 provider 分叉，避免复制一遍六百行流程控制。
-const BUILD = "devbot-20261028-v4.17";
+// v4.18：AI 会话的收尾小注只留 `— exit 0`，不再附目录。那两个脚本整体跑在子 shell
+//       里（避免 exit 杀掉长驻 shell），cd 不外泄，报出来的是父 shell 的位置，
+//       跟「AI 在哪个目录干活」不是一回事 —— 用户确实问过「为什么显示
+//       /workspaces/watch-ai-assistant」。普通 shell 命令仍保留目录（那是真的会变）。
+const BUILD = "devbot-20261028-v4.18";
 
 /**
  * 「AI 编程会话」的两种 provider。/gemini 与 /buddy 除脚本生成外流程完全一致
@@ -961,7 +965,7 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   private async enqueueBuddy(chatId: string, script: string, label: string): Promise<void> {
-    const res = this.shell.enqueue(chatId, script, { label });
+    const res = this.shell.enqueue(chatId, script, { label, hideCwd: true });
     if (res.ok) return;
     await this.reply(chatId, res.message ?? "shell 通道不可用。");
   }
@@ -1044,6 +1048,7 @@ export class AssistantDO extends DurableObject<Env> {
       const model = await this.buddyPin(chatId);
       const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt, model }), {
         label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
+        hideCwd: true,
       });
       if (modeHint) await this.reply(chatId, modeHint);
       if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
@@ -1158,7 +1163,7 @@ export class AssistantDO extends DurableObject<Env> {
 
   /** 简单脚本（status / new）：通道不在线就别假装成功。 */
   private async enqueueGemini(chatId: string, script: string, label: string): Promise<void> {
-    const res = this.shell.enqueue(chatId, script, { label });
+    const res = this.shell.enqueue(chatId, script, { label, hideCwd: true });
     if (res.ok) return;
     await this.reply(chatId, res.message ?? "shell 通道不可用。");
   }
@@ -1177,6 +1182,7 @@ export class AssistantDO extends DurableObject<Env> {
       const model = await this.geminiPin(chatId);
       const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt, model, chain: this.geminiChain() }), {
         label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
+        hideCwd: true,
       });
       if (modeHint) await this.reply(chatId, modeHint);
       if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
@@ -1273,6 +1279,7 @@ export class AssistantDO extends DurableObject<Env> {
       const model = await this.buddyPin(chatId);
       const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt: prompt ?? undefined, model }), {
         label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
+        hideCwd: true,
       });
       if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
       return;
@@ -1282,6 +1289,7 @@ export class AssistantDO extends DurableObject<Env> {
     const model = await this.geminiPin(chatId);
     const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt: prompt ?? undefined, model, chain: this.geminiChain() }), {
       label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
+      hideCwd: true,
     });
     if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
   }

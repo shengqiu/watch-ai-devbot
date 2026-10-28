@@ -115,6 +115,17 @@ export function extractMarkers(text: string): { text: string; exit: number | nul
   return { text: kept.join("\n"), exit, cwd };
 }
 
+/**
+ * 收尾小注：`— exit 0 · /path`（成功与否 + shell 现在站在哪）。
+ *
+ * hideCwd 由 AI 会话（/gemini、/buddy）启用：那两个脚本整体包在子 shell 里，
+ * 里面的 cd 不会改变长驻 shell 的目录，报出来的是父 shell 的位置，跟 AI 实际
+ * 在哪个目录干活无关 —— 只留退出码，少一处要解释的地方。
+ */
+export function footerNote(exit: number | null, cwd: string | null, hideCwd = false): string {
+  return `\n— exit ${exit ?? "?"}${cwd && !hideCwd ? ` · ${cwd}` : ""}`;
+}
+
 // ------------------------------------------------------------------ 状态机
 
 export interface ShellCmd {
@@ -145,6 +156,13 @@ export interface ShellCmd {
   /** true = 不把命令原文写进 agent 日志（含密钥时） */
   quiet?: boolean;
   /**
+   * true = 收尾小注只留 `— exit 0`，不报目录。给 AI 会话（/gemini、/buddy）用：
+   * 它们的脚本整体跑在子 shell 里（避免 exit 杀掉长驻 shell），`cd` 不外泄，
+   * 报出来的目录是**父 shell** 的位置，跟「AI 在哪个目录干活」不是一回事，
+   * 只会让人以为跑错目录。
+   */
+  hideCwd?: boolean;
+  /**
    * 下行命令的 HMAC 签名（Worker 用 AGENT_KEY 算，agent 验签后才执行）。
    * 缺省 = 没配 signer（老实例/单测），此时不下发 sig 字段，agent 按兼容模式处理。
    */
@@ -158,6 +176,8 @@ export interface ShellOpts {
   echo?: boolean;
   /** 是否允许 agent 记录命令原文（默认 true；含密钥时传 false） */
   quiet?: boolean;
+  /** 收尾小注里不报目录（只留 `— exit 0`），见 ShellCmd.hideCwd */
+  hideCwd?: boolean;
 }
 
 export interface ShellOutMsg {
@@ -408,6 +428,7 @@ export class ShellHub {
     if (opts.label) rec.label = opts.label;
     if (opts.echo === false) rec.echo = false;
     if (opts.quiet) rec.quiet = true;
+    if (opts.hideCwd) rec.hideCwd = true;
     this.queue.set(id, rec);
     this.buf.set(id, { parts: [], chars: 0, timer: null, echoed: false });
     this.push(rec);
@@ -701,7 +722,7 @@ export class ShellHub {
       }
     }
     if (done) {
-      out += `\n— exit ${exit ?? "?"}${cwd ? ` · ${cwd}` : ""}`;
+      out += footerNote(exit, cwd, cmd.hideCwd === true);
     }
     if (!out.trim()) {
       if (done) {

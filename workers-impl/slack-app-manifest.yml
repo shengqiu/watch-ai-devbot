@@ -1,15 +1,26 @@
-# Slack App 一键配置清单（v4.22 Slack 通道）
+# Slack App 一键配置清单（v4.23 Slack 通道）
 #
 # 用法：Slack API → Your Apps → Create New App → From an app manifest → 粘贴本文件
-# （把 <WORKER_BASE_URL> 换成你的 Worker 地址，如 https://watch-ai-devbot.<子域>.workers.dev）
 #
-# 装好后还差三步（见 DEPLOY.md「Slack 通道」节）：
-#   1. App Credentials 页复制 Signing Secret → wrangler secret put SLACK_SIGNING_SECRET
-#   2. OAuth & Permissions 页复制 Bot User OAuth Token → wrangler secret put SLACK_BOT_TOKEN
-#   3. Event Subscriptions 开启 → Request URL 填 <WORKER_BASE_URL>/slack/events
-#      （此时 Slack 会发 url_verification 握手，Worker 回 challenge 即配置成功）
-#   4. 把你的 Slack user id（U 开头）配进白名单：wrangler secret put SLACK_ALLOWED_USERS
-#      （或先留空放开，发一条消息后从 wrangler tail 日志里找 user=Uxxxx）
+# ⚠️ 为什么这里没有预置 Event Subscriptions 的 Request URL：
+#    建 App 时 Slack 会立即向 request_url 发 url_verification 握手，
+#    但那时 SLACK_SIGNING_SECRET 还没配进 Worker（secret 要等 App 建好才拿得到），
+#    Worker 按 fail-closed 返回 404 → 握手失败 → App 创建不了（先有鸡还是先有蛋）。
+#    所以事件订阅必须在配好 secret 之后，去 App 页面手动开启（见下方步骤 5）。
+#    Slash Commands 的 URL 不做创建期校验（首次调用才生效），可以安全预登记。
+#
+# 装好后的顺序（详见 DEPLOY.md「Slack 通道」节）：
+#   1. 用本文件建 App（本步无网络校验，必成功）
+#   2. OAuth & Permissions → Install to Workspace → 复制 Bot User OAuth Token（xoxb-...）
+#   3. Basic Information → App Credentials → 复制 Signing Secret
+#   4. 注入 Cloudflare：npx wrangler secret put SLACK_BOT_TOKEN / SLACK_SIGNING_SECRET
+#      （注意：secret 只在部署时读取——改 secret 后需要重新 deploy 才生效）
+#   5. Event Subscriptions → 开启 → Request URL 填
+#      https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/events
+#      （此刻握手必过，显示 Verified 即成功）
+#      → Subscribe to bot events 里勾 message.im（私聊主场景）与 app_mention（可选）→ Save
+#   6. 白名单：npx wrangler secret put SLACK_ALLOWED_USERS
+#      （你的 U 开头 user id；空 = 放开，发一条消息后从 wrangler tail 日志里找 user=Uxxxx）
 
 display_information:
   name: watch-ai-devbot
@@ -20,25 +31,48 @@ features:
   bot_user:
     display_name: watch-ai-devbot
     always_online: false
+  # Slash 指令预登记（清单与 workers-impl/src/commands.ts 注册表一致；
+  # URL 首次调用时才校验，建 App 阶段无网络请求）
+  slash_commands:
+    - command: /boot
+      description: 开机（30 秒后确认结果）
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /halt
+      description: 关机（省免费额度）
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /cs
+      description: 机器状态 + shell 通道
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /usage
+      description: 本月运行时长 / 免费额度
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /gemini
+      description: Gemini 编程会话
+      usage_hint: "[问题 | off | new | models | status]"
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /buddy
+      description: CodeBuddy 编程会话
+      usage_hint: "[问题 | off | new | models | status]"
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /ctrlc
+      description: 中断当前命令并清空队列
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /help
+      description: 指令表
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
+    - command: /diag
+      description: 诊断信息（排查用）
+      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
 
 oauth_config:
   scopes:
     bot:
       - chat:write        # 发消息（chat.postMessage）
       - chat:write.public  # 允许发到 bot 未加入的公开频道（可选，按需删）
+      - im:history         # 订阅 message.im（私聊消息）的必需 scope —— 漏了收不到私聊事件
       - app_mentions:read  # 被 @提及时收事件（频道里使用）
 
 settings:
-  event_subscriptions:
-    request_url: "https://watch-ai-devbot.SHENGQIU-PURDUE.workERS.dev/slack/events" # ← 换成你的地址
-    bot_events:
-      - message.im      # 私聊消息（主场景）
-      - app_mention     # 频道 @提及（可选）
-  interactivity:
-    is_enabled: true
-    # Slash Commands 的 Request URL（逐条指令也要在 App → Slash Commands 页登记，
-    # 命令清单与 workers-impl/src/commands.ts 的注册表一致：boot halt cs usage gemini buddy ctrlc help diag）
-    request_url: "https://watch-ai-devbot.SHENGQIU-PURDUE.workERS.dev/slack/commands"
   org_deploy_enabled: false
   socket_mode_enabled: false   # 必须 false：Socket Mode 要常驻连接，与 CF Workers 免费档冲突
   token_rotation_enabled: false

@@ -143,3 +143,4 @@ Apple Watch 发语音/文字 → Telegram → webhook POST 到 Cloudflare Worker
 - 核对 `src/router/` 目录（intent.ts / providers.ts）确实存在，
   两份 README 文件地图对其的引用无误，无需修改
 - 内容零功能变化；改动仅限文档
+> 分支保护策略见 docs/BRANCH-PROTECTION.md（watch-ai-assistant 仓）。

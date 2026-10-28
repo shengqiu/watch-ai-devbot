@@ -94,3 +94,18 @@
 
 **理由**：Telegram Bot API 是纯 HTTPS REST + webhook，与 Cloudflare Workers 事件驱动形态**天然绝配**——无备案、无签名、无审核、无意图配置的全部摩擦；@BotFather 30 秒出 token；无常驻连接、duration 成本≈0；Watch Telegram 手表版支持语音输入（听写/语音条均可）。
 **代价**：**Telegram 在中国大陆被墙**——用户手机与 Apple Watch 需代理/VPN；语音需第三方 STT 转写（无平台内置免费 ASR）。
+
+## ADR-12 编程执行体接入：非交互 CLI（/gemini、/buddy，2026-10-28）
+
+**背景**：ADR-4 把「LLM 直出」定为默认、CLI 定为进阶。实际使用中用户希望在手表/手机上直接驱动真正的编码 agent（能改文件、跑命令），而开发机（GitHub Codespace）已经由 devbot 远程开关机。
+
+**结论**：
+1. 不做「把 TUI 塞进 Telegram」。两个 CLI 都走**非交互模式**：每条消息 = 一次 `-p "<问题>"`，stdout 逐行回传；交互式 Ink/全屏 TUI 每次按键重绘，硬灌进来只会得到重复碎片。
+2. 会话续用靠 CLI 自己的 session（gemini `-r latest` / codebuddy `-c`），并用标记文件保护「首次没有 session 可续」的情况。
+3. 无人值守必须自动批准：gemini `--approval-mode=yolo`、codebuddy `-y`。
+4. 认证分两条路，都不经过聊天：`/gemini` 用 `GEMINI_API_KEY`（Codespaces secret 或 out-of-band 写的 `~/.config/watch-ai/gemini-key`）；`/buddy` 用 **CodeBuddy 自己的浏览器 OAuth**，登录态落在开发机 `~/.codebuddy`，chat 侧没有任何 key 可收（`/buddy key|login` 直接回帮助）。
+5. 两个 provider 共用**一个**会话模式槽位（`ai_mode`）：普通文本只能给其中一个，「后来的覆盖先前的」，避免用户必须先 off 再开。
+6. `/buddy` 固定工作目录 `/workspaces/codebuddy` 并 pre-trust（写进 `~/.codebuddy/settings.json` 的 `trustedDirectories`）：headless 下信任询问会直接卡住，且「允许 agent 在哪个目录动手」是安全边界，应当显式声明而不是靠 `--yes` 偷偷绕过。
+
+**理由**：CLI 的会话/工具/权限模型已经成熟，复用它比自己写一个 agent 省钱省时；一键「开机 → 等 shell → 装 CLI → 发问题」的体验和 /boot 一致；两个 CLI 共用流程控制（模式开关、待发提问、prep alarm）只在生成脚本处分叉，避免复制整套等待/重试逻辑。
+**代价**：单飞队列下一问一答串行，长任务会占住通道；CodeBuddy 登录失效时只能人工到开发机终端重新授权（headless 拿不到浏览器）；CLI 的 flag 随版本变动（如 `--model` 无短选项），改动需同步 `src/buddy.ts` / `src/gemini.ts`。

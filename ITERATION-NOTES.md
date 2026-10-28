@@ -1,7 +1,10 @@
 # Watch AI 编程助手 — 部署与迭代纪要
 
 > Apple Watch 语音 → 云端 AI 编程助手（Telegram 通道 / Cloudflare Workers 免费档）
-> 纪要截至 2026-10-26，仓库 BUILD v16；线上实际部署版本以 CF Dashboard / `curl /healthz` 为准。
+> 纪要截至 2026-10-28，仓库 BUILD `devbot-20261028-v4.16`。
+> 线上实际版本用**带 ADMIN_KEY 的 `/status`** 查（`/healthz` 自安全审查 #7 起只回 `{"ok":true}`，不再带 build）。
+> 验证会话窗口自 v4.16 起为 **10 分钟滑动**（任何交互续期 10 分钟；连续 10 分钟无消息即失效，须重新回答验证词）。
+> 下文 v16 及更早的条目是历史记录，部署方式与鉴权已改为 header（见 README / DEPLOY.md）。
 
 ## 架构一句话
 

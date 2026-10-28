@@ -70,10 +70,12 @@ npx wrangler deploy
 
 ### 4.3 注册 webhook（一次性，关键）
 
-浏览器打开或 curl（用你 deploy 输出的真实子域）：
+`/setup` 是**管理端点**，必须带 `ADMIN_KEY`（安全审查 #7/#8：密钥只走请求头、绝不进 URL；
+浏览器发不出自定义头，所以用 curl，用你 deploy 输出的真实子域）：
 
 ```bash
-curl https://watch-ai-qqbot.<你的子域>.workers.dev/setup
+curl -X POST -H "X-Admin-Key: $ADMIN_KEY" \
+  https://watch-ai-devbot.<你的子域>.workers.dev/setup
 ```
 
 这会用本次请求的公网地址自动 `setWebhook` 指向本 Worker 的 `/webhook`，并回显 `getWebhookInfo`——
@@ -82,8 +84,13 @@ curl https://watch-ai-qqbot.<你的子域>.workers.dev/setup
 ### 4.4 验证已上线
 
 ```bash
-curl https://watch-ai-qqbot.<你的子域>.workers.dev/healthz
-# → {"ok":true,"build":"telegram-20261025-v16","channel":"telegram"}
+# 公开探针：只回 liveness，不含 build / 连接信息（安全审查 #7）
+curl https://watch-ai-devbot.<你的子域>.workers.dev/healthz
+# → {"ok":true}
+
+# 诊断（build / shell 在线 / 鉴权模式 / 来源 IP）走需 ADMIN_KEY 的 /status
+curl -H "X-Admin-Key: $ADMIN_KEY" \
+  https://watch-ai-devbot.<你的子域>.workers.dev/status
 ```
 
 实时日志：`npx wrangler tail`（消息/语音转写/LLM/回复全在这里）。
@@ -97,11 +104,11 @@ curl https://watch-ai-qqbot.<你的子域>.workers.dev/healthz
    > 听写示范：「用 gemini 帮我写一个 python 快速排序，带类型注解」
 3. 约 5~30 秒收到回复（代码 + 说明），手表震动提醒
 
-**第一条消息发出后，去 `wrangler tail` 日志里找 `chat=<数字>`——那就是你的 chat_id**，下一步加固要用。
+**第一条消息发出后，去 `wrangler tail` 日志里找 `user=<数字>`（即你的 Telegram user_id；私聊里等于 chat_id）**，下一步加固要用。被拒时回包也会直接告诉你 user_id。
 
 ## Step 6 加固（5 分钟，建议做）
 
-1. **填白名单**：把上一步日志里的 `chat_id` 填进 `wrangler.toml` 的 `ALLOWED_USERS`，重新 `npx wrangler deploy`——否则任何给 Bot 发消息的人都能支使机器人烧你的 key
+1. **填白名单**：把你的 Telegram `user_id`（from.id）填进 `wrangler.toml` 的 `ALLOWED_USERS`，重新 `npx wrangler deploy`——否则任何给 Bot 发消息的人都能支使机器人烧你的 key。注意是 **user_id**（私聊时等于 chat_id，但群聊里 chat_id 是群号、不是你本人），被拒时回包会直接告诉你 `你的 user_id 是 ...`。
 2. 按需调 `DAILY_CALL_BUDGET`（日调用上限）/ `RATE_LIMIT_PER_MIN`（分钟级限流）
 3. Gemini 侧在 AI Studio 设消费告警
 
@@ -121,8 +128,8 @@ curl "http://localhost:8787/send?text=hi&chat_id=<你的chat_id>"
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 发消息完全没反应 | webhook 没注册成功 | 重新 `curl .../setup`，看返回的 `getWebhookInfo.url` 是否正确、有无 `last_error_message` |
-| 日志出现 `非白名单 chat=...，忽略` | 命中白名单 | 把该 chat_id 加进 `ALLOWED_USERS`，或清空白名单 |
+| 发消息完全没反应 | webhook 没注册成功 | 重新 `curl -X POST -H "X-Admin-Key: $ADMIN_KEY" .../setup`，看返回的 `getWebhookInfo.url` 是否正确、有无 `last_error_message` |
+| 日志出现 `非白名单 user=...，拒绝` | 不在白名单 | 把该 user_id 加进 `ALLOWED_USERS` 的 secret，或清空白名单 |
 | 日志 `403 forbidden` | `TELEGRAM_WEBHOOK_SECRET` 与 setWebhook 时不一致 | 重新 setup，或删掉该 secret |
 | 能收但不回 | Gemini key 没配/配额耗尽 | 日志里 `[agent]` 有报错；`providers.json` 里没 key 的厂商自动禁用 |
 | 语音没转写 | 未配 `STT_BASE_URL/STT_API_KEY` | 配 Groq Whisper（Step 3）；或让用户发文字 |

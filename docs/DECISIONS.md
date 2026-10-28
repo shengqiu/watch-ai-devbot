@@ -40,7 +40,7 @@
 
 ## ADR-9 计算平台终版：Cloudflare Workers + Durable Objects（2026-10-24）
 
-**背景**：ADR-5 定的是「单机 Docker Compose + VPS」。用户要求先敲定云计算产品再动代码，并对「Oracle 之外的免费选项」做了全量调研（GCP e2-micro / Azure 12 个月 / CF Workers / HF Spaces / Render / Fly / Railway / Deno Deploy / 腾讯云试用 / 家里常开设备）。
+**背景**：ADR-5 定的是「单机 Docker Compose + VPS」。用户要求先敲定云计算产品再动代码，并对「Oracle 之外的免费选项」做了全量调研（GCP e2-micro / Azure 12 个月 / CF Workers / HF Spaces / Render / Fly / Railway / Deno Deploy / 家里常开设备）。
 
 **调研关键事实**：
 - **Render Free 出局**：免费档无 background worker，且 15 分钟无请求即休眠——长连接 bot 永远算「空闲」。Fly.io / Railway / Heroku 免费档均已终结；HF Spaces 的 Docker/Gradio 自 2026-07 起需 PRO $9/月。
@@ -76,7 +76,7 @@
 2. 接入方式 = Gemini 官方 **OpenAI 兼容端点** `https://generativelanguage.googleapis.com/v1beta/openai/`（`Authorization: Bearer {GEMINI_API_KEY}`）——与其余厂商共用同一套 `/chat/completions` 路由代码，零额外适配。
 3. **Claude 降级为可选**：`providers` 中 `anthropic` 置 `enabled: false`，填 key 后置 true 即恢复；意图别名表保留 `claude/anthropic/克劳德`。
 4. 意图解析新增别名：`gemini / google / 谷歌 / gemini pro / gemini flash`；「pro 档」触发 flagship 档位。
-5. 对架构的连带影响：Gemini 国内不可直连 → 计算侧必须出海 → 与 ADR-9（Cloudflare Workers）互相印证，国内 VPS 选项（腾讯云轻量）在 Gemini 为主的前提下不再适合。
+5. 对架构的连带影响：Gemini 国内不可直连 → 计算侧必须出海 → 与 ADR-9（Cloudflare Workers）互相印证，国内 VPS 选项在 Gemini 为主的前提下不再适合。
 6. 成本红利：AI Studio 免费档可覆盖个人轻度使用（~50 条/天），模型侧有机会 ¥0；超额按量计费。
 
 **理由**：用户偏好；Gemini 3 档编程能力与 Claude/GPT 同档；OpenAI 兼容端点让「按需选厂商」的路由层零成本扩展；免费档进一步压低总成本。

@@ -22,6 +22,16 @@ import {
   GEMINI_SECRETS_FILE,
 } from "../src/gemini.js";
 import {
+  buildBuddyScript,
+  buildBuddyStatusScript,
+  buildBuddyModelsScript,
+  buildBuddyNewSessionScript,
+  parseBuddyArgs,
+  BUDDY_DIR,
+  BUDDY_PKG,
+  BUDDY_SESSION_MARK,
+} from "../src/buddy.js";
+import {
   COMMANDS,
   matchCommand,
   looksLikeUnknownSlash,
@@ -1700,6 +1710,88 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("shell: 告警含 /cs 自查提示", txt.includes("/cs"), true);
   check("shell: 告警含 /halt 重启提示", txt.includes("/halt"), true);
   check("shell: 告警含断线时长", /已\s*\d+(分钟|小时)/.test(txt), true);
+}
+
+// ---- /buddy（CodeBuddy CLI，v4.17）----
+{
+  // 参数解析：与 /gemini 完全对齐（用户要求「功能和 /gemini 一样」）
+  check("buddy 空 → open", parseBuddyArgs("").kind, "open");
+  check("buddy off", parseBuddyArgs("off").kind, "off");
+  check("buddy quit 等价 off", parseBuddyArgs("quit").kind, "off");
+  check("buddy status", parseBuddyArgs("status").kind, "status");
+  check("buddy new", parseBuddyArgs("new").kind, "new");
+  check("buddy models", parseBuddyArgs("models").kind, "models");
+  check("buddy ls 是别名", parseBuddyArgs("ls").kind, "models");
+  // 登录只在机器上做浏览器 OAuth，聊天里绝不收凭证
+  check("buddy login 不收凭证", parseBuddyArgs("login code123").kind, "help");
+  check("buddy key 不收凭证", parseBuddyArgs("key code123").kind, "help");
+  check("buddy model auto", parseBuddyArgs("model auto").model, "auto");
+  check("buddy model 保留原名", parseBuddyArgs("model deepseek-v4.1-flash").model, "deepseek-v4.1-flash");
+  const bAsk = parseBuddyArgs("把 hello.txt 改成 你好");
+  check("buddy 其它文本 → ask", bAsk.kind, "ask");
+  check("buddy ask 保留全文", bAsk.prompt, "把 hello.txt 改成 你好");
+
+  // 脚本骨架
+  const bPrep = buildBuddyScript();
+  check("buddy 脚本包子 shell", bPrep.startsWith("("), true);
+  check("buddy 脚本以 ) 收尾", bPrep.trimEnd().endsWith(")"), true);
+  // 用户要求：直接进入 codebuddy 文件夹
+  check("buddy cd 固定目录", bPrep.includes(`cd ${BUDDY_DIR}`), true);
+  check("buddy 目录不存在时自动建", bPrep.includes(`mkdir -p ${BUDDY_DIR}`), true);
+  // 允许该目录 = 写进 CodeBuddy 的 trustedDirectories，避免 headless 卡在信任询问
+  check("buddy 自动补信任目录", bPrep.includes("trustedDirectories"), true);
+  check("buddy 信任的就是工作目录", bPrep.includes(`t.add("${BUDDY_DIR}")`), true);
+  // 装错包是常见坑：npm 上的 codebuddy / codebuddy-cli 都是别人的 Hello World 桩
+  check("buddy 装的是腾讯官方包", bPrep.includes(BUDDY_PKG), true);
+  check("buddy 不装同名假包", bPrep.includes("npm i -g codebuddy </dev/null"), false);
+  check("buddy 缺 CLI 才装", bPrep.includes("command -v codebuddy"), true);
+  // nvm 装的 CLI 在非登录 shell 里不在 PATH 上，必须显式补
+  check("buddy 补 nvm PATH", bPrep.includes("nvm/current/bin"), true);
+  check("buddy 准备模式不跑 prompt", bPrep.includes('-p "$P"'), false);
+  check("buddy 不需要 API key", bPrep.includes("CODEBUDDY_API_KEY"), false);
+
+  // 运行脚本
+  const bRun = buildBuddyScript({ prompt: "hi", model: "deepseek-v4.1-flash" });
+  check("buddy 问题落文件（避开转义）", bRun.includes('P="$(cat /tmp/ws-buddy-prompt.txt)"'), true);
+  check("buddy 带 -p", bRun.includes('-p "$P"'), true);
+  check("buddy 跳过权限确认（无人值守没法按 y）", bRun.includes(" -y"), true);
+  check("buddy 带模型", bRun.includes("--model deepseek-v4.1-flash"), true);
+  check("buddy stdin 重定向 /dev/null", bRun.includes("</dev/null"), true);
+  check("buddy prompt 不落明文进命令", bRun.includes("hi"), false);
+  check(
+    "buddy prompt 能还原",
+    Buffer.from(/printf %s '([^']+)'/.exec(bRun)[1], "base64").toString("utf8"),
+    "hi",
+  );
+  // 续会话必须受标记文件保护：这个目录还没聊过时直接 -c 会报「无会话可续」
+  check("buddy 续会话受标记保护", bRun.includes(BUDDY_SESSION_MARK), true);
+  check("buddy 第一条不加 -c", /\C="";\s*\[ -f/.test(bRun), true);
+  check("buddy 成功后打标记", /rc -eq 0 \]; then mkdir -p[\s\S]*touch/.test(bRun), true);
+  // 模型名注入：白名单挡掉（拼进 shell 命令）
+  check("buddy 模型注入被拒", buildBuddyScript({ prompt: "x", model: "a; rm -rf /" }).includes("rm -rf"), false);
+
+  // 自检脚本
+  const bSt = buildBuddyStatusScript();
+  check("buddy 状态查 CLI", bSt.includes("command -v codebuddy"), true);
+  check("buddy 状态报信任", bSt.includes("trustedDirectories"), true);
+  check("buddy 状态报目录", bSt.includes("$(pwd)"), true);
+  check("buddy 状态报认证", bSt.includes(".codebuddy"), true);
+  check("buddy 状态模型名过白名单", buildBuddyStatusScript("a;rm -rf /").includes("rm -rf"), false);
+
+  check("buddy 模型清单可跑", buildBuddyModelsScript().includes("codebuddy --help"), true);
+  check("buddy 新会话清标记", buildBuddyNewSessionScript().includes(BUDDY_SESSION_MARK), true);
+
+  // 指令注册表：加了指令就必须同步帮助 / 菜单（否则文本和行为分叉）
+  const buddySpec = COMMANDS.find((c) => c.name === "buddy");
+  check("buddy 已注册", Boolean(buddySpec), true);
+  check("buddy 有中文别名", buddySpec.aliases.includes("cb"), true);
+  check("buddy 进 Telegram 菜单", menuCommands().some((m) => m.command === "buddy"), true);
+  check("buddy 算终端互动（续命看门狗）", buddySpec.touch, true);
+  check("/buddy 能被匹配", matchCommand("/buddy").spec.name, "buddy");
+  check("/cb 别名能匹配", matchCommand("/cb").spec.name, "buddy");
+  check("/help buddy 有细节", (renderCommandHelp("buddy") ?? "").includes(BUDDY_DIR), true);
+  check("总帮助里有 CodeBuddy 分组", renderHelp().includes("CodeBuddy"), true);
+  check("总帮助列出 /buddy", renderHelp().includes("/buddy"), true);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

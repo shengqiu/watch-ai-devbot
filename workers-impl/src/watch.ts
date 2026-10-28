@@ -410,8 +410,8 @@ function shellAlertText(offMin: number, repeat: boolean): string {
 export interface AlarmTask {
   /** 到期时间戳（ms） */
   due: number;
-  /** 任务种类：boot_check | watch | gemini_prep（等 shell 连上后准备/启动 Gemini） */
-  kind: "boot_check" | "watch" | "gemini_prep";
+  /** 任务种类：boot_check | watch | gemini_prep | buddy_prep（等 shell 连上后准备/启动对应 CLI） */
+  kind: "boot_check" | "watch" | "gemini_prep" | "buddy_prep";
   /** 附带数据（如 boot_check 的 chat_id） */
   payload?: Record<string, unknown>;
 }

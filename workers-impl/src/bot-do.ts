@@ -69,6 +69,14 @@ import {
   sanitizeModel,
 } from "./gemini";
 import {
+  buildBuddyScript,
+  buildBuddyStatusScript,
+  buildBuddyModelsScript,
+  buildBuddyNewSessionScript,
+  parseBuddyArgs,
+  BUDDY_DIR,
+} from "./buddy";
+import {
   matchCommand,
   renderHelp,
   renderCommandHelp,
@@ -151,7 +159,23 @@ import {
 //       滑动语义不变（任何交互续期 10 分钟），只是连续 10 分钟没消息就失效、
 //       下一条消息重新走验证词。默认值抽成 VERIFY_SESSION_DEFAULT_MIN 并有单测锁住，
 //       防止以后被人顺手改回 30 —— 那样不会有任何测试变红。
-const BUILD = "devbot-20261028-v4.16";
+// v4.17：新增 /buddy —— 用 CodeBuddy CLI 做同样的「编程会话」（非交互 -p、-c 续会话、
+//       -y 跳过确认）。与 /gemini 的差别只在认证与目录：CodeBuddy 走浏览器 OAuth
+//       （登录态在 ~/.codebuddy，不需要 API key），工作目录固定 /workspaces/codebuddy
+//       并 pre-trust。两边共用同一套「模式开关 + 待发提问 + prep alarm」，只在生成
+//       脚本处按 provider 分叉，避免复制一遍六百行流程控制。
+const BUILD = "devbot-20261028-v4.17";
+
+/**
+ * 「AI 编程会话」的两种 provider。/gemini 与 /buddy 除脚本生成外流程完全一致
+ * （开机 → 等通道 → 装 CLI → 非交互 -p → 续会话），所以共用同一套模式开关、
+ * 待发提问暂存和 prep alarm，只在生成脚本处按 provider 分叉。
+ */
+type AiProvider = "gemini" | "buddy";
+
+/** provider → 等通道用的 alarm kind（两种各自独立，避免互相覆盖）。 */
+const aiPrepKind = (p: AiProvider): "gemini_prep" | "buddy_prep" =>
+  p === "buddy" ? "buddy_prep" : "gemini_prep";
 
 /**
  * 未识别输入时的兜底提示。
@@ -356,7 +380,8 @@ export class AssistantDO extends DurableObject<Env> {
         // 早期版本漏传导致「开机成功」那条消息永远发不出去（静默成功）。
         if (t.kind === "boot_check") await this.onBootCheckAlarm(t.payload);
         else if (t.kind === "watch") await this.onWatchAlarm();
-        else if (t.kind === "gemini_prep") await this.onGeminiPrepAlarm(t.payload);
+        else if (t.kind === "gemini_prep") await this.onAiPrepAlarm("gemini", t.payload);
+        else if (t.kind === "buddy_prep") await this.onAiPrepAlarm("buddy", t.payload);
       }
     } catch (e) {
       console.error("[alarm] 队列处理失败", e);
@@ -525,6 +550,9 @@ export class AssistantDO extends DurableObject<Env> {
         case "gemini":
           await this.handleGemini(m.chatId, args, m.messageId);
           return;
+        case "buddy":
+          await this.handleBuddy(m.chatId, args, m.messageId);
+          return;
         case "halt": {
           // 先停机（核心动作，不容失败），再落账（记账失败不应阻断停机）
           const reply = await this.handleStopDev();
@@ -604,14 +632,20 @@ export class AssistantDO extends DurableObject<Env> {
       return;
     }
 
-    // 6.6b) Gemini 会话模式：普通文本 = 问 Gemini；行首 `!` = 仍然走 shell。
+    // 6.6b) AI 会话模式：普通文本 = 问当前 provider（gemini / buddy）；行首 `!` = 仍然走 shell。
     //       位置在指令派发之后 —— 会话模式里 /halt、/cs 这些指令照样能用。
-    if (!parsed && (await this.geminiModeOn(m.chatId))) {
-      if (trimmed.startsWith("!")) {
-        text = trimmed.slice(1).trim(); // 拆掉「!」后落回 shell
-      } else {
-        await this.startGemini(m.chatId, text);
-        return;
+    if (!parsed) {
+      const mode = await this.aiMode(m.chatId);
+      if (mode) {
+        if (trimmed.startsWith("!")) {
+          text = trimmed.slice(1).trim(); // 拆掉「!」后落回 shell
+        } else if (mode === "buddy") {
+          await this.startBuddy(m.chatId, text);
+          return;
+        } else {
+          await this.startGemini(m.chatId, text);
+          return;
+        }
       }
     }
 
@@ -692,12 +726,12 @@ export class AssistantDO extends DurableObject<Env> {
    * 「开始开发」阶段 1：同步检查 + 触发启动 + 即时回复 + 启动看门狗。
    * 二查走 DO alarm 队列（30 秒后）。返回 null = 已回复（后续阶段自己发）。
    *
-   * opts.then="gemini"：开机成功后自动排 gemini_prep（/gemini 触发的开机走这条）。
+   * opts.then：开机成功后自动排 gemini_prep / buddy_prep（/gemini、/buddy 触发的开机走这条）。
    * opts.silent：调用方已经发过自己的「正在启动」文案，这里不再重复。
    */
   private async handleBootDev(
     chatId: string,
-    opts: { then?: "gemini"; silent?: boolean } = {},
+    opts: { then?: AiProvider; silent?: boolean } = {},
   ): Promise<string | null> {
     const client = this.codespaceClient();
     if (!client) return "未配置 GH_CODESPACE_PAT，无法操作开发机（wrangler secret put GH_CODESPACE_PAT）。";
@@ -715,10 +749,10 @@ export class AssistantDO extends DurableObject<Env> {
       // 本来就在跑：看门狗起点重置（你刚确认过要用）
       await this.ensureWatch(chatId, "bot");
       // 机器本来就开着（只是 shell 还没连上）：直接进「等通道」流程
-      if (opts.then === "gemini") {
+      if (opts.then) {
         await pushAlarm(this.alarmStore(), {
           due: Date.now() + 5_000,
-          kind: "gemini_prep",
+          kind: aiPrepKind(opts.then),
           payload: { chat_id: chatId, attempt: 1 },
         });
       }
@@ -763,11 +797,11 @@ export class AssistantDO extends DurableObject<Env> {
     if (final.ok) {
       // 开机成功：刷新 episode 起点（从「确认运行」起算），并排首次看门狗检查
       await this.ensureWatch(chatId, "bot");
-      // /gemini 触发的开机：接着等 shell 连上，再做环境准备
-      if (payload?.then === "gemini") {
+      // /gemini、/buddy 触发的开机：接着等 shell 连上，再做环境准备
+      if (payload?.then === "gemini" || payload?.then === "buddy") {
         await pushAlarm(this.alarmStore(), {
           due: Date.now() + 5_000,
-          kind: "gemini_prep",
+          kind: aiPrepKind(payload.then as AiProvider),
           payload: { chat_id: chatId, attempt: 1 },
         });
       }
@@ -820,16 +854,45 @@ export class AssistantDO extends DurableObject<Env> {
     return lines.join("\n");
   }
 
-  // ---------------------------------------------------------------- Gemini 会话
+  // ---------------------------------------------------------------- AI 会话（gemini / buddy）
 
-  /** 会话模式开关（按 chat 存）。开启后普通文本 = 问 Gemini。 */
+  /**
+   * 当前会话模式（按 chat 存）。开启后普通文本 = 问对应 CLI。
+   *
+   * 只存一个槽位（`ai_mode`）而不是两个布尔：两个 AI 同时“打开”在语义上是矛盾的
+   * —— 普通文本要么给 Gemini 要么给 CodeBuddy。后来的覆盖先前的，用户不用记着
+   * 先 off 再开。
+   * 兼容老 key：v4.17 之前只有 `gem_mode`（布尔），读到时按 gemini 处理，
+   * 免得升级后正在聊的会话突然「发文字变成 shell 命令」。
+   */
+  private async aiMode(chatId: string): Promise<AiProvider | null> {
+    const m = await this.ctx.storage.get<string>(`ai_mode:${chatId}`);
+    if (m === "gemini" || m === "buddy") return m;
+    return (await this.ctx.storage.get<boolean>(`gem_mode:${chatId}`)) === true ? "gemini" : null;
+  }
+
+  private async setAiMode(chatId: string, mode: AiProvider | null): Promise<void> {
+    if (mode) await this.ctx.storage.put(`ai_mode:${chatId}`, mode);
+    else await this.ctx.storage.delete(`ai_mode:${chatId}`);
+    // 老 key 一并清掉：否则 ai_mode 删了之后 gem_mode=true 会把模式“复活”
+    await this.ctx.storage.delete(`gem_mode:${chatId}`);
+  }
+
+  /** 兼容旧调用点（原先只有 gemini 一个 provider）。 */
   private async geminiModeOn(chatId: string): Promise<boolean> {
-    return (await this.ctx.storage.get<boolean>(`gem_mode:${chatId}`)) === true;
+    return (await this.aiMode(chatId)) === "gemini";
+  }
+
+  private async buddyModeOn(chatId: string): Promise<boolean> {
+    return (await this.aiMode(chatId)) === "buddy";
   }
 
   private async setGeminiMode(chatId: string, on: boolean): Promise<void> {
-    if (on) await this.ctx.storage.put(`gem_mode:${chatId}`, true);
-    else await this.ctx.storage.delete(`gem_mode:${chatId}`);
+    await this.setAiMode(chatId, on ? "gemini" : null);
+  }
+
+  private async setBuddyMode(chatId: string, on: boolean): Promise<void> {
+    await this.setAiMode(chatId, on ? "buddy" : null);
   }
 
   private async geminiModel(chatId: string): Promise<string | undefined> {
@@ -873,6 +936,155 @@ export class AssistantDO extends DurableObject<Env> {
     return Date.now() - p.at <= 10 * 60_000 ? p.prompt : null;
   }
 
+  // ---------------------------------------------------------------- CodeBuddy 会话
+
+  private async buddyModel(chatId: string): Promise<string | undefined> {
+    return await this.ctx.storage.get<string>(`buddy_model:${chatId}`);
+  }
+
+  /** 用户是否钉死了模型（`/buddy model <名字>`）。空串 = 用 CLI 默认。 */
+  private async buddyPin(chatId: string): Promise<string> {
+    return (await this.buddyModel(chatId))?.trim() ?? "";
+  }
+
+  /** 同 gemini 的待发提问暂存，独立 key：两个 provider 各留各的，互不踩。 */
+  private async rememberBuddyPrompt(chatId: string, prompt: string): Promise<void> {
+    await this.ctx.storage.put(`buddy_pending:${chatId}`, { prompt, at: Date.now() });
+  }
+
+  private async takeBuddyPrompt(chatId: string): Promise<string | null> {
+    const key = `buddy_pending:${chatId}`;
+    const p = await this.ctx.storage.get<{ prompt: string; at: number }>(key);
+    if (p === undefined) return null;
+    await this.ctx.storage.delete(key);
+    return Date.now() - p.at <= 10 * 60_000 ? p.prompt : null;
+  }
+
+  private async enqueueBuddy(chatId: string, script: string, label: string): Promise<void> {
+    const res = this.shell.enqueue(chatId, script, { label });
+    if (res.ok) return;
+    await this.reply(chatId, res.message ?? "shell 通道不可用。");
+  }
+
+  /** /buddy 的全部子命令在此分派（与 /gemini 一一对应）。 */
+  private async handleBuddy(chatId: string, args: string, messageId: number | null): Promise<void> {
+    const act = parseBuddyArgs(args);
+    switch (act.kind) {
+      case "help":
+        await this.reply(chatId, renderCommandHelp("buddy") ?? "");
+        return;
+      case "off": {
+        // 只在当前确实是 buddy 时才真的退出：否则「/buddy off」会把正在跑的
+        // Gemini 会话也关掉，用户会以为 Gemini 自己断了。
+        if (!(await this.buddyModeOn(chatId))) {
+          const cur = await this.aiMode(chatId);
+          await this.reply(
+            chatId,
+            cur === "gemini"
+              ? "当前是 Gemini 会话模式（/gemini off 退出）。"
+              : "现在没开会话模式，发文字 = 直接执行 shell 命令。",
+          );
+          return;
+        }
+        await this.setBuddyMode(chatId, false);
+        await this.ctx.storage.delete(`buddy_pending:${chatId}`);
+        await this.reply(
+          chatId,
+          "🧩 已退出 CodeBuddy 会话模式。之后发文字 = 直接在开发机执行命令；想再聊发 /buddy。",
+        );
+        return;
+      }
+      case "model": {
+        const m = act.model.trim();
+        if (m === "auto") {
+          await this.ctx.storage.delete(`buddy_model:${chatId}`);
+          await this.reply(chatId, "🧩 已回到 CLI 默认模型（/buddy models 看可选清单）。");
+          return;
+        }
+        if (!sanitizeModel(m)) {
+          await this.reply(
+            chatId,
+            `模型名不合法：${m}\n用法：/buddy model deepseek-v4.1-flash（或 auto 回到默认）\n看清单：/buddy models`,
+          );
+          return;
+        }
+        await this.ctx.storage.put(`buddy_model:${chatId}`, m);
+        await this.reply(chatId, `🧩 已固定 ${m}（/buddy model auto 回到默认）`);
+        return;
+      }
+      case "models":
+        await this.enqueueBuddy(chatId, buildBuddyModelsScript(), "📚 buddy models");
+        return;
+      case "new":
+        await this.enqueueBuddy(chatId, buildBuddyNewSessionScript(), "🆕 新会话");
+        return;
+      case "status":
+        await this.enqueueBuddy(chatId, buildBuddyStatusScript(await this.buddyPin(chatId)), "🔍 buddy status");
+        return;
+      case "ask":
+        await this.startBuddy(chatId, act.prompt);
+        return;
+      case "open":
+        await this.setBuddyMode(chatId, true);
+        await this.startBuddy(chatId);
+        return;
+    }
+  }
+
+  /**
+   * 打开 / 提问的公共入口，结构与 startGemini 完全一致（三态：在线 / 没开机 / 在跑但通道没连）。
+   * 唯一区别是「准备什么脚本」以及不需要查 key（CodeBuddy 用 OAuth 登录态）。
+   */
+  private async startBuddy(chatId: string, prompt?: string): Promise<void> {
+    const modeHint = prompt
+      ? null
+      : `🧩 CodeBuddy 模式已开：直接发问题即可（目录 ${BUDDY_DIR}，/buddy off 退出，行首 ! 仍执行 shell）`;
+
+    if (this.shell.online()) {
+      const model = await this.buddyPin(chatId);
+      const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt, model }), {
+        label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
+      });
+      if (modeHint) await this.reply(chatId, modeHint);
+      if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+      return;
+    }
+
+    const client = this.codespaceClient();
+    if (!client) {
+      await this.reply(chatId, "未配置 GH_CODESPACE_PAT，无法操作开发机（wrangler secret put GH_CODESPACE_PAT）。");
+      return;
+    }
+    if (modeHint) await this.reply(chatId, modeHint);
+
+    let state: CodespaceState | null = null;
+    try {
+      state = (await client.status()).state;
+    } catch {
+      /* 查不动就按「没开」处理，交给 beginBoot 报错 */
+    }
+    if (state && state !== "Available") {
+      await this.reply(
+        chatId,
+        `🖥 开发机没开（${describeState(state)}），正在启动…\n起来后我会自动接上它、准备好 CodeBuddy，然后${prompt ? "把你的问题发过去" : "告诉你一声"}。`,
+      );
+      if (prompt) await this.rememberBuddyPrompt(chatId, prompt);
+      await this.handleBootDev(chatId, { then: "buddy", silent: true });
+      return;
+    }
+
+    await this.reply(
+      chatId,
+      `⏳ 机器在跑，但 shell 通道还没连上（开机后约 10~30 秒）。\n连上我就${prompt ? "把这条问题发过去" : "开始准备 CodeBuddy 环境"}。`,
+    );
+    if (prompt) await this.rememberBuddyPrompt(chatId, prompt);
+    await pushAlarm(this.alarmStore(), {
+      due: Date.now() + 10_000,
+      kind: "buddy_prep",
+      payload: { chat_id: chatId, attempt: 1 },
+    });
+  }
+
   /** /gemini 的全部子命令在此分派。 */
   private async handleGemini(chatId: string, args: string, messageId: number | null): Promise<void> {
     const act = parseGeminiArgs(args);
@@ -881,6 +1093,17 @@ export class AssistantDO extends DurableObject<Env> {
         await this.reply(chatId, renderCommandHelp("gemini") ?? "");
         return;
       case "off":
+        // 对称保护：当前开的是 CodeBuddy 模式时，/gemini off 不该把它一起关掉
+        if (!(await this.geminiModeOn(chatId))) {
+          const cur = await this.aiMode(chatId);
+          await this.reply(
+            chatId,
+            cur === "buddy"
+              ? "当前是 CodeBuddy 会话模式（/buddy off 退出）。"
+              : "现在没开会话模式，发文字 = 直接执行 shell 命令。",
+          );
+          return;
+        }
         await this.setGeminiMode(chatId, false);
         await this.ctx.storage.delete(`gem_pending:${chatId}`);
         await this.reply(
@@ -999,13 +1222,17 @@ export class AssistantDO extends DurableObject<Env> {
     });
   }
 
-  /** alarm：等 shell 连上后下发 Gemini 脚本（开机成功 / 通道未连都走这里）。 */
-  private async onGeminiPrepAlarm(payload?: Record<string, unknown>): Promise<void> {
+  /**
+   * alarm：等 shell 连上后下发对应的 AI 脚本（开机成功 / 通道未连都走这里）。
+   * gemini 与 buddy 只差「取哪份待发提问 + 生成哪个脚本」，等待与重试逻辑完全共用。
+   */
+  private async onAiPrepAlarm(provider: AiProvider, payload?: Record<string, unknown>): Promise<void> {
     const chatId = typeof payload?.chat_id === "string" ? payload.chat_id : "";
     if (!chatId) return;
     const attempt = Number(payload?.attempt ?? 1);
     const client = this.codespaceClient();
     if (!client) return;
+    const cmd = provider === "buddy" ? "/buddy" : "/gemini";
 
     let state: CodespaceState | null = null;
     try {
@@ -1017,11 +1244,11 @@ export class AssistantDO extends DurableObject<Env> {
       if (attempt < 30) {
         await pushAlarm(this.alarmStore(), {
           due: Date.now() + 10_000,
-          kind: "gemini_prep",
+          kind: aiPrepKind(provider),
           payload: { chat_id: chatId, attempt: attempt + 1 },
         });
       } else {
-        await this.reply(chatId, "开发机一直没起来，先发 /cs 看看状态，或稍后再发 /gemini。");
+        await this.reply(chatId, `开发机一直没起来，先发 /cs 看看状态，或稍后再发 ${cmd}。`);
       }
       return;
     }
@@ -1029,7 +1256,7 @@ export class AssistantDO extends DurableObject<Env> {
       if (attempt < 30) {
         await pushAlarm(this.alarmStore(), {
           due: Date.now() + 10_000,
-          kind: "gemini_prep",
+          kind: aiPrepKind(provider),
           payload: { chat_id: chatId, attempt: attempt + 1 },
         });
       } else {
@@ -1041,12 +1268,27 @@ export class AssistantDO extends DurableObject<Env> {
       return;
     }
 
+    if (provider === "buddy") {
+      const prompt = await this.takeBuddyPrompt(chatId);
+      const model = await this.buddyPin(chatId);
+      const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt: prompt ?? undefined, model }), {
+        label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
+      });
+      if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+      return;
+    }
+
     const prompt = await this.takeGeminiPrompt(chatId);
     const model = await this.geminiPin(chatId);
     const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt: prompt ?? undefined, model, chain: this.geminiChain() }), {
       label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
     });
     if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+  }
+
+  /** 兼容入口：v4.17 之前入队的 alarm 里 kind 只有 gemini_prep，这里保持同名壳子。 */
+  private async onGeminiPrepAlarm(payload?: Record<string, unknown>): Promise<void> {
+    await this.onAiPrepAlarm("gemini", payload);
   }
 
   // ---------------------------------------------------------------- 看门狗（省额度）

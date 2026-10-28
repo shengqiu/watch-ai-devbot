@@ -9,7 +9,7 @@
  *   3. 纯函数、零依赖 —— 可在 node 里直接单测，不需要 Worker 运行时。
  */
 
-export type CommandGroup = "开发机" | "Gemini" | "联机 shell" | "其它";
+export type CommandGroup = "开发机" | "Gemini" | "CodeBuddy" | "联机 shell" | "其它";
 
 export interface CommandSpec {
   /** 主名（不含斜杠；同时用作 Telegram 菜单里的 command） */
@@ -99,6 +99,29 @@ export const COMMANDS: CommandSpec[] = [
       "Gemini 以 --approval-mode=yolo 运行：能直接改文件、跑命令（无人值守没法按 y）。",
     ],
     group: "Gemini",
+    touch: true,
+    menu: true,
+  },
+  {
+    name: "buddy",
+    aliases: ["cb"],
+    desc: "CodeBuddy 编程会话（固定 codebuddy 目录 / 浏览器登录态）",
+    detail: [
+      "/buddy —— 打开会话：机器关了自动开机、没装自动装，之后直接发问题即可。",
+      "/buddy <问题> —— 只问一次，不进入会话模式。",
+      "/buddy off —— 退出会话模式，回到「发文字 = shell 命令」。",
+      "/buddy new —— 开新会话（清掉 -c 续用标记）。",
+      "/buddy model <名字> —— 固定模型；/buddy model auto 回到 CLI 默认。",
+      "/buddy models —— 列出 CLI 支持的模型。",
+      "/buddy status —— 查 CLI 安装 / 工作目录 / 信任状态 / 会话状态。",
+      "",
+      "工作目录固定为 /workspaces/codebuddy，并已 pre-trust（不会卡在「信任此文件夹」）。",
+      "认证走 CodeBuddy 自己的浏览器 OAuth（登录态在 ~/.codebuddy），不需要 API key；",
+      "登录失效时 headless 会直接报鉴权错误 —— 到 codespace 终端手动跑一次 codebuddy 重新授权。",
+      "以 -y 运行（跳过权限确认）：能直接改文件、跑命令（无人值守没法按 y）。",
+      "会话模式下：直接发文字 = 问 CodeBuddy；行首加 ! = 仍然执行 shell 命令。",
+    ],
+    group: "CodeBuddy",
     touch: true,
     menu: true,
   },
@@ -240,10 +263,11 @@ function levenshtein(a: string, b: string): number {
   return prev[n];
 }
 
-const GROUP_ORDER: CommandGroup[] = ["开发机", "Gemini", "联机 shell", "其它"];
+const GROUP_ORDER: CommandGroup[] = ["开发机", "Gemini", "CodeBuddy", "联机 shell", "其它"];
 const GROUP_ICON: Record<CommandGroup, string> = {
   开发机: "🖥",
   Gemini: "🤖",
+  CodeBuddy: "🧩",
   "联机 shell": "⌨️",
   其它: "🔐",
 };

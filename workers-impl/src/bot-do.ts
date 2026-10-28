@@ -168,7 +168,14 @@ import {
 //       里（避免 exit 杀掉长驻 shell），cd 不外泄，报出来的是父 shell 的位置，
 //       跟「AI 在哪个目录干活」不是一回事 —— 用户确实问过「为什么显示
 //       /workspaces/watch-ai-assistant」。普通 shell 命令仍保留目录（那是真的会变）。
-const BUILD = "devbot-20261028-v4.18";
+// v4.19：修「刚开机就被看门狗关掉」。看门狗用 episode.lastActivity 算空闲时长，但那
+//       个值只在开机成功（boot_check）时才刷新；/buddy 触发的开机在那之前就有几十秒
+//       窗口，若此时一轮已到期的 watch alarm 落地，会拿上一轮的 lastActivity 算出
+//       「空闲 90 分钟」→ 立刻自动关机 → agent 一行日志都来不及写，Telegram 永远停在
+//       「机器在跑，但 shell 通道还没连上」。现在 evalWatch 里加了不变量
+//       「空闲 ≤ 本轮已运行」（active = max(lastActivity, bootAt)），并有回归测试；
+//       AI 等待通道时 60 秒也会先回一句，不再让人干等 5 分钟。
+const BUILD = "devbot-20261028-v4.19";
 
 /**
  * 「AI 编程会话」的两种 provider。/gemini 与 /buddy 除脚本生成外流程完全一致
@@ -1260,6 +1267,16 @@ export class AssistantDO extends DurableObject<Env> {
     }
     if (!this.shell.online()) {
       if (attempt < 30) {
+        // 60 秒还没连上就打个招呼：之前这段时间一个字都没有，用户只能干等 5 分钟，
+        // 分不清「正在等」和「已经卡死」——2026-10-28 20:16 那次就是这么卡住的。
+        if (attempt === 6) {
+          await this.reply(
+            chatId,
+            "⏳ 机器起来了，但开发机里的 shell agent 还没连上（正常 10~30 秒）。\n" +
+              "我继续等，最多再等 4 分钟；一直不通就在 codespace 终端跑一句：\n" +
+              "bash .devcontainer/post-start.sh",
+          );
+        }
         await pushAlarm(this.alarmStore(), {
           due: Date.now() + 10_000,
           kind: aiPrepKind(provider),
@@ -1268,7 +1285,9 @@ export class AssistantDO extends DurableObject<Env> {
       } else {
         await this.reply(
           chatId,
-          "机器起来了，但 shell 通道 5 分钟没连上。发 /cs 确认，或到 codespace 里跑 bash .devcontainer/post-start.sh。",
+          "机器起来了，但 shell 通道 5 分钟没连上。\n" +
+            "在 codespace 终端跑一句 bash .devcontainer/post-start.sh，然后重发 " +
+            `${cmd}；也可以发 /cs 看状态。`,
         );
       }
       return;

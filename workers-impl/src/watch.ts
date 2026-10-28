@@ -121,7 +121,16 @@ export function evalWatch(w: WatchInput): WatchDecision {
   // 运行时长的兜底起点：没记录 bootAt 时用 lastActivity 估（比 0 合理）
   const boot = w.bootAt > 0 ? w.bootAt : w.lastActivity;
 
-  const idleMin = (w.now - w.lastActivity) / MIN; // 距你上次终端级互动
+  // 不变量：空闲时长不可能长过本轮已运行时长 —— 机器才起来 1 分钟，不可能
+  // 「已经空闲 90 分钟」。用 lastActivity 直接算会漏掉这个约束，后果是：
+  // 上一轮窗口的 lastActivity 没被刷新（开机流程走完之前 watchdog alarm 就先落地），
+  // 一轮已经到期的检查会把刚拉起来的机器当成「闲置已久」直接关掉。
+  // 2026-10-28 20:16 的事故就是这样：/buddy 触发开机 → postStart 拉起 supervisor →
+  // 2 秒后机器被自动关机，agent 一个日志都没写，Telegram 那边永远停在
+  // 「机器在跑，但 shell 通道还没连上」。
+  const active = Math.max(w.lastActivity, boot);
+
+  const idleMin = (w.now - active) / MIN; // 距你上次终端级互动（封顶到本轮起点）
   const runMin = Math.max(0, (w.now - boot) / MIN); // 本轮已运行
 
   // 1) 互动还新鲜：你正在干活，别打扰（同时把第三信号追踪清零）
@@ -129,7 +138,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
     return {
       notify: null,
       stop: false,
-      nextCheck: w.lastActivity + w.remindMin * MIN,
+      nextCheck: active + w.remindMin * MIN,
       markReminded: false,
       ghFreshSince: null, // 你刚互动过：GH 追踪重置
       capNotified: false,
@@ -148,7 +157,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
       return {
         notify: null,
         stop: false,
-        nextCheck: w.lastActivity + w.autostopMin * MIN,
+        nextCheck: active + w.autostopMin * MIN,
         markReminded: false,
         ghFreshSince: w.ghFreshSince,
         capNotified: w.capNotified,
@@ -165,7 +174,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
     return {
       notify: `⏰ 开发机已运行 ${fmtDur(runMin)}，你已 ${fmtDur(idleMin)} 没和我说过话。\n` + tail,
       stop: false,
-      nextCheck: w.lastActivity + w.autostopMin * MIN,
+      nextCheck: active + w.autostopMin * MIN,
       markReminded: true,
       ghFreshSince: w.ghFreshSince,
       capNotified: w.capNotified,

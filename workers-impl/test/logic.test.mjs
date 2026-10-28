@@ -463,6 +463,24 @@ check("关机：不动作", evalWatch(W({ running: false })), {
   check("新鲜互动：不标记提醒", d.markReminded, false);
 }
 
+// 不变量：机器刚起来时不可能「已经闲置很久」（2026-10-28 事故回归）
+// 场景：上一轮窗口的 lastActivity 是一小时前，/buddy 刚把机器拉起来，
+// 一轮已经到期的 watchdog alarm 正好落在这几十秒里 → 旧算法算出 idle=60min →
+// 直接自动关机，agent 连一行日志都来不及写（Telegram 永远停在「等通道」）。
+{
+  const bootAt = 10_000_000 + 59 * MIN;
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, lastActivity: 10_000_000 - 60 * MIN, bootAt }));
+  check("刚开机：不自动关机", d.stop, false);
+  check("刚开机：不打扰", d.notify, null);
+  check("刚开机：从本轮起点算下一轮", d.nextCheck, bootAt + 25 * MIN);
+}
+
+// 反过来：老窗口（lastActivity 与 bootAt 都是老的）该关还是要关
+{
+  const d = evalWatch(W({ now: 10_000_000 + 60 * MIN }));
+  check("老窗口：照常自动关机", d.stop, true);
+}
+
 // 提醒窗口：首次 → 发提醒 + 标记
 {
   const d = evalWatch(W({ now: 10_000_000 + 30 * MIN }));

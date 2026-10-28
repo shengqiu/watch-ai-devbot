@@ -141,7 +141,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261028-v4.12";
+const BUILD = "devbot-20261028-v4.13";
 
 /**
  * 未识别输入时的兜底提示。
@@ -1207,8 +1207,15 @@ export class AssistantDO extends DurableObject<Env> {
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
-    // shell 离线告警：机器在跑但 agent 没连上 → 主动发 Telegram（否则只能你自己发现）
-    const sa = await this.checkShellAlert(state === "Available");
+    // shell 离线告警：机器在跑但 agent 没连上 → 主动发 Telegram（否则只能你自己发现）。
+    // 兜住异常：告警是「旁路」功能，绝不能因为它出错而毁掉巡检本身（看门狗也走这条路径）。
+    let sa: { shellAlert: string | null } = { shellAlert: null };
+    try {
+      sa = await this.checkShellAlert(state === "Available");
+    } catch (e) {
+      console.error("[shell-alert] 检查失败（不影响巡检其它逻辑）", e);
+      sa = { shellAlert: "error" };
+    }
     const ep = await this.getEpisode();
     if (state === "Available") {
       if (!ep || !ep.running) {

@@ -1,7 +1,7 @@
 # Watch AI 编程助手 — 部署与迭代纪要
 
 > Apple Watch 语音 → 云端 AI 编程助手（Telegram 通道 / Cloudflare Workers 免费档）
-> 纪要截至 2026-10-28，仓库 BUILD `devbot-20261028-v4.17`。
+> 纪要截至 2026-10-28，仓库 BUILD `devbot-20261028-v4.18`。
 > 线上实际版本用**带 ADMIN_KEY 的 `/status`** 查（`/healthz` 自安全审查 #7 起只回 `{"ok":true}`，不再带 build）。
 > 验证会话窗口自 v4.16 起为 **10 分钟滑动**（任何交互续期 10 分钟；连续 10 分钟无消息即失效，须重新回答验证词）。
 > 下文 v16 及更早的条目是历史记录，部署方式与鉴权已改为 header（见 README / DEPLOY.md）。
@@ -41,7 +41,9 @@ Apple Watch 发语音/文字 → Telegram → webhook POST 到 Cloudflare Worker
 
 - **待办：删除 Cloudflare API Token**（Dashboard → My Profile → API Tokens）。部署已全部完成，不再需要
 - 部署命令：`CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy`
-- 测试：`npm test`（当前 633/633）
+- 测试：`npm test`（当前 640/640）
+- 收尾小注：普通命令是 `— exit 0 · <shell 当前目录>`；`/gemini`、`/buddy` 只留 `— exit 0`
+  （它们的脚本跑在子 shell 里，cd 不外泄，报目录只会误导成「跑错目录」）。
 - AI 编程会话：`/gemini`（GEMINI_API_KEY 或 `~/.config/watch-ai/gemini-key`）、`/buddy`（CodeBuddy CLI，
   浏览器 OAuth 登录态在开发机 `~/.codebuddy`，**不需要 key**）。`/buddy` 工作目录固定
   `/workspaces/codebuddy` 且已 pre-trust；该目录不在时脚本会自动建目录并补 trustedDirectories。

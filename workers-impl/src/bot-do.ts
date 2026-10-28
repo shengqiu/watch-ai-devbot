@@ -409,8 +409,15 @@ export class AssistantDO extends DurableObject<Env> {
           return await this.handleSlackCommand(request);
         case "/slackstatus": {
           // 诊断（需 ADMIN_KEY，走 index 鉴权）：Slack 通道配置状态 + auth.test
+          // auth.test 返回 bot 自己的 user_id（U 开头）与 username —— 这就是
+          // 「我的 bot 叫什么 / id 是多少」在 Slack 侧的权威答案（不用去 workspace 里翻）。
           const r = await this.slack.authTest();
-          return Response.json({ ok: r.ok, bot: r.user ?? null, team: r.team ?? null });
+          return Response.json({
+            ok: r.ok,
+            bot: r.user ?? null,
+            botId: r.user_id ?? null,
+            team: r.team ?? null,
+          });
         }
         case "/send": {
           // 调试用：主动推一条文本到指定 chat_id
@@ -780,13 +787,10 @@ export class AssistantDO extends DurableObject<Env> {
           return;
         }
         case "diag":
-          await this.diagnose(m.chatId, (t) =>
-            this.tg.call("sendMessage", {
-              chat_id: m.chatId,
-              text: t,
-              disable_web_page_preview: true,
-            }),
-          );
+          // 走 sendPlain（通道感知）而不是直接 this.tg.call：
+          // chatId 带 slack: 前缀时，Telegram 的 sendMessage 会拿 "slack:C123"
+          // 当 chat_id 去 Telegram 发，必然失败（v4.23 修）。
+          await this.diagnose(m.chatId, (t) => this.sendPlain(m.chatId, t));
           return;
       }
     }
@@ -1877,6 +1881,24 @@ export class AssistantDO extends DurableObject<Env> {
     return Boolean(this.env.SLACK_BOT_TOKEN) && this.env.SLACK_ENABLED !== "0";
   }
 
+  /**
+   * 纯文本发送（不做 markdown 渲染）。通道感知：
+   *   - Slack：mrkdwn=false，原样发（诊断报告里那些〔FENCE〕〔IND〕标记要看得见）
+   *   - Telegram：裸 sendMessage（与 v4.23 前的行为逐字节一致）
+   * 用于 /diag 这类「就是要看原文」的回包。
+   */
+  private async sendPlain(chatId: string, text: string): Promise<void> {
+    if (channelOf(chatId) === "slack") {
+      if (this.slackOn()) await this.slack.sendMessage(chatId.slice("slack:".length), text, { markdown: false });
+      return;
+    }
+    await this.tg.call("sendMessage", {
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+    });
+  }
+
   // ---------------------------------------------------------------- Shell 通道
 
   /**
@@ -2205,7 +2227,8 @@ export class AssistantDO extends DurableObject<Env> {
         .slice(0, 400);
     const report = [
       `诊断报告 build=${BUILD}`,
-      `通道: tg=${this.tg ? "on" : "off"}`,
+      `通道: ${channelOf(chatId)}${channelOf(chatId) === "slack" ? `（chat=${chatId}）` : ""}`,
+      `Slack: ${this.slackOn() ? "on" : "off"}`,
       `最近输入: ${(lastUser?.content ?? "无").slice(0, 80)}`,
       `模型回复含围栏: ${/```/.test(raw) ? "是" : "否"}`,
       `模型回复含缩进行: ${/^( {4}|\t)/m.test(raw) ? "是" : "否"}`,

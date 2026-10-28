@@ -193,6 +193,12 @@ import {
 const BUILD = "devbot-20261028-v4.21";
 
 /**
+ * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
+ * devbot 另加 Test 状态检查，enforce_admins=false 供 promote 的 GITHUB_TOKEN 放行）。
+ * 策略文档：watch-ai-assistant 仓 docs/BRANCH-PROTECTION.md。
+ */
+
+/**
  * 「AI 编程会话」的两种 provider。/gemini 与 /buddy 除脚本生成外流程完全一致
  * （开机 → 等通道 → 装 CLI → 非交互 -p → 续会话），所以共用同一套模式开关、
  * 待发提问暂存和 prep alarm，只在生成脚本处按 provider 分叉。

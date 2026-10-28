@@ -185,7 +185,12 @@ import {
 //       · 省额度看门狗：开发机上有命令在跑（busy）= 正在用，不打扰不关机；
 //       · /cs：有命令在跑时显示进程状态行（agent 太老会明说需 git pull）；
 //       · 幽灵输出：登记被清后迟到的输出不再静默丢弃，会提示「它可能还在跑」。
-const BUILD = "devbot-20261028-v4.20";
+// v4.21：完整回传（用户要求「codebuddy 的 stdout 全部发给我」）。截断链路全开：
+//       agent MAX_CHARS 6 万 → 200 万（旧值会把长输出的尾部整段丢掉）、
+//       Worker SHELL_MAX_CHARS 2.4 万 → 200 万（旧值掐头尾丢中间）；Telegram
+//       4096/条的分块保留（物理上限），sendMessage 429 限速改为按 retry_after
+//       重试（完整回传后一次连发几十条是常态，429 从异常变成预期内）。
+const BUILD = "devbot-20261028-v4.21";
 
 /**
  * 「AI 编程会话」的两种 provider。/gemini 与 /buddy 除脚本生成外流程完全一致
@@ -241,7 +246,10 @@ export class AssistantDO extends DurableObject<Env> {
     this.tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN ?? "", ep.telegramApiBase);
     this.shell = new ShellHub((chatId, text) => this.sendShellChunk(chatId, text), {
       flushMs: Number(env.SHELL_FLUSH_MS ?? 1200),
-      maxChars: Number(env.SHELL_MAX_CHARS ?? 24000),
+      // 完整回传：用户要求「codebuddy 的 stdout 全部发给我」。旧默认 24000 会
+      // 掐头尾丢中间。200 万 ≈ 实际不设限（单条命令输出到不了这个量级），
+      // Telegram 4096/条的分块仍然保留（物理上限绕不开），429 由 sendShellChunk 重试。
+      maxChars: Number(env.SHELL_MAX_CHARS ?? 2_000_000),
       // Gemini 会边想边改文件，一条命令跑十几分钟是正常的；15 分钟就放弃太急
       cmdTtlMs: 45 * 60_000,
       // 下行命令签名：agent 只执行签名对得上的命令，见 src/agent-auth.ts。
@@ -1917,14 +1925,29 @@ export class AssistantDO extends DurableObject<Env> {
 
   /** shell 输出回传：纯文本发送，不走 MarkdownV2（命令输出里转义符太多，容易 400/渲染乱）。 */
   private async sendShellChunk(chatId: string, text: string): Promise<void> {
-    try {
-      await this.tg.call("sendMessage", {
-        chat_id: chatId,
-        text,
-        disable_web_page_preview: true,
-      });
-    } catch (e) {
-      console.error("[shell] 回传失败", e);
+    // Telegram 对连续 sendMessage 限速（~1msg/s，突发 ~30）。完整回传长输出时
+    // 一次可能连发几十条，429 是常态而不是异常 —— 按 retry_after 等待后重发。
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.tg.call("sendMessage", {
+          chat_id: chatId,
+          text,
+          disable_web_page_preview: true,
+        });
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const m = /HTTP 429.*retry after (\d+)/i.exec(msg) ?? /HTTP 429/i.exec(msg) ? null : null;
+        const retryAfter = /retry after (\d+)/i.exec(msg)?.[1];
+        const waitMs = retryAfter ? Number(retryAfter) * 1000 + 500 : 1500;
+        if (/HTTP 429/.test(msg) && attempt <= 5) {
+          console.warn(`[shell] 429 限速，${waitMs}ms 后重发（第 ${attempt} 次）`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        console.error("[shell] 回传失败", e);
+        return;
+      }
     }
   }
 

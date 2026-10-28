@@ -708,6 +708,27 @@ const {
     check("capOutput 保留尾", capped.endsWith("x".repeat(8)), true);
   }
 
+  // ---- 完整回传：默认上限 200 万，一条 30 万字符的输出不能丢任何内容 ----
+  {
+    const big = ("line of codebuddy stdout\n").repeat(12_000); // ~30 万字符
+    const capped = capOutput(big, 2_000_000);
+    check("30 万字符不触发截断", capped, big);
+    check("截断标记不出现", capped.includes("省略"), false);
+  }
+  // 兜底仍在：真超过上限时还是掐头尾（防内存失控），不是悄悄丢
+  {
+    const capped = capOutput("y".repeat(2_500_000), 2_000_000);
+    check("超 200 万仍有省略标记", capped.includes("省略"), true);
+    check("超 200 万保留头", capped.startsWith("yyy"), true);
+  }
+  // 大输出分块：4096 物理上限下应该拆成多条，且内容不丢
+  {
+    const big = ("x".repeat(100) + "\n").repeat(100); // 10100 字符
+    const parts = chunkOutput(big, 3400);
+    check("大输出拆多条", parts.length > 1, true);
+    check("分块内容无丢失", parts.join("").replace(/\n/g, ""), big.replace(/\n/g, ""));
+  }
+
   check("markerLine 拼接", markerLine(0, "/tmp"), "__WS__0__/tmp__");
   check("parseMarkerLine 正常", parseMarkerLine("__WS__0__/tmp__"), { exit: 0, cwd: "/tmp" });
   check("parseMarkerLine 非零退出码", parseMarkerLine("__WS__127__/workspaces/x__"), {

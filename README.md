@@ -4,6 +4,12 @@ Telegram 开发指令 bot —— **Apple Watch 语音 → 云端 AI 编程助手
 
 从 [watch-ai-assistant](https://github.com/shengqiu/watch-ai-assistant)（v16 聊天版）fork 而来，在此独立演进开发能力。
 
+> **本目录只对应 `shengqiu/watch-ai-devbot`（Worker `watch-ai-devbot`）。**
+> 同级 `../repo/` **不是本目录的镜像**：那是另一个仓库 `watch-ai-assistant`，仍在服务
+> （chatbot 后端 worker `watch-ai-qqbot` + Codespace 宿主 `.devcontainer`/`shell-agent`）。
+> 两边 `workers-impl` 已结构性分叉（v19 单文件版 vs 本目录 v4.x 模块化版），
+> **不要互相复制文件**。分工与已知漂移见 `../README.md`。
+
 ## 核心能力
 
 - **Codespace 远程开关**：手表/手机上对 bot 说「开始开发」「停止开发」「开发机状态」，远程控制 GitHub Codespaces 开发机（两次查询开机协议，DO alarm 30s 自动确认）

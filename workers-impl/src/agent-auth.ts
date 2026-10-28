@@ -134,6 +134,59 @@ export class NonceCache {
   }
 }
 
+// ------------------------------------------------------------------ 鉴权限流
+
+/**
+ * 失败计数滑动窗口（「N 次/窗口 → 429」暴力尝试防护用）。
+ *
+ * 固定窗口 + 自动过期：record 一次失败 → 窗口内计数 +1；超过窗口的旧记录会被
+ * prune 掉，计数自然回落。blocked 在计数达到 limit 时为真；retryAfterSec 给出
+ * 距解除还有多少秒（给 429 的 Retry-After 头用）。
+ *
+ * 状态只在内存（entry/DO 实例生命周期内），不做持久化：限流是软护栏，丢窗口
+ * 不影响安全（最坏是短暂放行，真正的门是密钥本身）。key 一般取客户端 IP。
+ */
+export class FailWindow {
+  private readonly hits = new Map<string, number[]>();
+
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number,
+  ) {}
+
+  /** 记录一次失败（now 毫秒时间戳）。 */
+  record(key: string, now = Date.now()): void {
+    const arr = this.hits.get(key) ?? [];
+    this.prune(arr, now);
+    arr.push(now);
+    this.hits.set(key, arr);
+  }
+
+  /** 窗口内失败次数是否已 ≥ limit（顺带清理过期记录，避免 Map 无限增长）。 */
+  blocked(key: string, now = Date.now()): boolean {
+    const arr = this.hits.get(key);
+    if (!arr || arr.length === 0) return false;
+    this.prune(arr, now);
+    return arr.length >= this.limit;
+  }
+
+  /** 距限流解除还有多少秒（给 Retry-After）；未限流返回 0。 */
+  retryAfterSec(key: string, now = Date.now()): number {
+    const arr = this.hits.get(key);
+    if (!arr || arr.length === 0) return 0;
+    this.prune(arr, now);
+    if (arr.length < this.limit) return 0;
+    return Math.max(0, Math.ceil((arr[0]! + this.windowMs - now) / 1000));
+  }
+
+  private prune(arr: number[], now: number): void {
+    const cut = now - this.windowMs;
+    let i = 0;
+    while (i < arr.length && (arr[i] as number) < cut) i++;
+    if (i > 0) arr.splice(0, i);
+  }
+}
+
 // ------------------------------------------------------------------ 判定
 
 export type AuthResult = { ok: true; mode: "hmac" | "legacy" } | { ok: false; reason: string };

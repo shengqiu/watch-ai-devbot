@@ -392,7 +392,8 @@ check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
 
 // ---- 省额度看门狗（watch.ts）----
 import { evalWatch, evalShellAlert, fmtDur, pushAlarm, drainAlarms } from "../src/watch.js";
-import { adminDenied, reloadVerdict, bearerToken } from "../src/admin-auth.js";
+import { adminDenied, reloadVerdict, bearerToken, adminGate, reloadGate, clientIp, ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW_MS } from "../src/admin-auth.js";
+import { FailWindow } from "../src/agent-auth.js";
 
 const W = (over = {}) => ({
   running: true,
@@ -1468,6 +1469,70 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
     reloadVerdict(envDeploy, req({ method: "POST", headers: { "X-Deploy-Key": DEPLOY } })).ok,
     true,
   );
+}
+
+// ---------------------------------------------------------------- 管理端点限流（安全审查 P2-6）
+{
+  const ADMIN = "adm1n-s3cret";
+  const DEPLOY = "d3ploy-s3cret";
+  const envAdmin = { ADMIN_KEY: ADMIN };
+  const envDeploy = { DEPLOY_KEY: DEPLOY };
+  const req = (opts = {}) =>
+    new Request(opts.url ?? "https://x.dev/status", {
+      method: opts.method ?? "GET",
+      headers: opts.headers ?? {},
+    });
+  const ip = "1.2.3.4";
+  const now = 1_000_000;
+
+  // --- FailWindow 基础 ---
+  {
+    const w = new FailWindow(8, 10 * 60_000);
+    for (let i = 0; i < 7; i++) w.record(ip, now + i);
+    check("FailWindow: 7 次内未封禁", w.blocked(ip, now + 100), false);
+    w.record(ip, now + 100); // 第 8 次失败填满桶
+    check("FailWindow: 第 8 次触发封禁（第 9 次请求被 429）", w.blocked(ip, now + 100), true);
+    // 8 次都压在 now：Retry-After ≈ 窗口秒（600）。必须在「超窗口」检查前读，否则被 prune 清空
+    check("FailWindow: retryAfter ≈ 窗口秒", w.retryAfterSec(ip, now) > 590 && w.retryAfterSec(ip, now) <= 600, true);
+    // 超过窗口后自动回落
+    check("FailWindow: 超窗口后自动回落", w.blocked(ip, now + 100 + 10 * 60_000 + 1), false);
+    // 不同 key 独立
+    check("FailWindow: 不同 IP 互不影响", w.blocked("9.9.9.9", now + 100), false);
+  }
+
+  // --- adminGate：限流优先于密钥 ---
+  {
+    const w = new FailWindow(ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW_MS);
+    const good = req({ headers: { Authorization: `Bearer ${ADMIN}` } });
+    const bad = req({ headers: { Authorization: "Bearer wrong" } });
+    check("adminGate: 密钥正确 → allow", adminGate(w, ip, envAdmin, good, now), "allow");
+    check("adminGate: 密钥错误 → deny", adminGate(w, ip, envAdmin, bad, now), "deny");
+    // 造满失败：限流优先，连正确密钥也进不来
+    for (let i = 0; i < ADMIN_FAIL_LIMIT; i++) w.record(ip, now + i);
+    check("adminGate: 失败满后正确密钥也 block（限流优先）", adminGate(w, ip, envAdmin, good, now + 100), "block");
+    check("adminGate: 失败满后错误密钥也 block", adminGate(w, ip, envAdmin, bad, now + 100), "block");
+    // 超窗口回落
+    check("adminGate: 超窗口后回落为 deny（密钥仍错）", adminGate(w, ip, envAdmin, bad, now + 100 + ADMIN_FAIL_WINDOW_MS + 1), "deny");
+  }
+
+  // --- reloadGate：限流优先于 405/401 ---
+  {
+    const w = new FailWindow(ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW_MS);
+    const ok = req({ method: "POST", headers: { Authorization: `Bearer ${DEPLOY}` } });
+    const bad = req({ method: "POST", headers: { Authorization: "Bearer wrong" } });
+    const get = req({ method: "GET", headers: { Authorization: `Bearer ${DEPLOY}` } });
+    check("reloadGate: POST+正确 → ok", reloadGate(w, ip, envDeploy, ok, now).decision, "ok");
+    const r405 = reloadGate(w, ip, envDeploy, get, now);
+    check("reloadGate: GET → deny 405", r405.decision === "deny" && r405.status === 405, true);
+    const r401 = reloadGate(w, ip, envDeploy, bad, now);
+    check("reloadGate: 密钥错 → deny 401", r401.decision === "deny" && r401.status === 401, true);
+    for (let i = 0; i < ADMIN_FAIL_LIMIT; i++) w.record(ip, now + i);
+    check("reloadGate: 失败满后 → block（限流优先）", reloadGate(w, ip, envDeploy, ok, now + 100).decision, "block");
+  }
+
+  // --- clientIp：限流键 ---
+  check("clientIp: 有 CF-Connecting-IP 头 → 取该 IP", clientIp(req({ headers: { "CF-Connecting-IP": "5.6.7.8" } })), "5.6.7.8");
+  check("clientIp: 无头 → unknown", clientIp(req()), "unknown");
 }
 
 // ---------------------------------------------------------------- shell 离线告警

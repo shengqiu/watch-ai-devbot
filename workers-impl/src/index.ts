@@ -17,7 +17,8 @@ import type { Env } from "./env";
 import { endpoints } from "./config";
 import { TelegramClient } from "./telegram/client";
 import { guardMode, webhookVerdict } from "./telegram-ip";
-import { adminDenied, reloadVerdict, reloadErrorResponse } from "./admin-auth";
+import { adminGate, reloadGate, reloadVerdict, reloadErrorResponse, rateLimitedResponse, clientIp, ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW_MS } from "./admin-auth";
+import { FailWindow } from "./agent-auth";
 
 // Durable Object 必须从入口导出（wrangler 据此注册绑定）
 export { AssistantDO } from "./bot-do";
@@ -25,6 +26,29 @@ export { AssistantDO } from "./bot-do";
 // 管理端点鉴权抽到 admin-auth.ts（纯函数，可单测）：
 //   密钥只认请求头（Authorization: Bearer <ADMIN_KEY> 或 X-Admin-Key），绝不接受 URL 查询串，
 //   避免密钥被访问日志 / 代理遥测记录（安全审查 #8）。
+// 另加每-IP 失败限流（FailWindow：8 次/10 分钟 → 429），防密钥暴力破解（安全审查 P2-6）。
+
+// 限流窗口在入口 Worker 实例内存里，覆盖所有管理端点（含 /admin/reload）。
+// 注意：多实例边缘下这是 per-isolate 的软护栏——真正的安全门仍是密钥本身；
+// 若以后要全局一致限流，把计数挪到 DO storage 即可（见 bot-do.ts 的额度实现）。
+const adminFailWindow = new FailWindow(ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW_MS);
+
+/**
+ * 管理端点准入：限流优先（429），其次密钥（403 并记一次失败），通过返回 null。
+ * 限流优先意味着被封的 IP 连「密钥对不对」都探不出来。
+ */
+function adminAdmit(ip: string, env: Env, request: Request): Response | null {
+  const g = adminGate(adminFailWindow, ip, env, request);
+  if (g === "block") return rateLimitedResponse(adminFailWindow.retryAfterSec(ip));
+  if (g === "deny") {
+    adminFailWindow.record(ip);
+    return Response.json(
+      { ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" },
+      { status: 403 },
+    );
+  }
+  return null;
+}
 
 /**
  * 取单例 DO 的 stub。
@@ -43,6 +67,7 @@ export default {
     try {
       const url = new URL(request.url);
       const stub = doStub(env);
+      const ip = clientIp(request); // 限流键：边缘写入，伪造不了
 
       if (url.pathname === "/healthz") {
         // 公开只读存活探针：只回通用 liveness，不暴露任何部署/连接信息
@@ -53,9 +78,8 @@ export default {
       if (url.pathname === "/status") {
         // 诊断详情：仅限管理员。暴露部署身份、shell 在线状态、鉴权模式、最近来源 IP
         // 这些都属于 operational metadata，不能对匿名公开（/healthz 只回 liveness）。
-        if (adminDenied(env, request)) {
-          return Response.json({ ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" }, { status: 403 });
-        }
+        const d = adminAdmit(ip, env, request);
+        if (d) return d;
         const r = await stub.fetch("http://do/status");
         return Response.json({
           ok: true,
@@ -66,9 +90,8 @@ export default {
       }
 
       if (url.pathname === "/setup") {
-        if (adminDenied(env, request)) {
-          return Response.json({ ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" }, { status: 403 });
-        }
+        const d = adminAdmit(ip, env, request);
+        if (d) return d;
         if (!env.TELEGRAM_BOT_TOKEN) {
           return Response.json(
             { ok: false, error: "TELEGRAM_BOT_TOKEN 未配置。先运行: npx wrangler secret put TELEGRAM_BOT_TOKEN" },
@@ -124,8 +147,12 @@ export default {
       // 不套 ADMIN_KEY —— 这样 CI 不需要拿到管理全站的那把钥匙。
       // 安全（安全审查 #8）：只接受 POST，密钥走 Authorization 头，绝不进 URL。
       if (url.pathname === "/admin/reload") {
-        const v = reloadVerdict(env, request);
-        if (!v.ok) return reloadErrorResponse(v);
+        const g = reloadGate(adminFailWindow, ip, env, request);
+        if (g.decision === "block") return rateLimitedResponse(adminFailWindow.retryAfterSec(ip));
+        if (g.decision === "deny") {
+          adminFailWindow.record(ip);
+          return reloadErrorResponse({ ok: false, status: g.status });
+        }
         return stub.fetch(
           new Request("http://do/admin/reload", {
             method: "POST",
@@ -141,9 +168,8 @@ export default {
         url.pathname === "/patrol" ||
         url.pathname === "/shell/status"
       ) {
-        if (adminDenied(env, request)) {
-          return Response.json({ ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" }, { status: 403 });
-        }
+        const d = adminAdmit(ip, env, request);
+        if (d) return d;
         return stub.fetch(`http://do${url.pathname}?${url.searchParams.toString()}`);
       }
 

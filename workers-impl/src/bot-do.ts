@@ -141,7 +141,7 @@ import {
 //       ② agent 每 15s POST /shell/ping 报存活 + 在跑命令，Worker 的在线判定
 //       只认它（不再信「写成功」），agent 重启就立即中断它手上的命令；
 //       ③ 用户发下一条命令时若发现上一条已失联，当场解锁并放行，不用等 TTL。
-const BUILD = "devbot-20261028-v4.13";
+const BUILD = "devbot-20261028-v4.14";
 
 /**
  * 未识别输入时的兜底提示。

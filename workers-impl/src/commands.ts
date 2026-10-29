@@ -131,7 +131,7 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: "ctrlc",
-    aliases: ["stop", "kill"],
+    aliases: ["stop", "kill", "中断"],
     desc: "Interrupt the running command (Ctrl-C) and clear the queue",
     detail: [
       "Sends Ctrl-C to the foreground command and drops everything queued locally.",
@@ -143,7 +143,7 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: "verify",
-    aliases: ["gate"],
+    aliases: ["gate", "验证"],
     desc: "Verification gate (status; on / off)",
     detail: [
       "/verify — show current state: gate open/closed, when this session expires.",
@@ -159,7 +159,7 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: "help",
-    aliases: ["?", "？", "commands", "menu"],
+    aliases: ["?", "？", "commands", "menu", "帮助"],
     desc: "Command list; /help <cmd> for details",
     detail: [
       "No argument: the full command list.",
@@ -326,7 +326,9 @@ export function renderCommandHelp(nameOrAlias: string): string | null {
   );
   if (!spec) return null;
   const lines = [`/${spec.name} — ${spec.desc}`, "", ...spec.detail];
-  if (spec.aliases.length) lines.push("", `Aliases: ${spec.aliases.join(" / ")}`);
+  // 中文别名只为兼容老输入（打了照样认），不进展示 —— 界面统一英文
+  const shownAliases = spec.aliases.filter((a) => !/\p{Script=Han}/u.test(a));
+  if (shownAliases.length) lines.push("", `Aliases: ${shownAliases.join(" / ")}`);
   return lines.join("\n");
 }
 

@@ -763,6 +763,7 @@ const {
   check("verify 进 Telegram 菜单", menuCommands().some((m) => m.command === "verify"), true);
   check("/verify 能被匹配", matchCommand("/verify").spec.name, "verify");
   check("/verify alias gate 能匹配", matchCommand("/gate").spec.name, "verify");
+  check("/verify 中文别名仍认（界面不展示）", matchCommand("/验证").spec.name, "verify");
   check("/verify off 有细节", (renderCommandHelp("verify") ?? "").includes("off"), true);
   check("verify 帮助写明安全降级", (renderCommandHelp("verify") ?? "").includes("security downgrade"), true);
   check("总帮助列出 /verify", renderHelp().includes("/verify"), true);
@@ -1099,7 +1100,8 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("cmd 开机（已停用）", matchCommand("开机"), null);
   check("cmd 关机（已停用）", matchCommand("关机"), null);
   check("cmd 停止开发（已停用）", matchCommand("停止开发"), null);
-  check("cmd 帮助（中文别名已停用）", matchCommand("帮助"), null);
+  check("cmd 帮助（中文别名仍认）", matchCommand("帮助")?.spec.name, "help");
+  check("cmd 中断（中文别名仍认）", matchCommand("中断")?.spec.name, "ctrlc");
   check("cmd commands 是 help 别名", matchCommand("commands")?.spec.name, "help");
   // 验证词/开机口令不能撞上任何指令，否则会被指令派发抢走
   check("cmd 验证词不撞指令", matchCommand("哈哈"), null);
@@ -1134,6 +1136,7 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   const one = renderCommandHelp("boot");
   check("单条帮助无别名则不显示别名行", one.includes("Aliases"), false);
   check("单条帮助有别名则显示", renderCommandHelp("help").includes("Aliases:"), true);
+  check("单条帮助不展示中文别名", renderCommandHelp("help").includes("帮助"), false);
   check("单条帮助认斜杠别名", renderCommandHelp("/halt")?.includes("/halt"), true);
   check("单条帮助认斜杠", renderCommandHelp("/halt")?.includes("/halt"), true);
   check("单条帮助不存在 → null", renderCommandHelp("nope"), null);

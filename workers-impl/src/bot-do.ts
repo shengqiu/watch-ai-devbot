@@ -234,8 +234,8 @@ import {
 // v4.26：Slack 通道（与 Telegram 同一条 DO 流水线，chatId `slack:` 前缀隔离状态；
 //       agent/codespace 通信零改动）+ 恢复被陈旧工作副本覆盖的集成。
 // v4.27：全部面向上层的提示改成英文（用户要求）；/buddy、/gemini 脚本内部文案不动
-//       （那是 AI agent 的 scope）。中文别名同步下线（帮助/中断/验证）。
-const BUILD = "devbot-20261029-v4.27";
+//       （那是 AI agent 的 scope）。中文别名转为「仍认但不展示」，老输入照样命中。
+const BUILD = "devbot-20261029-v4.28";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；

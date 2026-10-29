@@ -1,6 +1,19 @@
 /** 从 Telegram Update 里提取我们关心的信息（chat_id / user_id / 文本 / 语音）。 */
 import type { TgUpdate } from "./types";
 
+/**
+ * 消息来源通道（v4.22 起多通道）。DO 内的 chatId 用前缀区分命名空间：
+ *   telegram：裸数字 chat_id（历史格式，不加前缀——兼容已有 storage）
+ *   slack：   `slack:<channel_id>`（extractSlackEvent 生成）
+ * 回包路由（DO.reply/sendShellChunk）按前缀选客户端，状态键天然隔离。
+ */
+export type Channel = "telegram" | "slack";
+
+/** chatId → 通道判定（无前缀 = telegram，历史数据兼容）。 */
+export function channelOf(chatId: string): Channel {
+  return chatId.startsWith("slack:") ? "slack" : "telegram";
+}
+
 export interface Incoming {
   updateId: number;
   /** 会话 id（私聊即用户 id），用于回消息、白名单、历史、限流的键 */

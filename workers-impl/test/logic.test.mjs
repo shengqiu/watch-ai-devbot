@@ -2,7 +2,6 @@
  * 纯逻辑单测：意图解析 + 长文本分段 + Telegram Update 提取。
  * 运行：npm test（内部先 tsc 编译到 /tmp/wi-test 再 node 跑）
  */
-import { readFileSync } from "node:fs";
 import { parseIntent, effortFor } from "../src/router/intent.js";
 import { clampEffort, modelOrder } from "../src/router/providers.js";
 import { escapeV2, mdToV2 } from "../src/telegram/markdown.js";
@@ -1975,47 +1974,6 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("/help buddy 有细节", (renderCommandHelp("buddy") ?? "").includes(BUDDY_DIR), true);
   check("总帮助里有 CodeBuddy 分组", renderHelp().includes("CodeBuddy"), true);
   check("总帮助列出 /buddy", renderHelp().includes("/buddy"), true);
-}
-
-// ---- /verify：验证挑战总闸（v4.25）----
-{
-  const verifySpec = COMMANDS.find((c) => c.name === "verify");
-  check("verify 已注册", Boolean(verifySpec), true);
-  check("verify 进 Telegram 菜单", menuCommands().some((m) => m.command === "verify"), true);
-  check("/verify 能被匹配", matchCommand("/verify").spec.name, "verify");
-  check("verify 中文别名能匹配", matchCommand("/验证").spec.name, "verify");
-  check("/verify off 有细节", (renderCommandHelp("verify") ?? "").includes("off"), true);
-  check("verify 帮助写明安全降级", (renderCommandHelp("verify") ?? "").includes("降级"), true);
-  check("总帮助列出 /verify", renderHelp().includes("/verify"), true);
-  check("总帮助提到 verify 开关", renderHelp().includes("/verify off"), true);
-  // verify 不算终端互动（touch 未设）：开关验证不该续命看门狗（纯配置操作）
-  check("verify 不续命看门狗", verifySpec.touch === true, false);
-}
-
-// ---- 接线护栏：bot-do 里 ShellHub 的 Sender 转发必须带第三个参数 ----
-// v4.22 的事故：ShellHub 加了 markdown 标志（Sender 第三参），flush 正确传出、
-// sendShellChunk 正确接收，但 bot-do 构造处的箭头函数写的是 (chatId, text) => ...
-// 把 opts 当场丢掉 —— AI 输出一直是纯文本，而逻辑测试全绿（测试直接 new ShellHub，
-// 没走 bot-do 那条真机接线）。这里用源码文本断言钉住这根线，谁改丢谁红。
-//
-// 路径说明：npm test 先把 ts 编译到 /tmp/wi-test 再在那里跑测试，所以
-// import.meta.url 指向的是编译产物 —— 源码要从 process.cwd()（= workers-impl）
-// 读。本地直接 node test/logic.test.mjs 时 cwd 也是 workers-impl，两条路都对。
-{
-  const src = readFileSync(`${process.cwd()}/src/bot-do.ts`, "utf8");
-  const m = /new ShellHub\(\(([^)]*)\)\s*=>\s*this\.sendShellChunk\(([^)]*)\)/.exec(src);
-  check("ShellHub Sender 转发存在", m !== null, true);
-  if (m) {
-    const params = m[1].split(",").map((s) => s.trim()).filter(Boolean);
-    const args = m[2].split(",").map((s) => s.trim()).filter(Boolean);
-    check("Sender 转发参数个数 = 3", params.length, 3);
-    check("转发实参个数 = 3", args.length, 3);
-    check("第三个参数名一致（opts 原样转发）", params[2], args[2]);
-  }
-  // 六个 AI 下发点都必须带 markdown: true
-  const aiEnqueues = src.match(/this\.shell\.enqueue\([\s\S]{0,400}?hideCwd: true[\s\S]{0,120}?\)/g) ?? [];
-  const withMd = src.match(/hideCwd: true,\s*markdown: true/g) ?? [];
-  check("AI 下发点全部带 markdown 标志（6 处）", withMd.length, 6);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

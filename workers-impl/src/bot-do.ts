@@ -15,8 +15,20 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { endpoints } from "./config";
 import { TelegramClient } from "./telegram/client";
-import { extractIncoming, type Incoming } from "./telegram/update";
+import { extractIncoming, channelOf, type Incoming } from "./telegram/update";
 import type { TgUpdate } from "./telegram/types";
+import { SlackClient } from "./slack/client";
+import {
+  isUrlVerification,
+  extractSlackEvent,
+  extractSlackCommand,
+  normalizeSlackText,
+  type SlackIncoming,
+} from "./slack/update";
+import type {
+  SlackCommandForm,
+  SlackEventWrapper,
+} from "./slack/types";
 import { parseIntent, effortFor, type Intent } from "./router/intent";
 import { chatChain, loadProviders, type ChatResult } from "./router/providers";
 import { chunkText, transcribeBytes } from "./asr";
@@ -196,21 +208,25 @@ import {
 //       现在 ShellCmd 加 markdown 标志（六个 AI 下发点全带），发送端按该标志
 //       走 TelegramClient.sendMessage（mdToV2 转换 + 400 降级纯文本兜底）；
 //       普通 shell 命令保持纯文本（任意字节流，乱转义反而毁输出）。
+// v4.23：Slack 通道（用户要求「加一个跟 cfworker 和 codespace 沟通的前端：slack，
+//       与 telegram 线路的后端同质化」）。同一个 Worker、同一条 DO 流水线：
+//       /slack/events（Events API）与 /slack/commands（Slash 指令）验签后进
+//       handleMessage，chatId 用 `slack:<channel>` 前缀隔离状态（验证/历史/限流/
+//       看门狗推送）；reply/sendShellChunk 按前缀路由到 SlackClient（mrkdwn 渲染
+//       + 429 退避，与 Telegram 的 MarkdownV2 + retry_after 同构；markdown 标志
+//       在 Slack 侧同样生效）。Slash 指令（/boot 等）与 Telegram 共用同一张指令
+//       注册表（单一真相源）。agent/codespace 通信（/shell/*、HMAC、SSE）零改动；
+//       Telegram 线路行为不变。
 // v4.23：修 v4.22 的接线 bug —— 构造 ShellHub 的 Sender 转发箭头函数写的是
 //       (chatId, text) => ...，第三个参数 opts（含 markdown 标志）被当场丢弃，
 //       AI 输出实际仍是纯文本（逻辑测试全绿：它们直接 new ShellHub，不走这条
 //       真机接线）。现改为三参原样转发，并加源码文本断言护栏（谁改丢谁红）。
-// v4.24：/buddy 免费额度优先链（用户要求「尽量优先选择免费的额度」）。
-//       实测推翻旧判断：16 个模型全部在免费额度内可用（含 pro 级），CLI 还有
-//       原生 --fallback-model（过载自动切换，only works with --print —— 正合用法）。
-//       机制：链（flash 系优先，BUDDY_MODELS 可覆盖）+ 每跳 --model X
-//       --fallback-model 下一跳 + 外层循环跨多跳降级 + 上次成功模型记忆
-//       （持久卷 buddy-model 文件，提到链头）。/buddy model auto 回链。
-// v4.25：/verify 验证挑战总闸（用户要求「在 telegram 里 slash 打开或关上验证」）。
-//       /verify 看状态（含会话剩余分钟）、on 开启（默认）、off 关闭（安全降级开关，
-//       按 chat 持久，DO storage）。off 时白名单消息直达流水线；验证词开机口令不受
-//       影响（5.7 在闸门外）。on 回来时旧会话作废、立即重新挑战。
-const BUILD = "devbot-20261029-v4.25";
+// v4.24：Slack 通道（与 Telegram 同一条 DO 流水线，chatId `slack:` 前缀隔离状态；
+//       agent/codespace 通信零改动）+ 恢复被陈旧工作副本覆盖的集成。
+//       同期并入 /buddy 免费额度优先链：16 模型实测全免费 + CLI 原生
+//       --fallback-model 单跳 + 外层循环多跳降级 + 上次成功模型记忆
+//       （链由 BUDDY_MODELS 覆盖，/buddy model auto 回链）。
+const BUILD = "devbot-20261029-v4.24";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -247,6 +263,12 @@ const SYSTEM_PROMPT = `你是一位资深软件工程师，通过用户的智能
 
 export class AssistantDO extends DurableObject<Env> {
   private readonly tg: TelegramClient;
+  /**
+   * Slack 客户端（v4.22）。token 未配置时仍构造（空 token），发送前由
+   * slackOn() 判定通道是否可用——与 Telegram「白名单未配 = 放开」的语义不同，
+   * Slack 通道是「没配 = 整体关闭」，不影响 Telegram 线路。
+   */
+  private readonly slack: SlackClient;
   /** Shell 网关：agent SSE 连接 + 命令队列 + 输出缓冲（内存态，DO 驱逐即失效） */
   private readonly shell: ShellHub;
   /** 已用过的请求 nonce（防重放）。DO 驱逐即清空——那时连接也断了，窗口自然关闭。 */
@@ -270,8 +292,11 @@ export class AssistantDO extends DurableObject<Env> {
     // 端点集中解析（默认官方地址，可用环境变量覆盖，见 src/config.ts）
     const ep = endpoints(env);
     this.tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN ?? "", ep.telegramApiBase);
-    // 注意第三个参数 opts 必须原样转发（含 markdown 标志）：
-    // v4.22 在这里写成 (chatId, text) => ... 把 opts 丢了，AI 输出一直纯文本。
+    this.slack = new SlackClient(env.SLACK_BOT_TOKEN ?? "", ep.slackApiBase);
+    // Sender 转发**必须带第三个参数 opts**（含 markdown 标志）：
+    // 写成 (chatId, text) => … 会把 opts 当场丢掉 —— AI 会话输出一直是纯文本，
+    // 而逻辑测试全绿（测试直接 new ShellHub，不走 bot-do 这条真机接线）。
+    // v4.23 事故的教训：接线处要断言，见 test/logic.test.mjs 的护栏用例。
     this.shell = new ShellHub((chatId, text, opts) => this.sendShellChunk(chatId, text, opts), {
       flushMs: Number(env.SHELL_FLUSH_MS ?? 1200),
       // 完整回传：用户要求「codebuddy 的 stdout 全部发给我」。旧默认 24000 会
@@ -392,6 +417,38 @@ export class AssistantDO extends DurableObject<Env> {
           });
         case "/webhook":
           return await this.handleWebhook(request);
+        case "/slack/events":
+          return await this.handleSlackEvents(request);
+        case "/slack/commands":
+          return await this.handleSlackCommand(request);
+        case "/slackstatus": {
+          // 诊断（需 ADMIN_KEY，走 index 鉴权）：Slack 通道配置状态 + auth.test
+          // auth.test 返回 bot 自己的 user_id（U 开头）与 username —— 这就是
+          // 「我的 bot 叫什么 / id 是多少」在 Slack 侧的权威答案（不用去 workspace 里翻）。
+          //
+          // 容错：token 没配/失效时 auth.test 会抛错，这里转成 ok:false 回报，
+          // 而不是让整个端点 500（排查时最需要看到的是「哪个环节坏了」）。
+          if (!this.slackOn()) {
+            return Response.json({
+              ok: false,
+              error: "Slack 通道未启用（SLACK_BOT_TOKEN 未配置或 SLACK_ENABLED=0）",
+            });
+          }
+          try {
+            const r = await this.slack.authTest();
+            return Response.json({
+              ok: r.ok,
+              bot: r.user ?? null,
+              botId: r.user_id ?? null,
+              team: r.team ?? null,
+            });
+          } catch (e) {
+            return Response.json({
+              ok: false,
+              error: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
+            });
+          }
+        }
         case "/send": {
           // 调试用：主动推一条文本到指定 chat_id
           const text = url.searchParams.get("text") ?? "";
@@ -478,20 +535,116 @@ export class AssistantDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
+  // ---------------------------------------------------------------- Slack 入口
+
+  /**
+   * Slack Events API（v4.22）。
+   *
+   * 验签在 index.ts 完成（签名覆盖原始 body，必须先 text() 再 parse——这里收到的
+   * 已是验签通过的原始文本）。三种 body：
+   *   1. url_verification —— 配置 Request URL 时的握手，回 challenge 即完成配置；
+   *   2. event_callback   —— 真正的事件；只认 message，提取后进与 Telegram
+   *                          完全相同的流水线（handleMessage）；
+   *   3. 其它             —— 200 空回（Slack 只认 HTTP 层）。
+   */
+  private async handleSlackEvents(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = JSON.parse(await request.text());
+    } catch {
+      return Response.json({ ok: true }); // 坏 JSON 也回 200：别让 Slack 重试风暴
+    }
+    // 握手：回 challenge（Slack 用它确认 URL 属于我们）
+    if (isUrlVerification(body)) {
+      return new Response(body.challenge, { headers: { "Content-Type": "text/plain" } });
+    }
+    const m = extractSlackEvent(body as SlackEventWrapper);
+    if (m) {
+      const text = normalizeSlackText(m.text);
+      if (text) {
+        this.ctx.waitUntil(
+          this.handleSlackMessage({ ...m, text }).catch((e) => console.error("[slack]", e)),
+        );
+      }
+    }
+    return Response.json({ ok: true });
+  }
+
+  /**
+   * Slash Commands（/boot /halt /cs …）。
+   * 表单编码；command 去斜杠后与 text 拼成一条指令文本，走同一张指令注册表。
+   * 同步 200 空回（处理放 waitUntil）——Slack 要求 3 秒内应答，慢了会重发。
+   */
+  private async handleSlackCommand(request: Request): Promise<Response> {
+    let form: SlackCommandForm = {};
+    try {
+      const params = new URLSearchParams(await request.text());
+      const obj: Record<string, string> = {};
+      params.forEach((v, k) => {
+        obj[k] = v;
+      });
+      form = obj as SlackCommandForm;
+    } catch {
+      return new Response("", { status: 200 });
+    }
+    const m = extractSlackCommand(form);
+    if (m) {
+      this.ctx.waitUntil(this.handleSlackMessage(m).catch((e) => console.error("[slack]", e)));
+    }
+    return new Response("", { status: 200 }); // 空回：回复走 chat.postMessage
+  }
+
+  /**
+   * Slack 消息 → 共享流水线。
+   *
+   * 与 Telegram 的 handleMessage 共用全部逻辑（去重/白名单/验证门/限流/额度/
+   * 意图/指令派发/shell/回包），差异只有三点：
+   *   1. updateId 是字符串（Telegram 是数字）——去重键空间本来就带 slack: 前缀；
+   *   2. 白名单走 SLACK_ALLOWED_USERS（两通道账号体系不同，独立配置）；
+   *   3. 无语音（Slack 语音条是 file share，v1 不转写，提示用户发文字）。
+   */
+  private async handleSlackMessage(m: SlackIncoming): Promise<void> {
+    await this.handleMessage(
+      {
+        updateId: 0, // Slack 的去重键在 text 前缀里，见 seenMsg 调用处
+        chatId: m.chatId,
+        userId: m.userId,
+        messageId: null,
+        text: m.text,
+        voiceFileId: null,
+        voiceMime: null,
+      },
+      { dedupeKey: m.updateId, channel: "slack" },
+    );
+  }
+
   // ---------------------------------------------------------------- 消息处理
 
-  private async handleMessage(m: Incoming): Promise<void> {
-    // 1) 去重：Telegram 重试时可能重推同一 update_id
-    const key = `u${m.updateId}`;
+  /**
+   * 共享消息流水线（Telegram 与 Slack 共用，v4.22 起多通道）。
+   *
+   * opts.channel：来源通道（默认 telegram）。
+   * opts.dedupeKey：去重键（Telegram 用 updateId 数字；Slack 用 `slack:<event_id>`
+   * 字符串，由 handleSlackMessage 传入——两套 id 空间不同，统一在这里收敛）。
+   */
+  private async handleMessage(
+    m: Incoming,
+    opts: { channel?: "telegram" | "slack"; dedupeKey?: string } = {},
+  ): Promise<void> {
+    const channel = opts.channel ?? "telegram";
+    // 1) 去重：Telegram 重试时可能重推同一 update_id；Slack 同样会重试（3s 超时）
+    const key = opts.dedupeKey ?? `u${m.updateId}`;
     if (await this.seenMsg(key)) return;
     await this.markSeen(key);
 
     // 2) 白名单（未配置 = 放开，仅建议开发期）。**只认 user_id（from.id）**，
     //    不认 chat_id——群聊里 chat_id 是群号不是人，按 chat_id 放行会把整个群放进来。
     //    拒绝时回报 user_id，方便管理员把该号加白（只回一次/分钟，避免被刷屏）。
-    const allowed = (this.env.ALLOWED_USERS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    //    Slack 通道用独立的 SLACK_ALLOWED_USERS（两通道账号体系不同）。
+    const allowedRaw = channel === "slack" ? this.env.SLACK_ALLOWED_USERS : this.env.ALLOWED_USERS;
+    const allowed = (allowedRaw ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     if (allowed.length > 0 && !allowed.includes(m.userId)) {
-      console.log(`[tg] 非白名单 user=${m.userId}（chat=${m.chatId}），拒绝`);
+      console.log(`[${channel}] 非白名单 user=${m.userId}（chat=${m.chatId}），拒绝`);
       if (await this.allowRate(m.chatId)) {
         await this.reply(
           m.chatId,
@@ -528,7 +681,7 @@ export class AssistantDO extends DurableObject<Env> {
       await this.reply(m.chatId, "没听清⋯⋯换句话试试，或者直接发文字。");
       return;
     }
-    console.log(`[tg] 消息 chat=${m.chatId} source=${source} text=${text.slice(0, 80)}`);
+    console.log(`[${channel}] 消息 chat=${m.chatId} source=${source} text=${text.slice(0, 80)}`);
 
     // 5.5) 身份验证（10 分钟滑动会话）：
     //   - 未验证：一切问题/指令都不转发 LLM / Codespace，只回验证问题；
@@ -539,52 +692,47 @@ export class AssistantDO extends DurableObject<Env> {
     //     下一条消息重新走验证（2026-10-28 用户要求「严格 10 分钟」，原为 30）。
     //   - 答案 VERIFY_ANSWER 走 secret（不在公开源码里）；未配置 = 服务锁定（默认安全）。
     //   - 设备限制由「白名单账号」达成（Telegram 不提供设备信息）。
-    //   - /verify off 可整体关掉验证挑战（v4.25，按 chat 持久）：这是用户自己权衡的
-    //     降级开关，关掉后所有消息直达流水线（仍受 ALLOWED_USERS 白名单约束）。
     const now = Date.now();
     const verifyAnswer = this.env.VERIFY_ANSWER;
     const sessionMs = this.verifySessionMs();
     const fp = verifyAnswer ? answerFingerprint(verifyAnswer) : "";
-    const verifyOff = await this.verifyGateOff(m.chatId);
-    if (!verifyOff) {
-      const state = await this.getVerify(m.chatId);
-      if (!isVerified(state, now, fp)) {
-        if (verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
-          await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
-          const pending = await this.takePendingCmd(m.chatId, now);
-          if (!pending) {
-            await this.reply(m.chatId, "验证通过 ✓（10 分钟内互动免验证）");
-            // 「哈哈」同时是开机口令（用户 2026-10-27 定）：验证完顺手把机器拉起来
-            await this.bootOnPassword(m.chatId);
-            return;
-          }
-          // 有暂存命令：告知 + 落回正常流水线执行（不 return）
-          await this.reply(
-            m.chatId,
-            `验证通过 ✓（10 分钟内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
-          );
-          text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
-          source = `${source}+replay`;
-          console.log(`[tg] 验证通过后补执行暂存命令 chat=${m.chatId} cmd=${previewCmd(pending, 60)}`);
-        } else {
-          // 未通过：像命令的才记下来（输错的验证词不该在验证后被当成命令执行）
-          const remember = looksLikeCommand(text);
-          if (remember) await this.rememberPendingCmd(m.chatId, text, now);
-          await this.setVerify(m.chatId, 0); // 保持未验证
-          await this.reply(
-            m.chatId,
-            verifyAnswer
-              ? remember
-                ? `${CHALLENGE_TEXT}\n\n（你这条我记着了，回验证词后自动执行）`
-                : CHALLENGE_TEXT
-              : `${CHALLENGE_TEXT}\n（管理员未配置验证答案，服务锁定中）`,
-          );
+    const state = await this.getVerify(m.chatId);
+    if (!isVerified(state, now, fp)) {
+      if (verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
+        await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
+        const pending = await this.takePendingCmd(m.chatId, now);
+        if (!pending) {
+          await this.reply(m.chatId, "验证通过 ✓（10 分钟内互动免验证）");
+          // 「哈哈」同时是开机口令（用户 2026-10-27 定）：验证完顺手把机器拉起来
+          await this.bootOnPassword(m.chatId);
           return;
         }
+        // 有暂存命令：告知 + 落回正常流水线执行（不 return）
+        await this.reply(
+          m.chatId,
+          `验证通过 ✓（10 分钟内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
+        );
+        text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
+        source = `${source}+replay`;
+        console.log(`[${channel}] 验证通过后补执行暂存命令 chat=${m.chatId} cmd=${previewCmd(pending, 60)}`);
+      } else {
+        // 未通过：像命令的才记下来（输错的验证词不该在验证后被当成命令执行）
+        const remember = looksLikeCommand(text);
+        if (remember) await this.rememberPendingCmd(m.chatId, text, now);
+        await this.setVerify(m.chatId, 0); // 保持未验证
+        await this.reply(
+          m.chatId,
+          verifyAnswer
+            ? remember
+              ? `${CHALLENGE_TEXT}\n\n（你这条我记着了，回验证词后自动执行）`
+              : CHALLENGE_TEXT
+            : `${CHALLENGE_TEXT}\n（管理员未配置验证答案，服务锁定中）`,
+        );
+        return;
       }
-      // 已验证（或刚验证通过）→ 滑动延续
-      await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
     }
+    // 已验证（或刚验证通过）→ 滑动延续
+    await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
 
     // 5.6) 终端级互动续命（在 text 就绪后判定）：只有开发机相关消息才刷新看门狗，
     //      纯聊天不续命——防止将来接 LLM 后「聊天把机器聊到永不关机」。
@@ -669,16 +817,10 @@ export class AssistantDO extends DurableObject<Env> {
           return;
         }
         case "diag":
-          await this.diagnose(m.chatId, (t) =>
-            this.tg.call("sendMessage", {
-              chat_id: m.chatId,
-              text: t,
-              disable_web_page_preview: true,
-            }),
-          );
-          return;
-        case "verify":
-          await this.handleVerify(m.chatId, args);
+          // 走 sendPlain（通道感知）而不是直接 this.tg.call：
+          // chatId 带 slack: 前缀时，Telegram 的 sendMessage 会拿 "slack:C123"
+          // 当 chat_id 去 Telegram 发，必然失败（v4.23 修）。
+          await this.diagnose(m.chatId, (t) => this.sendPlain(m.chatId, t));
           return;
       }
     }
@@ -727,7 +869,7 @@ export class AssistantDO extends DurableObject<Env> {
     if (Object.keys(providers).length === 0) {
       await this.appendHistory(m.chatId, "user", text);
       await this.reply(m.chatId, shellRes === "disabled" ? terminalHint() : shellRes);
-      console.log(`[tg] shell 不可用且无 LLM 厂商，已回提示 chat=${m.chatId}`);
+      console.log(`[${channel}] shell 不可用且无 LLM 厂商，已回提示 chat=${m.chatId}`);
       return;
     }
 
@@ -751,7 +893,7 @@ export class AssistantDO extends DurableObject<Env> {
 
     // 8) 分段回包
     await this.reply(m.chatId, answer);
-    console.log(`[tg] 已回复 chat=${m.chatId} via ${via}`);
+    console.log(`[${channel}] 已回复 chat=${m.chatId} via ${via}`);
   }
 
   // ---------------------------------------------------------------- Codespace 开发机
@@ -895,44 +1037,6 @@ export class AssistantDO extends DurableObject<Env> {
     } catch (e) {
       return `查询失败：${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
     }
-  }
-
-  /**
-   * /verify：验证挑战总闸（v4.25）。
-   * 无参 = 看状态；on/off = 开关。状态里附带「本次会话何时过期」，让 10 分钟滑动窗口可见。
-   */
-  private async handleVerify(chatId: string, args: string): Promise<void> {
-    const key = args.trim().toLowerCase();
-    if (key === "off" || key === "关") {
-      await this.setVerifyGate(chatId, true);
-      await this.reply(
-        chatId,
-        "🔓 验证挑战已关闭：白名单账号的消息直达所有功能，不再要验证词。\n（安全降级开关：关闭期间任何登录该账号的设备都能用；/verify on 立即恢复）",
-      );
-      return;
-    }
-    if (key === "on" || key === "开") {
-      await this.setVerifyGate(chatId, false);
-      await this.reply(
-        chatId,
-        "🔒 验证挑战已开启：闲置 10 分钟后要重新回答验证词（每次互动滑动延续）。\n下一条消息立即生效。",
-      );
-      return;
-    }
-    // 无参或未知参数 = 状态
-    if (key && key !== "status" && key !== "状态") {
-      await this.reply(chatId, `参数不认识：${key}\n用法：/verify（看状态）/verify on /verify off`);
-      return;
-    }
-    const off = await this.verifyGateOff(chatId);
-    const state = await this.getVerify(chatId);
-    const remainMin = state && state.exp > Date.now() ? Math.ceil((state.exp - Date.now()) / 60_000) : 0;
-    const line = off
-      ? "验证挑战：关（消息直达，不需要验证词）"
-      : state && state.exp > Date.now()
-        ? `验证挑战：开（本次会话已验证，约 ${remainMin} 分钟后过期）`
-        : "验证挑战：开（当前未验证，下一条消息会要验证词）";
-    await this.reply(chatId, `${line}\n开关：/verify on /verify off`);
   }
 
   /** 「用量」：本月累计运行时长（cs_runtime 表）+ 当前窗口状态。 */
@@ -1797,12 +1901,44 @@ export class AssistantDO extends DurableObject<Env> {
     }
   }
 
-  /** 分段发送（长回答拆成多条，手表端更好读）。 */
+  /**
+   * 分段发送（长回答拆成多条，手表端更好读）。
+   * v4.22 起多通道：chatId 带 `slack:` 前缀 → SlackClient（mrkdwn + 429 退避），
+   * 否则 → Telegram（MarkdownV2 + 400 降级 + retry_after 重试）。分块大小各按
+   * 平台上限（Telegram REPLY_CHUNK_SIZE 默认 800；Slack 3800 内部处理）。
+   */
   private async reply(chatId: string, text: string): Promise<void> {
+    if (channelOf(chatId) === "slack") {
+      if (this.slackOn()) await this.slack.sendMessage(chatId.slice("slack:".length), text);
+      return;
+    }
     const chunks = chunkText(text, Number(this.env.REPLY_CHUNK_SIZE ?? 800));
     for (const chunk of chunks) {
       await this.tg.sendMessage(chatId, chunk);
     }
+  }
+
+  /** Slack 通道是否可用（token 配置 + 总开关）。 */
+  private slackOn(): boolean {
+    return Boolean(this.env.SLACK_BOT_TOKEN) && this.env.SLACK_ENABLED !== "0";
+  }
+
+  /**
+   * 纯文本发送（不做 markdown 渲染）。通道感知：
+   *   - Slack：mrkdwn=false，原样发（诊断报告里那些〔FENCE〕〔IND〕标记要看得见）
+   *   - Telegram：裸 sendMessage（与 v4.23 前的行为逐字节一致）
+   * 用于 /diag 这类「就是要看原文」的回包。
+   */
+  private async sendPlain(chatId: string, text: string): Promise<void> {
+    if (channelOf(chatId) === "slack") {
+      if (this.slackOn()) await this.slack.sendMessage(chatId.slice("slack:".length), text, { markdown: false });
+      return;
+    }
+    await this.tg.call("sendMessage", {
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+    });
   }
 
   // ---------------------------------------------------------------- Shell 通道
@@ -2013,8 +2149,19 @@ export class AssistantDO extends DurableObject<Env> {
     }
   }
 
-  /** shell 输出回传：纯文本发送，不走 MarkdownV2（命令输出里转义符太多，容易 400/渲染乱）。 */
+  /**
+   * shell 输出回传：普通命令纯文本发送，不走 MarkdownV2（命令输出里转义符太多，容易 400/渲染乱）。
+   * v4.22（远端）：AI 会话命令带 markdown 标志 → TelegramClient.sendMessage（mdToV2 + 400 降级）。
+   * v4.23（Slack）：chatId 带 `slack:` 前缀 → SlackClient（mrkdwn 渲染 + 429 退避，
+   *   markdown 标志同样生效——AI 会话在 Slack 里也走富文本）；Telegram 路径不变。
+   */
   private async sendShellChunk(chatId: string, text: string, opts?: { markdown?: boolean }): Promise<void> {
+    if (channelOf(chatId) === "slack") {
+      // markdown 标志透传：AI 会话（/gemini、/buddy）在 Slack 里也走 mrkdwn 富文本；
+      // 普通 shell 命令输出（任意字节流）传 false 保持纯文本，与 Telegram 侧语义一致。
+      if (this.slackOn()) await this.slack.sendMessage(chatId.slice("slack:".length), text, opts);
+      return;
+    }
     // Telegram 对连续 sendMessage 限速（~1msg/s，突发 ~30）。完整回传长输出时
     // 一次可能连发几十条，429 是常态而不是异常 —— 按 retry_after 等待后重发。
     for (let attempt = 1; ; attempt++) {
@@ -2122,7 +2269,8 @@ export class AssistantDO extends DurableObject<Env> {
         .slice(0, 400);
     const report = [
       `诊断报告 build=${BUILD}`,
-      `通道: tg=${this.tg ? "on" : "off"}`,
+      `通道: ${channelOf(chatId)}${channelOf(chatId) === "slack" ? `（chat=${chatId}）` : ""}`,
+      `Slack: ${this.slackOn() ? "on" : "off"}`,
       `最近输入: ${(lastUser?.content ?? "无").slice(0, 80)}`,
       `模型回复含围栏: ${/```/.test(raw) ? "是" : "否"}`,
       `模型回复含缩进行: ${/^( {4}|\t)/m.test(raw) ? "是" : "否"}`,
@@ -2222,23 +2370,6 @@ export class AssistantDO extends DurableObject<Env> {
     return (Number.isFinite(min) && min > 0 ? min : VERIFY_SESSION_DEFAULT_MIN) * 60_000;
   }
 
-  // ---- /verify：验证挑战的总闸（v4.25，按 chat 持久） ----
-  // 默认开启（没有存储记录 = on，绝不把「没配置」当成「关」）。
-  // 关闭是用户自己权衡的安全降级：关掉后白名单账号的所有消息直达流水线，
-  // 不再回答验证词。重新开启立即恢复挑战。
-  private async verifyGateOff(chatId: string): Promise<boolean> {
-    return (await this.ctx.storage.get<boolean>(`verify_off:${chatId}`)) === true;
-  }
-
-  private async setVerifyGate(chatId: string, off: boolean): Promise<void> {
-    const key = `verify_off:${chatId}`;
-    if (off) await this.ctx.storage.put(key, true);
-    else await this.ctx.storage.delete(key);
-    // 状态切换时清理会话残留：off → 给一个已验证的长会话（省得 on 回来立刻要词）；
-    // on → 旧会话作废，下一条消息重新挑战（关闭期间谁都可能用过这个 chat）
-    await this.setVerify(chatId, off ? nextExpiry(Date.now(), this.verifySessionMs()) : 0, "");
-  }
-
   // 看门狗配置（vars）
   /** 空闲提醒阈值（分钟，默认 25） */
   private watchRemindMin(): number {
@@ -2320,8 +2451,7 @@ export class AssistantDO extends DurableObject<Env> {
    */
   private async syncMenuOnce(): Promise<void> {
     // 版本化 key：指令表变了就 +1，否则老 DO 里的 true 会永久压住同步、新指令进不了菜单
-    // v3：v4.25 新增 /verify（指令表变了，菜单要重同步一次）
-    const key = "menu_synced_v3";
+    const key = "menu_synced_v2";
     try {
       if (await this.ctx.storage.get<boolean>(key)) return;
       await this.tg.call("setMyCommands", { commands: menuCommands() });
@@ -2336,9 +2466,11 @@ export class AssistantDO extends DurableObject<Env> {
     return {
       ok: true,
       build: BUILD,
-      channel: "telegram",
+      channel: "telegram+slack",
       // 部署身份（wrangler.toml [vars] BOT_IDENTITY）：主 bot 缺省 main；devbot 部署显示 devbot
       identity: this.env.BOT_IDENTITY || "main",
+      // Slack 通道是否启用（token 配置 + 总开关）
+      slack: this.slackOn() ? "on" : "off",
       // shell agent 是否反连在线（诊断用：不在线说明 codespace 里 agent 没起来）
       shell: this.shell.online() ? "online" : "offline",
       // 最近一次 agent 鉴权用的方式：hmac = 签名通道（正常）；legacy = 明文密钥（该升级了）

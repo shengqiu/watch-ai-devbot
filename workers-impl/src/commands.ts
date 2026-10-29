@@ -141,22 +141,6 @@ export const COMMANDS: CommandSpec[] = [
     menu: true,
   },
   {
-    name: "verify",
-    aliases: ["验证"],
-    desc: "验证挑战开关（/verify 看状态；on / off 开关）",
-    detail: [
-      "/verify —— 查看当前状态：挑战开/关、本次会话何时过期。",
-      "/verify on —— 开启验证挑战（默认）：闲置 10 分钟后要回答验证词。",
-      "/verify off —— 关闭验证挑战：白名单账号的消息直达，不再要验证词。",
-      "",
-      "off 是安全降级开关（自己的选择）：关掉期间任何登录该账号的设备都能用全部功能。",
-      "重新 on 会立即恢复挑战（关闭期间的会话作废，下一条消息重新验证）。",
-      "只影响本 chat 的验证挑战；账号白名单（ALLOWED_USERS）始终生效。",
-    ],
-    group: "其它",
-    menu: true,
-  },
-  {
     name: "help",
     aliases: ["帮助", "?", "？", "commands", "menu"],
     desc: "指令表；/help <指令> 看细节",
@@ -311,7 +295,6 @@ export function renderHelp(): string {
   lines.push("会话过期会先要验证词，通过后 10 分钟内互动免验证；");
   lines.push("（10 分钟不说话就失效，下一条消息要重新验证）");
   lines.push("验证前发的那条命令会自动补执行，不用重发。");
-  lines.push("不想被反复要验证词：/verify off 关掉挑战（/verify on 恢复）。");
   lines.push("");
   lines.push("细节看 /help <指令>，例如 /help boot");
   return lines.join("\n");

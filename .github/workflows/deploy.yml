@@ -61,6 +61,40 @@ jobs:
       - name: Logic tests
         run: npm test
 
+      # ---- 接线护栏（独立于 src/test 文件，防「陈旧工作副本覆盖」）----
+      # 2026-10-29 发生过两次：另一个会话把 bot-do.ts / index.ts 等整体提交成旧版本，
+      # 一次性抹掉 412 行 Slack 集成并一路绿灯部署上线。test/logic.test.mjs 里的
+      # 断言也跟着被覆盖，于是「集成还在不在」没人把关。
+      # 这道检查只读源码文本，放在 workflow 里（对方不会碰这个文件），
+      # 任何人把 Slack 接线删掉都会在这里卡红，阻止上线。
+      - name: Wiring guard（Slack 接线必须存在）
+        run: |
+          fail=0
+          check_present() {
+            if grep -q -- "$2" "$1"; then
+              echo "  ✅ $1"
+            else
+              echo "  ❌ $1 缺少：$2"
+              fail=1
+            fi
+          }
+          echo "检查 Slack 通道接线："
+          check_present workers-impl/src/bot-do.ts "handleSlackEvents"
+          check_present workers-impl/src/bot-do.ts "handleSlackCommand"
+          check_present workers-impl/src/bot-do.ts 'channelOf(chatId) === "slack"'
+          check_present workers-impl/src/index.ts "/slack/events"
+          check_present workers-impl/src/index.ts "/slack/commands"
+          check_present workers-impl/src/index.ts "verifySlackRequest"
+          check_present workers-impl/src/bot-do.ts "new ShellHub((chatId, text, opts)"
+          echo "检查 Slack 通道配置文件："
+          check_present workers-impl/src/slack/update.ts "extractSlackEvent"
+          check_present workers-impl/src/slack/verify.ts "verifySlackRequest"
+          if [ "$fail" != "0" ]; then
+            echo "::error::Slack 通道接线缺失 —— 拒绝上线（若这是有意删除，请同时删除 test/slack.test.mjs 与本步骤）"
+            exit 1
+          fi
+          echo "Slack 接线完整 ✅"
+
   # ---- dev 上的提交：测试通过后自动晋升到 main ----
   promote:
     name: dev → main

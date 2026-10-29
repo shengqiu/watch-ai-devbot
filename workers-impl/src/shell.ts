@@ -62,7 +62,7 @@ export function capOutput(text: string, max: number): string {
   if (text.length <= max) return text;
   const head = Math.floor(max * 0.6);
   const tail = max - head;
-  return `${text.slice(0, head)}\n⋯⋯ 省略 ${text.length - max} 字符 ⋯⋯\n${text.slice(text.length - tail)}`;
+  return `${text.slice(0, head)}\n⋯⋯ ${text.length - max} chars omitted ⋯⋯\n${text.slice(text.length - tail)}`;
 }
 
 /**
@@ -377,9 +377,9 @@ export class ShellHub {
    * 区分三种「不知道」：没在跑、agent 太老、真的读不到 —— 别混成一句话。
    */
   procLine(): string {
-    if (!this.agentRunning) return "（当前没有命令在跑）";
+    if (!this.agentRunning) return "(no command running)";
     if (this.agentProc) return this.agentProc;
-    return this.procSeen ? "（agent 未报告，可能刚启动）" : "进程状态未知（agent 版本太老，需 git pull）";
+    return this.procSeen ? "(agent did not report; probably just started)" : "process state unknown (agent too old; git pull on the machine)";
   }
 
   /**
@@ -425,7 +425,7 @@ export class ShellHub {
         continue;
       }
       this.clearAck(id);
-      void this.send(cmd.chatId, `⚠️ shell 连接断开，命令没送到开发机：${cmd.label ?? cmd.cmd}`);
+      void this.send(cmd.chatId, `⚠️ Shell connection dropped; the command never reached the machine: ${cmd.label ?? cmd.cmd}`);
       this.buf.delete(id);
       this.queue.delete(id);
     }
@@ -442,10 +442,10 @@ export class ShellHub {
       return {
         ok: false,
         message: [
-          "⌨️ shell 未连接：开发机里的 shell agent 没连上来。",
+          "⌨️ Shell not connected: the shell agent on the dev machine is not connected.",
           "",
-          "· 刚开机的话等 30 秒再试（postStart 自动拉起）",
-          "· 若一直不在线，在 codespace 终端执行：node shell-agent/agent.mjs",
+          "· Just booted? Wait 30s and retry (postStart launches it automatically)",
+          "· Still offline? Run this in the codespace terminal: node shell-agent/agent.mjs",
         ].join("\n"),
       };
     }
@@ -461,10 +461,10 @@ export class ShellHub {
         // 刚才的 npm 安装、还是 gemini 在想、还是自己十几分钟前发的什么。
         const cur = [...this.queue.values()][0];
         const shown = cur.label ?? cur.cmd.split("\n")[0].slice(0, 60);
-        const hint = lost.length > 0 ? "（刚清掉一条失联的命令）\n" : "\n";
+        const hint = lost.length > 0 ? "(just dropped a lost command)\n" : "\n";
         return {
           ok: false,
-          message: `⌨️ 上一条命令还在跑：${shown}${hint}等它结束，或发 /ctrlc 中断（会连同队列一起清掉）。`,
+          message: `⌨️ Previous command still running: ${shown}${hint}Wait for it, or /ctrlc to interrupt (also clears the queue).`,
         };
       }
     }
@@ -490,7 +490,7 @@ export class ShellHub {
    * 就能反复打断你正在跑的构建，属于低成本骚扰。
    */
   sendCtrlC(): string | null {
-    if (!this.online()) return "⌨️ shell 未连接。";
+    if (!this.online()) return "⌨️ Shell not connected.";
     this.chain = this.chain
       .then(async () => {
         if (!this.ctl) return;
@@ -555,9 +555,9 @@ export class ShellHub {
     const chars = msg.text?.length ?? 0;
     await this.send(
       g.chatId,
-      `⚠️「${g.label}」的登记已经不在了（超时清理或 DO 被回收），但它**在开发机上可能还在跑** —— ` +
-        `刚收到它 ${chars} 字节的输出，无法投递。\n` +
-        `发 /cs 看进程状态；确认卡住就 /ctrlc，或重发一次。`,
+      `⚠️ The record for '${g.label}' is gone (timeout cleanup or DO eviction), but it **may still be running on the machine** — ` +
+        `just got ${chars} bytes of its output with nowhere to deliver it.\n` +
+        `Check /cs for the process state; /ctrlc if it's stuck, or just resend.`,
     );
   }
 
@@ -582,7 +582,7 @@ export class ShellHub {
       b.chars += msg.text.length;
       if (b.chars <= this.maxChars) b.parts.push(msg.text);
       else if (b.chars - msg.text.length < this.maxChars) {
-        b.parts.push("\n⋯⋯ 输出过长，已截断 ⋯⋯\n");
+        b.parts.push("\n⋯⋯ output too long, truncated ⋯⋯\n");
       }
     }
     if (msg.done) {
@@ -609,7 +609,7 @@ export class ShellHub {
     if (epoch > 0) {
       if (this.agentEpoch > 0 && epoch !== this.agentEpoch) {
         for (const [id, cmd] of [...this.queue]) {
-          if (cmd.ackedAt) void this.dropLost(id, "agent 重启过，这条被中断了");
+          if (cmd.ackedAt) void this.dropLost(id, "the agent restarted, so this one was interrupted");
         }
         this.agentRunning = null;
       }
@@ -658,10 +658,10 @@ export class ShellHub {
       if (!neverAcked && !abandoned && !expired) continue;
       lost.push(c);
       const why = neverAcked
-        ? "agent 一直没确认收到（那条连接其实是死的）"
+        ? "the agent never confirmed receipt (that connection was dead)"
         : expired
-          ? `超过 ${Math.round(this.cmdTtlMs / 60_000)} 分钟没结束`
-          : "agent 那边已经不在跑它了（被中断了）";
+          ? `it ran over ${Math.round(this.cmdTtlMs / 60_000)} min without finishing`
+          : "the agent is no longer running it (it was interrupted)";
       void this.dropLost(id, `「${c.label ?? c.cmd.split("\n")[0].slice(0, 40)}」${why}`);
     }
     return lost;
@@ -682,7 +682,7 @@ export class ShellHub {
     const name = c.label ?? c.cmd.split("\n")[0].slice(0, 40);
     await this.send(
       c.chatId,
-      `${partial ? partial + "\n\n" : ""}⚠️ 已自动解锁：${name} —— ${reason}。\n直接重发这条就行。`,
+      `${partial ? partial + "\n\n" : ""}⚠️ Auto-unlocked: ${name} — ${reason}.\nJust resend it.`,
     );
   }
 
@@ -699,12 +699,12 @@ export class ShellHub {
       const c = this.queue.get(id);
       if (!c || c.ackedAt) return;
       if (!this.ctl) {
-        void this.dropLost(id, "shell 连接已断开，命令没送到开发机");
+        void this.dropLost(id, "the shell connection is down; the command never reached the machine");
         return;
       }
       const tries = c.tries ?? 1;
       if (tries >= this.maxTries) {
-        void this.dropLost(id, `${Math.round((this.ackMs * ((1 << tries) - 1)) / 1000)}s 内 agent 没确认收到，通道是半死的`);
+        void this.dropLost(id, `no agent ack in ${Math.round((this.ackMs * ((1 << tries) - 1)) / 1000)}s; the channel is half-dead`);
         return;
       }
       c.tries = tries + 1;

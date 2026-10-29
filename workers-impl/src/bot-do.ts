@@ -233,7 +233,9 @@ import {
 //       影响（5.7 在闸门外）。on 回来时旧会话作废、立即重新挑战。
 // v4.26：Slack 通道（与 Telegram 同一条 DO 流水线，chatId `slack:` 前缀隔离状态；
 //       agent/codespace 通信零改动）+ 恢复被陈旧工作副本覆盖的集成。
-const BUILD = "devbot-20261029-v4.26";
+// v4.27：全部面向上层的提示改成英文（用户要求）；/buddy、/gemini 脚本内部文案不动
+//       （那是 AI agent 的 scope）。中文别名同步下线（帮助/中断/验证）。
+const BUILD = "devbot-20261029-v4.27";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -365,7 +367,7 @@ export class AssistantDO extends DurableObject<Env> {
         case "/csdebug": {
           // 调试：直接调 GitHub API 查 codespace 状态（绕过消息流水线，定位 PAT/网络问题）
           const client = this.codespaceClient();
-          if (!client) return Response.json({ ok: false, error: "GH_CODESPACE_PAT 未配置" }, { status: 400 });
+          if (!client) return Response.json({ ok: false, error: "GH_CODESPACE_PAT not configured" }, { status: 400 });
           try {
             const st = await client.status();
             return Response.json({ ok: true, state: st.state, name: st.name });
@@ -438,7 +440,7 @@ export class AssistantDO extends DurableObject<Env> {
           if (!this.slackOn()) {
             return Response.json({
               ok: false,
-              error: "Slack 通道未启用（SLACK_BOT_TOKEN 未配置或 SLACK_ENABLED=0）",
+              error: "Slack channel not enabled (SLACK_BOT_TOKEN unset or SLACK_ENABLED=0)",
             });
           }
           try {
@@ -655,7 +657,7 @@ export class AssistantDO extends DurableObject<Env> {
       if (await this.allowRate(m.chatId)) {
         await this.reply(
           m.chatId,
-          `未授权用户。你的 user_id 是 ${m.userId}，请联系管理员加入白名单。`,
+          `Unauthorized user. Your user_id is ${m.userId}; ask the admin to whitelist you.`,
         );
       }
       return;
@@ -667,13 +669,13 @@ export class AssistantDO extends DurableObject<Env> {
 
     // 3) 限流
     if (!(await this.allowRate(m.chatId))) {
-      await this.reply(m.chatId, `说话慢一点～每分钟最多 ${this.rateLimit()} 条。`);
+      await this.reply(m.chatId, `Slow down~ max ${this.rateLimit()} messages per minute.`);
       return;
     }
 
     // 4) 日额度（防失控烧钱）
     if (await this.overBudget()) {
-      await this.reply(m.chatId, "今天的调用额度用完了，明天再战。");
+      await this.reply(m.chatId, "Daily call budget is used up. See you tomorrow.");
       return;
     }
 
@@ -685,7 +687,7 @@ export class AssistantDO extends DurableObject<Env> {
       source = "stt-api";
     }
     if (!text) {
-      await this.reply(m.chatId, "没听清⋯⋯换句话试试，或者直接发文字。");
+      await this.reply(m.chatId, "Couldn't hear that... try again, or just type it.");
       return;
     }
     console.log(`[${channel}] 消息 chat=${m.chatId} source=${source} text=${text.slice(0, 80)}`);
@@ -713,7 +715,7 @@ export class AssistantDO extends DurableObject<Env> {
           await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
           const pending = await this.takePendingCmd(m.chatId, now);
           if (!pending) {
-            await this.reply(m.chatId, "验证通过 ✓（10 分钟内互动免验证）");
+            await this.reply(m.chatId, "Verified ✓ (no re-verification for 10 min while you keep talking)");
             // 「哈哈」同时是开机口令（用户 2026-10-27 定）：验证完顺手把机器拉起来
             await this.bootOnPassword(m.chatId);
             return;
@@ -721,7 +723,7 @@ export class AssistantDO extends DurableObject<Env> {
           // 有暂存命令：告知 + 落回正常流水线执行（不 return）
           await this.reply(
             m.chatId,
-            `验证通过 ✓（10 分钟内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
+            `Verified ✓\n▶ Running what you sent just now: ${previewCmd(pending)}`,
           );
           text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
           source = `${source}+replay`;
@@ -735,9 +737,9 @@ export class AssistantDO extends DurableObject<Env> {
             m.chatId,
             verifyAnswer
               ? remember
-                ? `${CHALLENGE_TEXT}\n\n（你这条我记着了，回验证词后自动执行）`
+                ? `${CHALLENGE_TEXT}\n\n(I've kept that one; it will run right after you answer.)`
                 : CHALLENGE_TEXT
-              : `${CHALLENGE_TEXT}\n（管理员未配置验证答案，服务锁定中）`,
+              : `${CHALLENGE_TEXT}\n(No answer configured by the admin; service is locked.)`,
           );
           return;
         }
@@ -804,12 +806,12 @@ export class AssistantDO extends DurableObject<Env> {
           const dropped = this.shell.killAll();
           const lines =
             dropped.length === 0
-              ? ["已发送 Ctrl-C ✓（队列本来就是空的）"]
+              ? ["Ctrl-C sent ✓ (queue was already empty)"]
               : [
-                  `已发送 Ctrl-C，并清掉 ${dropped.length} 条挂着的命令：`,
+                  `Ctrl-C sent; also dropped ${dropped.length} queued command(s):`,
                   ...dropped.map((d) => `· ${String(d.label ?? d.cmd.split("\n")[0]).slice(0, 60)}`),
                   "",
-                  "若那个进程仍然不理中断，发 /halt 关机。",
+                  "If the process ignores even this, send /halt.",
                 ];
           await this.reply(m.chatId, lines.join("\n"));
           return;
@@ -821,7 +823,7 @@ export class AssistantDO extends DurableObject<Env> {
             const hint = suggestCommand(args.split(/\s+/)[0]);
             await this.reply(
               m.chatId,
-              `没有这条指令：${args.split(/\s+/)[0]}${hint ? `\n你是不是要 /${hint}？` : ""}\n\n${renderHelp()}`,
+              `No such command: ${args.split(/\s+/)[0]}${hint ? `\nDid you mean /${hint}?` : ""}\n\n${renderHelp()}`,
             );
           } else {
             await this.reply(m.chatId, one ?? renderHelp());
@@ -850,7 +852,7 @@ export class AssistantDO extends DurableObject<Env> {
       const hint = suggestCommand(trimmed.split(/\s+/)[0]);
       await this.reply(
         m.chatId,
-        `未知指令 ${trimmed.split(/\s+/)[0]}${hint ? `，你是不是要 /${hint}？` : ""}\n发 /help 看全部指令。`,
+        `Unknown command ${trimmed.split(/\s+/)[0]}${hint ? ` — did you mean /${hint}?` : ""}\nSend /help for the full list.`,
       );
       return;
     }
@@ -900,7 +902,7 @@ export class AssistantDO extends DurableObject<Env> {
       via = `${result.provider}/${result.model} ${result.latencyMs}ms`;
     } catch (e) {
       console.error("[agent]", e);
-      answer = `所有模型都调用失败了：${e instanceof Error ? e.message.slice(0, 150) : String(e).slice(0, 150)}`;
+      answer = `Every model call failed: ${e instanceof Error ? e.message.slice(0, 150) : String(e).slice(0, 150)}`;
     }
 
     await this.appendHistory(m.chatId, "user", text);
@@ -938,7 +940,7 @@ export class AssistantDO extends DurableObject<Env> {
       // 查询失败就交给 beginBoot 去报错，比这里静默吞掉更清楚
     }
     if (state === "Available") {
-      await this.reply(chatId, "开发机已在运行中 ✓ 直接发命令就行");
+      await this.reply(chatId, "Dev machine already running ✓ just send commands");
       return;
     }
     const r = await this.handleBootDev(chatId);
@@ -957,7 +959,7 @@ export class AssistantDO extends DurableObject<Env> {
     opts: { then?: AiProvider; silent?: boolean } = {},
   ): Promise<string | null> {
     const client = this.codespaceClient();
-    if (!client) return "未配置 GH_CODESPACE_PAT，无法操作开发机（wrangler secret put GH_CODESPACE_PAT）。";
+    if (!client) return "GH_CODESPACE_PAT not configured; can't operate the dev machine (wrangler secret put GH_CODESPACE_PAT).";
     const p1 = await beginBoot(client);
     if (!opts.silent) await this.reply(chatId, p1.reply); // 先发即时回复（用户要求：立刻知道「正在启动」）
     if (p1.scheduleCheck) {
@@ -1033,25 +1035,25 @@ export class AssistantDO extends DurableObject<Env> {
 
   private async handleStopDev(): Promise<string> {
     const client = this.codespaceClient();
-    if (!client) return "未配置 GH_CODESPACE_PAT，无法操作开发机（wrangler secret put GH_CODESPACE_PAT）。";
+    if (!client) return "GH_CODESPACE_PAT not configured; can't operate the dev machine (wrangler secret put GH_CODESPACE_PAT).";
     return stopCodespace(client);
   }
 
   private async handleDevStatus(): Promise<string> {
     const client = this.codespaceClient();
-    if (!client) return "未配置 GH_CODESPACE_PAT，无法查询开发机状态。";
+    if (!client) return "GH_CODESPACE_PAT not configured; cannot query the dev machine.";
     try {
       const st = await client.status();
       // 状态查询 = 互动：机器在跑时刷新看门狗起点（你刚看过，说明在用）
       if (st.state === "Available") await this.ensureWatch(null, "bot");
       // 顺带报联机通道：用户看完「运行中」的下一句必然是「那我能发命令了吗」
-      const shell = this.shell.online() ? "已连接 ✓ 可以直接发命令" : "未连接（开机后约 10~30 秒自动连上）";
+      const shell = this.shell.online() ? "connected ✓ send commands right away" : "not connected (auto-connects ~10-30s after boot)";
       const s = this.shell.snapshot();
       // 有命令在跑时把进程状态一并报出来：这才是「到底在等 / 被挂起 / 已死」的答案
-      const proc = s.agentRunning ? `\n当前命令：${this.shell.procLine()}` : "";
-      return `开发机状态：${describeState(st.state)}\nshell 通道：${shell}${proc}`;
+      const proc = s.agentRunning ? `\nRunning command: ${this.shell.procLine()}` : "";
+      return `Dev machine: ${describeState(st.state)}\nShell channel: ${shell}${proc}`;
     } catch (e) {
-      return `查询失败：${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
+      return `Query failed: ${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
     }
   }
 
@@ -1061,36 +1063,36 @@ export class AssistantDO extends DurableObject<Env> {
    */
   private async handleVerify(chatId: string, args: string): Promise<void> {
     const key = args.trim().toLowerCase();
-    if (key === "off" || key === "关") {
+    if (key === "off") {
       await this.setVerifyGate(chatId, true);
       await this.reply(
         chatId,
-        "🔓 验证挑战已关闭：白名单账号的消息直达所有功能，不再要验证词。\n（安全降级开关：关闭期间任何登录该账号的设备都能用；/verify on 立即恢复）",
+        "🔓 Verification gate OFF: whitelisted messages go straight through, no passphrase needed.\n(Security downgrade: while off, any device logged into this account has full access; /verify on re-arms instantly.)",
       );
       return;
     }
-    if (key === "on" || key === "开") {
+    if (key === "on") {
       await this.setVerifyGate(chatId, false);
       await this.reply(
         chatId,
-        "🔒 验证挑战已开启：闲置 10 分钟后要重新回答验证词（每次互动滑动延续）。\n下一条消息立即生效。",
+        "🔒 Verification gate ON: after 10 min idle you'll be asked to re-verify (each interaction slides the window).\nTakes effect on the next message.",
       );
       return;
     }
     // 无参或未知参数 = 状态
-    if (key && key !== "status" && key !== "状态") {
-      await this.reply(chatId, `参数不认识：${key}\n用法：/verify（看状态）/verify on /verify off`);
+    if (key && key !== "status") {
+      await this.reply(chatId, `Unknown argument: ${key}\nUsage: /verify (status) /verify on /verify off`);
       return;
     }
     const off = await this.verifyGateOff(chatId);
     const state = await this.getVerify(chatId);
     const remainMin = state && state.exp > Date.now() ? Math.ceil((state.exp - Date.now()) / 60_000) : 0;
     const line = off
-      ? "验证挑战：关（消息直达，不需要验证词）"
+      ? "Verification gate: OFF (messages go straight through)"
       : state && state.exp > Date.now()
-        ? `验证挑战：开（本次会话已验证，约 ${remainMin} 分钟后过期）`
-        : "验证挑战：开（当前未验证，下一条消息会要验证词）";
-    await this.reply(chatId, `${line}\n开关：/verify on /verify off`);
+        ? `Verification gate: ON (session verified, expires in ~${remainMin} min)`
+        : "Verification gate: ON (not verified; next message will be challenged)";
+    await this.reply(chatId, `${line}\nToggle: /verify on /verify off`);
   }
 
   /** 「用量」：本月累计运行时长（cs_runtime 表）+ 当前窗口状态。 */
@@ -1102,19 +1104,19 @@ export class AssistantDO extends DurableObject<Env> {
     const month = today.slice(0, 7);
     const todayMin = this.runtimeMinutes(today, today);
     const monthMin = this.runtimeMinutes(`${month}-01`, `${month}-31`);
-    lines.push(`📊 开发机用量（本月 ${month}）`);
-    lines.push(`累计运行：${fmtDur(monthMin)} / 免费额度 ${budgetH} 小时`);
+    lines.push(`📊 Dev machine usage (${month})`);
+    lines.push(`Total runtime: ${fmtDur(monthMin)} / free allowance ${budgetH} h`);
     const pct = Math.min(100, Math.round((monthMin / 60 / budgetH) * 100));
-    lines.push(`额度消耗：${pct}%${pct >= 80 ? " ⚠️ 接近上限" : ""}`);
-    lines.push(`今日运行：${fmtDur(todayMin)}`);
+    lines.push(`Allowance used: ${pct}%${pct >= 80 ? " ⚠️ nearing the cap" : ""}`);
+    lines.push(`Today: ${fmtDur(todayMin)}`);
     // 当前窗口
     const ep = await this.getEpisode();
     if (ep && ep.running) {
-      lines.push(`当前窗口：运行中，已 ${fmtDur((Date.now() - ep.bootAt) / 60_000)}${ep.botStarted ? "" : "（非 bot 开机）"}`);
+      lines.push(`Current window: running, ${fmtDur((Date.now() - ep.bootAt) / 60_000)} so far${ep.botStarted ? "" : " (not booted by me)"}`);
     } else {
-      lines.push("当前窗口：关机中");
+      lines.push("Current window: shut down");
     }
-    lines.push(`看门狗：${this.autostopEnabled() ? `${this.watchRemindMin()}/${this.watchAutostopMin()} 分钟 提醒/自动关` : "仅提醒（自动关未启用）"}`);
+    lines.push(`Watchdog: ${this.autostopEnabled() ? `remind/auto-stop at ${this.watchRemindMin()}/${this.watchAutostopMin()} min` : "remind only (auto-stop disabled)"}`);
     return lines.join("\n");
   }
 
@@ -1236,7 +1238,7 @@ export class AssistantDO extends DurableObject<Env> {
   private async enqueueBuddy(chatId: string, script: string, label: string): Promise<void> {
     const res = this.shell.enqueue(chatId, script, { label, hideCwd: true, markdown: true });
     if (res.ok) return;
-    await this.reply(chatId, res.message ?? "shell 通道不可用。");
+    await this.reply(chatId, res.message ?? "Shell channel unavailable.");
   }
 
   /** /buddy 的全部子命令在此分派（与 /gemini 一一对应）。 */
@@ -1254,8 +1256,8 @@ export class AssistantDO extends DurableObject<Env> {
           await this.reply(
             chatId,
             cur === "gemini"
-              ? "当前是 Gemini 会话模式（/gemini off 退出）。"
-              : "现在没开会话模式，发文字 = 直接执行 shell 命令。",
+              ? "Currently in a Gemini session (/gemini off to leave)."
+              : "No session mode right now; plain text = run a shell command.",
           );
           return;
         }
@@ -1263,7 +1265,7 @@ export class AssistantDO extends DurableObject<Env> {
         await this.ctx.storage.delete(`buddy_pending:${chatId}`);
         await this.reply(
           chatId,
-          "🧩 已退出 CodeBuddy 会话模式。之后发文字 = 直接在开发机执行命令；想再聊发 /buddy。",
+          "🧩 Left CodeBuddy session mode. Plain text = run a shell command again; /buddy to chat.",
         );
         return;
       }
@@ -1273,26 +1275,26 @@ export class AssistantDO extends DurableObject<Env> {
           await this.ctx.storage.delete(`buddy_model:${chatId}`);
           await this.reply(
             chatId,
-            `🧩 已回到免费额度优先链：某个模型不可用会自动换下一个。\n链：${this.buddyChain().join(" → ")}`,
+            `🧩 Back to the free-quota-first chain: an unavailable model auto-switches to the next.\nChain: ${this.buddyChain().join(" → ")}`,
           );
           return;
         }
         if (!sanitizeModel(m)) {
           await this.reply(
             chatId,
-            `模型名不合法：${m}\n用法：/buddy model deepseek-v4.1-flash（或 auto 回到免费链）\n看清单：/buddy models`,
+            `Invalid model name: ${m}\nUsage: /buddy model deepseek-v4.1-flash (or auto for the free chain)\nList: /buddy models`,
           );
           return;
         }
         await this.ctx.storage.put(`buddy_model:${chatId}`, m);
-        await this.reply(chatId, `🧩 已固定 ${m}（不自动切换；/buddy model auto 回到免费链）`);
+        await this.reply(chatId, `🧩 Pinned ${m} (no rotation; /buddy model auto returns to the free chain)`);
         return;
       }
       case "models":
         await this.enqueueBuddy(chatId, buildBuddyModelsScript(this.buddyChain()), "📚 buddy models");
         return;
       case "new":
-        await this.enqueueBuddy(chatId, buildBuddyNewSessionScript(), "🆕 新会话");
+        await this.enqueueBuddy(chatId, buildBuddyNewSessionScript(), "🆕 Fresh session");
         return;
       case "status":
         await this.enqueueBuddy(chatId, buildBuddyStatusScript(await this.buddyPin(chatId), this.buddyChain()), "🔍 buddy status");
@@ -1314,23 +1316,23 @@ export class AssistantDO extends DurableObject<Env> {
   private async startBuddy(chatId: string, prompt?: string): Promise<void> {
     const modeHint = prompt
       ? null
-      : `🧩 CodeBuddy 模式已开：直接发问题即可（目录 ${BUDDY_DIR}，/buddy off 退出，行首 ! 仍执行 shell）`;
+      : `🧩 CodeBuddy session on: just send your question (dir ${BUDDY_DIR}, /buddy off to leave, leading ! still runs shell)`;
 
     if (this.shell.online()) {
       const model = await this.buddyPin(chatId);
       const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt, model, chain: this.buddyChain() }), {
-        label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
+        label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 Preparing CodeBuddy env",
         hideCwd: true,
         markdown: true,
       });
       if (modeHint) await this.reply(chatId, modeHint);
-      if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+      if (!res.ok) await this.reply(chatId, res.message ?? "Failed to dispatch, try again shortly.");
       return;
     }
 
     const client = this.codespaceClient();
     if (!client) {
-      await this.reply(chatId, "未配置 GH_CODESPACE_PAT，无法操作开发机（wrangler secret put GH_CODESPACE_PAT）。");
+      await this.reply(chatId, "GH_CODESPACE_PAT not configured; can't operate the dev machine (wrangler secret put GH_CODESPACE_PAT).");
       return;
     }
     if (modeHint) await this.reply(chatId, modeHint);
@@ -1344,7 +1346,7 @@ export class AssistantDO extends DurableObject<Env> {
     if (state && state !== "Available") {
       await this.reply(
         chatId,
-        `🖥 开发机没开（${describeState(state)}），正在启动…\n起来后我会自动接上它、准备好 CodeBuddy，然后${prompt ? "把你的问题发过去" : "告诉你一声"}。`,
+        `🖥 Dev machine is off (${describeState(state)}), booting...\nOnce it's up I'll connect, prepare CodeBuddy, then ${prompt ? "send your question over" : "let you know"}.`,
       );
       if (prompt) await this.rememberBuddyPrompt(chatId, prompt);
       await this.handleBootDev(chatId, { then: "buddy", silent: true });
@@ -1353,7 +1355,7 @@ export class AssistantDO extends DurableObject<Env> {
 
     await this.reply(
       chatId,
-      `⏳ 机器在跑，但 shell 通道还没连上（开机后约 10~30 秒）。\n连上我就${prompt ? "把这条问题发过去" : "开始准备 CodeBuddy 环境"}。`,
+      `⏳ Machine is running but the shell channel isn't up yet (~10-30s after boot).\nOnce it connects I'll ${prompt ? "send this question over" : "prepare the CodeBuddy environment"}.`,
     );
     if (prompt) await this.rememberBuddyPrompt(chatId, prompt);
     await pushAlarm(this.alarmStore(), {
@@ -1377,8 +1379,8 @@ export class AssistantDO extends DurableObject<Env> {
           await this.reply(
             chatId,
             cur === "buddy"
-              ? "当前是 CodeBuddy 会话模式（/buddy off 退出）。"
-              : "现在没开会话模式，发文字 = 直接执行 shell 命令。",
+              ? "Currently in a CodeBuddy session (/buddy off to leave)."
+              : "No session mode right now; plain text = run a shell command.",
           );
           return;
         }
@@ -1386,7 +1388,7 @@ export class AssistantDO extends DurableObject<Env> {
         await this.ctx.storage.delete(`gem_pending:${chatId}`);
         await this.reply(
           chatId,
-          "🤖 已退出 Gemini 会话模式。之后发文字 = 直接在开发机执行命令；想再聊发 /gemini。",
+          "🤖 Left Gemini session mode. Plain text = run a shell command again; /gemini to chat.",
         );
         return;
       case "model": {
@@ -1395,26 +1397,26 @@ export class AssistantDO extends DurableObject<Env> {
           await this.ctx.storage.delete(`gem_model:${chatId}`);
           await this.reply(
             chatId,
-            `🤖 已回到自动：按免费链依次尝试，某个模型配额用尽会自己换下一个。\n链：${this.geminiChain().join(" → ")}`,
+            `🤖 Back to auto: it walks the free chain and moves on when a model runs out of quota.\nChain: ${this.geminiChain().join(" → ")}`,
           );
           return;
         }
         if (!sanitizeModel(m)) {
           await this.reply(
             chatId,
-            `模型名不合法：${m}\n用法：/gemini model gemini-3.6-flash（或 auto 回到自动链）\n看可用清单：/gemini models`,
+            `Invalid model name: ${m}\nUsage: /gemini model gemini-3.6-flash (or auto for the chain)\nList: /gemini models`,
           );
           return;
         }
         await this.ctx.storage.put(`gem_model:${chatId}`, m);
-        await this.reply(chatId, `🤖 已固定 ${m}（固定后不自动切换；/gemini model auto 回到链）`);
+        await this.reply(chatId, `🤖 Pinned ${m} (no rotation; /gemini model auto returns to the chain)`);
         return;
       }
       case "models":
-        await this.enqueueGemini(chatId, buildModelsScript(this.geminiChain()), "📚 模型清单");
+        await this.enqueueGemini(chatId, buildModelsScript(this.geminiChain()), "📚 Model list");
         return;
       case "new":
-        await this.enqueueGemini(chatId, buildNewSessionScript(), "🆕 新会话");
+        await this.enqueueGemini(chatId, buildNewSessionScript(), "🆕 Fresh session");
         return;
       case "status":
         await this.enqueueGemini(
@@ -1438,7 +1440,7 @@ export class AssistantDO extends DurableObject<Env> {
   private async enqueueGemini(chatId: string, script: string, label: string): Promise<void> {
     const res = this.shell.enqueue(chatId, script, { label, hideCwd: true, markdown: true });
     if (res.ok) return;
-    await this.reply(chatId, res.message ?? "shell 通道不可用。");
+    await this.reply(chatId, res.message ?? "Shell channel unavailable.");
   }
 
   /**
@@ -1449,23 +1451,23 @@ export class AssistantDO extends DurableObject<Env> {
    *   ③ 机器在跑但通道没连 → 等 10~30 秒（agent 正连上来），gemini_prep 轮询重试
    */
   private async startGemini(chatId: string, prompt?: string): Promise<void> {
-    const modeHint = prompt ? null : "🤖 Gemini 模式已开：直接发问题即可（/gemini off 退出，行首 ! 仍执行 shell）";
+    const modeHint = prompt ? null : "🤖 Gemini session on: just send your question (/gemini off to leave, leading ! still runs shell)";
 
     if (this.shell.online()) {
       const model = await this.geminiPin(chatId);
       const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt, model, chain: this.geminiChain() }), {
-        label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
+        label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 Preparing Gemini env",
         hideCwd: true,
         markdown: true,
       });
       if (modeHint) await this.reply(chatId, modeHint);
-      if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+      if (!res.ok) await this.reply(chatId, res.message ?? "Failed to dispatch, try again shortly.");
       return;
     }
 
     const client = this.codespaceClient();
     if (!client) {
-      await this.reply(chatId, "未配置 GH_CODESPACE_PAT，无法操作开发机（wrangler secret put GH_CODESPACE_PAT）。");
+      await this.reply(chatId, "GH_CODESPACE_PAT not configured; can't operate the dev machine (wrangler secret put GH_CODESPACE_PAT).");
       return;
     }
     if (modeHint) await this.reply(chatId, modeHint);
@@ -1483,7 +1485,7 @@ export class AssistantDO extends DurableObject<Env> {
       // （buildGeminiScript 里的「⏳ 首次运行，正在安装…」），只在那一刻出现。
       await this.reply(
         chatId,
-        `🖥 开发机没开（${describeState(state)}），正在启动…\n起来后我会自动接上它、准备好 Gemini，然后${prompt ? "把你的问题发过去" : "告诉你一声"}。`,
+        `🖥 Dev machine is off (${describeState(state)}), booting...\nOnce it's up I'll connect, prepare Gemini, then ${prompt ? "send your question over" : "let you know"}.`,
       );
       if (prompt) await this.rememberGeminiPrompt(chatId, prompt);
       await this.handleBootDev(chatId, { then: "gemini", silent: true });
@@ -1492,7 +1494,7 @@ export class AssistantDO extends DurableObject<Env> {
 
     await this.reply(
       chatId,
-      `⏳ 机器在跑，但 shell 通道还没连上（开机后约 10~30 秒）。\n连上我就${prompt ? "把这条问题发过去" : "开始准备 Gemini 环境"}。`,
+      `⏳ Machine is running but the shell channel isn't up yet (~10-30s after boot).\nOnce it connects I'll ${prompt ? "send this question over" : "prepare the Gemini environment"}.`,
     );
     if (prompt) await this.rememberGeminiPrompt(chatId, prompt);
     await pushAlarm(this.alarmStore(), {
@@ -1528,7 +1530,7 @@ export class AssistantDO extends DurableObject<Env> {
           payload: { chat_id: chatId, attempt: attempt + 1 },
         });
       } else {
-        await this.reply(chatId, `开发机一直没起来，先发 /cs 看看状态，或稍后再发 ${cmd}。`);
+        await this.reply(chatId, `The dev machine never came up. Check /cs, or retry ${cmd} in a bit.`);
       }
       return;
     }
@@ -1539,8 +1541,8 @@ export class AssistantDO extends DurableObject<Env> {
         if (attempt === 6) {
           await this.reply(
             chatId,
-            "⏳ 机器起来了，但开发机里的 shell agent 还没连上（正常 10~30 秒）。\n" +
-              "我继续等，最多再等 4 分钟；一直不通就在 codespace 终端跑一句：\n" +
+            "⏳ Machine is up but the shell agent hasn't connected yet (normally 10-30s).\n" +
+              "I'll keep waiting up to 4 more minutes; if it never connects, run this in the codespace terminal:\n" +
               "bash .devcontainer/post-start.sh",
           );
         }
@@ -1552,9 +1554,9 @@ export class AssistantDO extends DurableObject<Env> {
       } else {
         await this.reply(
           chatId,
-          "机器起来了，但 shell 通道 5 分钟没连上。\n" +
-            "在 codespace 终端跑一句 bash .devcontainer/post-start.sh，然后重发 " +
-            `${cmd}；也可以发 /cs 看状态。`,
+          "Machine is up but the shell channel hasn't connected in 5 minutes.\n" +
+            "Run bash .devcontainer/post-start.sh in the codespace terminal, then resend " +
+            `${cmd}; or check /cs.`,
         );
       }
       return;
@@ -1564,22 +1566,22 @@ export class AssistantDO extends DurableObject<Env> {
       const prompt = await this.takeBuddyPrompt(chatId);
       const model = await this.buddyPin(chatId);
       const res = this.shell.enqueue(chatId, buildBuddyScript({ prompt: prompt ?? undefined, model, chain: this.buddyChain() }), {
-        label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 准备 CodeBuddy 环境",
+        label: prompt ? `🧩 ${previewPrompt(prompt)}` : "🛠 Preparing CodeBuddy env",
         hideCwd: true,
         markdown: true,
       });
-      if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+      if (!res.ok) await this.reply(chatId, res.message ?? "Failed to dispatch, try again shortly.");
       return;
     }
 
     const prompt = await this.takeGeminiPrompt(chatId);
     const model = await this.geminiPin(chatId);
     const res = this.shell.enqueue(chatId, buildGeminiScript({ prompt: prompt ?? undefined, model, chain: this.geminiChain() }), {
-      label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 准备 Gemini 环境",
+      label: prompt ? `🤖 ${previewPrompt(prompt)}` : "🛠 Preparing Gemini env",
       hideCwd: true,
       markdown: true,
     });
-    if (!res.ok) await this.reply(chatId, res.message ?? "下发失败，稍后再试。");
+    if (!res.ok) await this.reply(chatId, res.message ?? "Failed to dispatch, try again shortly.");
   }
 
   /** 兼容入口：v4.17 之前入队的 alarm 里 kind 只有 gemini_prep，这里保持同名壳子。 */
@@ -1741,13 +1743,13 @@ export class AssistantDO extends DurableObject<Env> {
         await client.stop();
       } catch (e) {
         console.error("[watch] 自动关机失败", e);
-        if (chat) await this.reply(chat, `⚠️ 看门狗自动关机失败：${e instanceof Error ? e.message.slice(0, 100) : "未知错误"}。稍后重试。`);
+        if (chat) await this.reply(chat, `⚠️ Watchdog auto-stop failed: ${e instanceof Error ? e.message.slice(0, 100) : "unknown error"}. Will retry.`);
         await pushAlarm(this.alarmStore(), { due: Date.now() + 5 * 60_000, kind: "watch" });
         return { acted: false, note: "stop-failed-retry" };
       }
       // 落账 + 清窗口
       await this.closeEpisode();
-      if (chat) await this.reply(chat, decision.notify ?? "已自动关机。");
+      if (chat) await this.reply(chat, decision.notify ?? "Auto-stopped.");
       console.log("[watch] 自动关机完成");
       return { acted: true, note: "stopped" };
     }
@@ -1772,7 +1774,7 @@ export class AssistantDO extends DurableObject<Env> {
    */
   private async patrol(): Promise<Record<string, unknown>> {
     const client = this.codespaceClient();
-    if (!client) return { ok: false, error: "GH_CODESPACE_PAT 未配置" };
+    if (!client) return { ok: false, error: "GH_CODESPACE_PAT not configured" };
     // 顺手清掉卡死的 shell 命令（agent 崩了 / 命令永不返回）
     const reaped = this.shell.reapStale();
     if (reaped > 0) console.log(`[shell] 巡检清理僵尸命令 ${reaped} 条`);
@@ -1798,7 +1800,7 @@ export class AssistantDO extends DurableObject<Env> {
         await this.ensureWatch(null, "observed");
         const chat = await this.getChatId();
         if (chat) {
-          await this.reply(chat, `👀 巡检发现开发机在运行（不是我开的）。不用了发 /halt，或在 GitHub 页面关机。`);
+          await this.reply(chat, `👀 Patrol: the dev machine is running (not started by me). Send /halt if you're done, or stop it from the GitHub page.`);
         }
         return { ok: true, state, note: "observed-new", ...sa };
       }
@@ -2090,7 +2092,7 @@ export class AssistantDO extends DurableObject<Env> {
   private async signDownlink(cmdId: string, cmd: string): Promise<string> {
     const id = this.agentId;
     const key = id ? this.agentKeyFor(id) : undefined;
-    if (!key) throw new Error("未识别已连接的机器，无法下发签名命令");
+    if (!key) throw new Error("no connected machine identified; cannot send a signed command");
     return signCommand(key, cmdId, cmd);
   }
 
@@ -2144,8 +2146,8 @@ export class AssistantDO extends DurableObject<Env> {
     const id = typeof body.id === "string" ? body.id.trim() : "";
     const key = typeof body.key === "string" ? body.key : "";
     const label = typeof body.label === "string" ? body.label.trim() : null;
-    if (!id || !key) return Response.json({ ok: false, error: "需要 {id, key}" }, { status: 400 });
-    if (key.length < 32) return Response.json({ ok: false, error: "key 至少 32 字符" }, { status: 400 });
+    if (!id || !key) return Response.json({ ok: false, error: "expected {id, key}" }, { status: 400 });
+    if (key.length < 32) return Response.json({ ok: false, error: "key must be at least 32 characters" }, { status: 400 });
     await this.ensureAgentOverrides();
     const now = Date.now();
     this.ctx.storage.sql.exec(
@@ -2291,7 +2293,7 @@ export class AssistantDO extends DurableObject<Env> {
     try {
       const st = await client.status();
       if (st.state !== "Available") {
-        return `⌨️ 开发机没开机（当前：${describeState(st.state)}）。先发 /boot。`;
+        return `⌨️ Dev machine is off (state: ${describeState(st.state)}). Send /boot first.`;
       }
     } catch {
       /* 状态查不动就回原始提示，别把异常抛给用户 */
@@ -2322,13 +2324,13 @@ export class AssistantDO extends DurableObject<Env> {
         .replace(/^( {4}|\t)/gm, "〔IND〕$&")
         .slice(0, 400);
     const report = [
-      `诊断报告 build=${BUILD}`,
-      `通道: ${channelOf(chatId)}${channelOf(chatId) === "slack" ? `（chat=${chatId}）` : ""}`,
+      `Diagnostics build=${BUILD}`,
+      `Channel: ${channelOf(chatId)}${channelOf(chatId) === "slack" ? ` (chat=${chatId})` : ""}`,
       `Slack: ${this.slackOn() ? "on" : "off"}`,
-      `最近输入: ${(lastUser?.content ?? "无").slice(0, 80)}`,
-      `模型回复含围栏: ${/```/.test(raw) ? "是" : "否"}`,
-      `模型回复含缩进行: ${/^( {4}|\t)/m.test(raw) ? "是" : "否"}`,
-      "模型回复原文（前400字，围栏→〔FENCE〕 缩进行→〔IND〕）:",
+      `Last input: ${(lastUser?.content ?? "none").slice(0, 80)}`,
+      `Reply has fences: ${/```/.test(raw) ? "yes" : "no"}`,
+      `Reply has indented lines: ${/^( {4}|\t)/m.test(raw) ? "yes" : "no"}`,
+      "Reply raw text (first 400 chars, fences→〔FENCE〕 indents→〔IND〕):",
       visible(raw),
     ].join("\n");
     await send(report);

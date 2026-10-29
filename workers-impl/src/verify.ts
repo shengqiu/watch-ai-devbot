@@ -83,7 +83,7 @@ export function isAnswerMatch(text: string, answer: string): boolean {
 }
 
 /** 验证问题文案（用户指定）。 */
-export const CHALLENGE_TEXT = "我可以回答你的问题，但我要知道你是谁...";
+export const CHALLENGE_TEXT = "I can answer that, but first I need to know who you are...";
 
 /**
  * 「验证前那条命令」的暂存（2026-10-27 用户要求）：
@@ -121,7 +121,7 @@ export function previewCmd(cmd: string, max = 120): string {
  * 注意：开关机的口语词（开始开发 / 停止开发 / 关机）已按用户要求移除，
  * 现在只有 /boot 与 /halt —— 所以这里也不再包含它们。
  */
-const CONTROL_WORDS = /^(开发机状态|用量|额度)([，。!！\s]*)$/;
+const CONTROL_WORDS = /^(status|quota)([，。!！\s]*)$/;
 
 /**
  * 这条消息像不像「要执行的命令」——决定验证后要不要补执行。

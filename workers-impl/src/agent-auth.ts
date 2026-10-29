@@ -274,10 +274,10 @@ export async function verifyAgentRequest(o: VerifyOpts): Promise<AuthResult> {
   const sig = o.headers.get(AGENT_HDR.sig) ?? "";
   if (!sig) {
     // 没有签名：只有显式打开的过渡窗口才接受明文密钥
-    if (!o.legacyAllowed) return { ok: false, reason: "缺少签名头" };
+    if (!o.legacyAllowed) return { ok: false, reason: "missing signature header" };
     const got = o.headers.get(AGENT_HDR.legacyKey) ?? "";
     const key = o.legacyKey ?? "";
-    return timingSafeEq(got, key) ? { ok: true, mode: "legacy" } : { ok: false, reason: "密钥不匹配" };
+    return timingSafeEq(got, key) ? { ok: true, mode: "legacy" } : { ok: false, reason: "key mismatch" };
   }
 
   // 按 id 选密钥：未知机器 / 已吊销 / 没配任何密钥 → undefined → 拒绝（fail-closed）。
@@ -285,19 +285,19 @@ export async function verifyAgentRequest(o: VerifyOpts): Promise<AuthResult> {
   // 配了 AGENT_KEYS 后空 id 查不到密钥 → 拒绝，从而强制每台机器带自己的身份。
   const key = o.agentKeyFor(agentId);
   if (!key) {
-    return { ok: false, reason: agentId ? `未知或已吊销的机器（${agentId}）` : "缺少 agent 身份（X-Agent-Id）" };
+    return { ok: false, reason: agentId ? `unknown or revoked machine (${agentId})` : "missing agent identity (X-Agent-Id)" };
   }
 
   const ts = o.headers.get(AGENT_HDR.ts) ?? "";
   const nonce = o.headers.get(AGENT_HDR.nonce) ?? "";
-  if (!nonce || nonce.length < 16) return { ok: false, reason: "缺少或过短的 nonce" };
-  if (!tsFresh(ts, now)) return { ok: false, reason: "时间戳超出窗口" };
+  if (!nonce || nonce.length < 16) return { ok: false, reason: "missing or too-short nonce" };
+  if (!tsFresh(ts, now)) return { ok: false, reason: "timestamp outside the window" };
 
   const bodySha = await sha256Hex(o.bodyText);
   const want = await hmacHex(key, requestInput(ts, nonce, o.method, o.path, bodySha));
-  if (!timingSafeEq(sig, want)) return { ok: false, reason: "签名不匹配" };
+  if (!timingSafeEq(sig, want)) return { ok: false, reason: "signature mismatch" };
 
   // 签名先验、再记 nonce：否则攻击者随便发个假签名就能把缓存灌满
-  if (o.nonces.check(nonce, now)) return { ok: false, reason: "nonce 重复（疑似重放）" };
+  if (o.nonces.check(nonce, now)) return { ok: false, reason: "duplicate nonce (possible replay)" };
   return { ok: true, mode: "hmac" };
 }

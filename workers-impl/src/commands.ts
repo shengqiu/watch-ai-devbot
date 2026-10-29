@@ -9,7 +9,7 @@
  *   3. 纯函数、零依赖 —— 可在 node 里直接单测，不需要 Worker 运行时。
  */
 
-export type CommandGroup = "开发机" | "Gemini" | "CodeBuddy" | "联机 shell" | "其它";
+export type CommandGroup = "Machine" | "Gemini" | "CodeBuddy" | "Shell" | "Other";
 
 export interface CommandSpec {
   /** 主名（不含斜杠；同时用作 Telegram 菜单里的 command） */
@@ -33,14 +33,14 @@ export const COMMANDS: CommandSpec[] = [
     // 2026-10-27 用户要求：开关机只认斜杠指令，中文口语一律不启动机器
     //（「开始开发」「开机」「开发」等口语词已移除，发了会被当成 shell 命令）
     aliases: [],
-    desc: "开机（30 秒后确认结果）",
+    desc: "Boot the dev machine (result in ~30s)",
     detail: [
-      "开机，并在启动完成后主动告诉你结果。",
-      "机器关机 / 启动中都可以发，重复发不会重复创建。",
-      "启动中的每一轮检查都在后台跑，最多等 2.5 分钟。",
-      "只有 /boot 和「单独发验证词」能开机；中文口语（开始开发 / 开机）已停用。",
+      "Boot the dev machine; I'll report once it's up.",
+      "Safe to send while shutdown / starting; repeated sends won't create duplicates.",
+      "Each startup check runs in the background, up to 2.5 minutes total.",
+      "Only /boot and the bare passphrase can boot; Chinese phrases no longer start the machine.",
     ],
-    group: "开发机",
+    group: "Machine",
     touch: true,
     menu: true,
   },
@@ -48,55 +48,56 @@ export const COMMANDS: CommandSpec[] = [
     name: "halt",
     // 同上：关机只认 /halt
     aliases: [],
-    desc: "关机（省免费额度）",
+    desc: "Shut down the dev machine (save quota)",
     detail: [
-      "关掉开发机，约 40 秒内完成（幂等，重复发不会报错）。",
-      "同时结掉本轮运行时长，可用 /usage 查看本月累计。",
-      "关机后 shell 会断开，再发命令会提示「未连接」。",
-      "只有 /halt 能关机：中文口语（停止开发 / 关机）已停用。",
+      "Shut down the dev machine, done in ~40s (idempotent, repeats are no-ops).",
+      "Closes this session's runtime; see /usage for the monthly total.",
+      "After shutdown the shell drops; further commands will say 'not connected'.",
+      "Only /halt shuts down; Chinese phrases no longer work.",
     ],
-    group: "开发机",
+    group: "Machine",
     touch: true,
     menu: true,
   },
   {
     name: "cs",
-    aliases: ["开发机状态", "状态"],
-    desc: "机器状态 + shell 通道",
+    aliases: ["status"],
+    desc: "Machine status + shell channel",
     detail: [
-      "查询开发机是否在运行，并附带 shell 通道是否已连上。",
-      "「运行中」但 shell 未连接时，等 10~30 秒再发命令。",
+      "Check whether the dev machine is running and the shell channel is connected.",
+      "If running but shell not connected, wait 10-30s and try again.",
     ],
-    group: "开发机",
+    group: "Machine",
     touch: true,
     menu: true,
   },
   {
     name: "usage",
-    aliases: ["用量", "额度"],
-    desc: "本月运行时长 / 免费额度",
-    detail: ["本月累计运行时长与免费额度对比，避免超额。"],
-    group: "开发机",
+    aliases: ["quota"],
+    desc: "This month's runtime vs free allowance",
+    detail: ["Monthly runtime total vs free allowance, so you don't go over."],
+    group: "Machine",
     touch: true,
     menu: true,
   },
   {
     name: "gemini",
     aliases: ["gem"],
-    desc: "Gemini 编程会话（自动开机 / 免费模型自动切换）",
+    desc: "Gemini coding session (auto boot / free model chain)",
     detail: [
-      "/gemini —— 打开会话：机器关了自动开机，没装自动装，然后直接发问题即可。",
-      "/gemini <问题> —— 只问一次，不进入会话模式。",
-      "/gemini off —— 退出会话模式，回到「发文字 = shell 命令」。",
-      "/gemini new —— 开新会话（清掉 -r latest 续用标记）。",
-      "/gemini model <名字> —— 固定某个模型；/gemini model auto 回到自动链。",
-      "/gemini models —— 列出账号可见的模型（✅ = 已在自动链里）。",
-      "/gemini status —— 查 CLI 安装 / 认证 / 模型链 / 会话状态。",
+      "/gemini — open a session: boots the machine if off, installs the CLI if missing, then just ask away.",
+      "/gemini <question> — one-shot question, no session mode.",
+      "/gemini off — leave session mode, back to 'text = shell command'.",
+      "/gemini new — start a fresh session (clears the -r latest marker).",
+      "/gemini model <name> — pin a model; /gemini model auto returns to the chain.",
+      "/gemini models — list models visible to this account (✅ = in the free chain).",
+      "/gemini status — check CLI install / auth / model chain / session.",
       "",
-      "默认按「免费模型链」自动切换：某个模型配额用尽（429）、过载（503）或下线（404）时，",
-      "自动换下一个并把成功那个记住，下一条从它开始。固定模型后不再自动切换。",
-      "会话模式下：直接发文字 = 问 Gemini；行首加 ! = 仍然执行 shell 命令。",
-      "Gemini 以 --approval-mode=yolo 运行：能直接改文件、跑命令（无人值守没法按 y）。",
+      "By default it rotates a free-model chain: on quota exhaustion (429), overload (503) or",
+      "retirement (404) it moves to the next one and remembers the winner for next time.",
+      "Pinning a model disables the rotation.",
+      "In session mode: plain text = ask Gemini; a leading ! still runs a shell command.",
+      "Runs with --approval-mode=yolo: it can edit files and run commands (nobody to press y).",
     ],
     group: "Gemini",
     touch: true,
@@ -105,24 +106,24 @@ export const COMMANDS: CommandSpec[] = [
   {
     name: "buddy",
     aliases: ["cb"],
-    desc: "CodeBuddy 编程会话（固定 codebuddy 目录 / 浏览器登录态）",
+    desc: "CodeBuddy coding session (fixed dir / browser OAuth login)",
     detail: [
-      "/buddy —— 打开会话：机器关了自动开机、没装自动装，之后直接发问题即可。",
-      "/buddy <问题> —— 只问一次，不进入会话模式。",
-      "/buddy off —— 退出会话模式，回到「发文字 = shell 命令」。",
-      "/buddy new —— 开新会话（清掉 -c 续用标记）。",
-      "/buddy model <名字> —— 固定模型；/buddy model auto 回到免费链。",
-      "/buddy models —— 列出 CLI 支持的模型（✅ = 已在免费链里）。",
-      "/buddy status —— 查 CLI 安装 / 工作目录 / 信任状态 / 会话状态。",
+      "/buddy — open a session: boots the machine if off, installs the CLI if missing, then just ask away.",
+      "/buddy <question> — one-shot question, no session mode.",
+      "/buddy off — leave session mode, back to 'text = shell command'.",
+      "/buddy new — start a fresh session (clears the -c marker).",
+      "/buddy model <name> — pin a model; /buddy model auto returns to the free chain.",
+      "/buddy models — list CLI models (✅ = in the free chain).",
+      "/buddy status — check CLI install / workdir / trust / session.",
       "",
-      "默认按「免费额度优先链」自动降级：当前模型不可用（过载/额度）时，",
-      "先由 CLI 原生 --fallback-model 单跳切换，不够再沿链换下一个（flash 系优先）。",
-      "上次成功的模型会记住并提到链头；固定模型后不再自动切换。",
-      "工作目录固定为 /workspaces/codebuddy，并已 pre-trust（不会卡在「信任此文件夹」）。",
-      "认证走 CodeBuddy 自己的浏览器 OAuth（登录态在 ~/.codebuddy），不需要 API key；",
-      "登录失效时 headless 会直接报鉴权错误 —— 到 codespace 终端手动跑一次 codebuddy 重新授权。",
-      "以 -y 运行（跳过权限确认）：能直接改文件、跑命令（无人值守没法按 y）。",
-      "会话模式下：直接发文字 = 问 CodeBuddy；行首加 ! = 仍然执行 shell 命令。",
+      "By default it walks a free-quota-first chain: if the current model is unavailable (overloaded /",
+      "out of quota), the CLI's own --fallback-model handles one hop, then the chain moves on (flash first).",
+      "The last working model is remembered and moved to the front; pinning disables rotation.",
+      "Workdir is fixed to /workspaces/codebuddy and pre-trusted (never stuck on a trust prompt).",
+      "Auth is CodeBuddy's own browser OAuth (state in ~/.codebuddy), no API key needed;",
+      "when it expires, headless calls fail with an auth error — rerun codebuddy once in the codespace terminal.",
+      "Runs with -y (skip permission prompts): it can edit files and run commands (nobody to press y).",
+      "In session mode: plain text = ask CodeBuddy; a leading ! still runs a shell command.",
     ],
     group: "CodeBuddy",
     touch: true,
@@ -130,50 +131,50 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: "ctrlc",
-    aliases: ["中断", "停止命令"],
-    desc: "中断当前命令（Ctrl-C），并清空卡住的队列",
+    aliases: ["stop", "kill"],
+    desc: "Interrupt the running command (Ctrl-C) and clear the queue",
     detail: [
-      "给开发机里前台运行的命令发 Ctrl-C，并清掉本地排队的命令。",
-      "命令卡住、输出刷屏、误跑了 sleep 等，用它逃生。",
-      "清完队列后仍可继续发命令；若进程连中断都不理，再发 /halt 关机。",
+      "Sends Ctrl-C to the foreground command and drops everything queued locally.",
+      "Escape hatch for stuck commands, runaway output, an accidental sleep, etc.",
+      "You can keep sending commands after; if the process ignores even this, /halt.",
     ],
-    group: "联机 shell",
+    group: "Shell",
     menu: true,
   },
   {
     name: "verify",
-    aliases: ["验证"],
-    desc: "验证挑战开关（/verify 看状态；on / off 开关）",
+    aliases: ["gate"],
+    desc: "Verification gate (status; on / off)",
     detail: [
-      "/verify —— 查看当前状态：挑战开/关、本次会话何时过期。",
-      "/verify on —— 开启验证挑战（默认）：闲置 10 分钟后要回答验证词。",
-      "/verify off —— 关闭验证挑战：白名单账号的消息直达，不再要验证词。",
+      "/verify — show current state: gate open/closed, when this session expires.",
+      "/verify on — enable the challenge (default): after 10 min idle you must re-answer.",
+      "/verify off — disable it: whitelisted messages go straight through, no passphrase.",
       "",
-      "off 是安全降级开关（自己的选择）：关掉期间任何登录该账号的设备都能用全部功能。",
-      "重新 on 会立即恢复挑战（关闭期间的会话作废，下一条消息重新验证）。",
-      "只影响本 chat 的验证挑战；账号白名单（ALLOWED_USERS）始终生效。",
+      "off is a security downgrade (your call): while off, any device logged into this account has full access.",
+      "Turning it back on re-arms immediately (sessions from the off period are void).",
+      "Only affects this chat's challenge; the account whitelist (ALLOWED_USERS) always applies.",
     ],
-    group: "其它",
+    group: "Other",
     menu: true,
   },
   {
     name: "help",
-    aliases: ["帮助", "?", "？", "commands", "menu"],
-    desc: "指令表；/help <指令> 看细节",
+    aliases: ["?", "？", "commands", "menu"],
+    desc: "Command list; /help <cmd> for details",
     detail: [
-      "不带参数：列出全部指令。",
-      "带参数：看某条指令的详细说明，例如 /help boot。",
-      "除了这些指令，直接发文字就是在开发机里执行命令。",
+      "No argument: the full command list.",
+      "With an argument: details for one command, e.g. /help boot.",
+      "Anything else you type is run as a command on the dev machine.",
     ],
-    group: "其它",
+    group: "Other",
     menu: true,
   },
   {
     name: "diag",
-    aliases: ["诊断"],
-    desc: "诊断信息（排查用）",
-    detail: ["输出 build 版本、通道、shell 状态等排查信息。"],
-    group: "其它",
+    aliases: [],
+    desc: "Diagnostics (troubleshooting)",
+    detail: ["Prints build version, channel, shell state and other troubleshooting info."],
+    group: "Other",
     menu: true,
   },
 ];
@@ -282,38 +283,38 @@ function levenshtein(a: string, b: string): number {
   return prev[n];
 }
 
-const GROUP_ORDER: CommandGroup[] = ["开发机", "Gemini", "CodeBuddy", "联机 shell", "其它"];
+const GROUP_ORDER: CommandGroup[] = ["Machine", "Gemini", "CodeBuddy", "Shell", "Other"];
 const GROUP_ICON: Record<CommandGroup, string> = {
-  开发机: "🖥",
+  Machine: "🖥",
   Gemini: "🤖",
   CodeBuddy: "🧩",
-  "联机 shell": "⌨️",
-  其它: "🔐",
+  Shell: "⌨️",
+  Other: "🔐",
 };
 
 /** 完整指令表（/help 无参数时发这个）。 */
 export function renderHelp(): string {
-  const lines: string[] = ["📖 devbot 指令", ""];
+  const lines: string[] = ["📖 devbot commands", ""];
   for (const g of GROUP_ORDER) {
     const specs = COMMANDS.filter((c) => c.group === g);
     if (specs.length === 0) continue;
     lines.push(`${GROUP_ICON[g]} ${g}`);
     for (const c of specs) {
-      const alias = c.aliases[0] ? `（${c.aliases[0]}）` : "";
+      const alias = c.aliases[0] ? ` (${c.aliases[0]})` : "";
       lines.push(`  /${c.name}${alias} — ${c.desc}`);
     }
     lines.push("");
   }
-  lines.push("直接发文字 = 在开发机里执行命令");
-  lines.push("（长驻 bash：cd / export / 后台进程都会保留）");
+  lines.push("Plain text = run a command on the dev machine");
+  lines.push("(persistent bash: cd / env vars / background jobs survive)");
   lines.push("");
-  lines.push("单独发验证词 = 开机口令（机器在跑就只回一句确认）；");
-  lines.push("会话过期会先要验证词，通过后 10 分钟内互动免验证；");
-  lines.push("（10 分钟不说话就失效，下一条消息要重新验证）");
-  lines.push("验证前发的那条命令会自动补执行，不用重发。");
-  lines.push("不想被反复要验证词：/verify off 关掉挑战（/verify on 恢复）。");
+  lines.push("The bare passphrase = boot phrase (just a confirmation if it's running);");
+  lines.push("an expired session asks for the passphrase first, then it's good for 10 min");
+  lines.push("of interaction (10 min silent = expired, next message re-verifies).");
+  lines.push("A command sent before verifying is remembered and auto-run after.");
+  lines.push("Tired of re-verifying? /verify off disables the gate (/verify on re-arms).");
   lines.push("");
-  lines.push("细节看 /help <指令>，例如 /help boot");
+  lines.push("Details: /help <command>, e.g. /help boot");
   return lines.join("\n");
 }
 
@@ -325,7 +326,7 @@ export function renderCommandHelp(nameOrAlias: string): string | null {
   );
   if (!spec) return null;
   const lines = [`/${spec.name} — ${spec.desc}`, "", ...spec.detail];
-  if (spec.aliases.length) lines.push("", `别名：${spec.aliases.join(" / ")}`);
+  if (spec.aliases.length) lines.push("", `Aliases: ${spec.aliases.join(" / ")}`);
   return lines.join("\n");
 }
 

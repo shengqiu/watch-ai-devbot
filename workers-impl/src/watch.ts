@@ -190,12 +190,12 @@ export function evalWatch(w: WatchInput): WatchDecision {
     const later = Math.max(0, w.autostopMin - idleMin);
     // GH 侧活跃时不承诺自动关机会不会执行——它会被无限推迟，说了不算
     const tail = ghFresh
-      ? `看起来你还在别处（VS Code／网页／SSH）干活，先不打扰。不用了记得发 /halt 省额度。`
+      ? `Looks like you're working elsewhere (VS Code / web / SSH), so I won't bug you. Send /halt when done to save quota.`
       : w.botStarted && w.autostopEnabled
-        ? `再不理我就自动关机（约 ${fmtDur(later)}后）。在干活就随便回我一个字。`
-        : `不用了就发 /halt，我帮你关机省额度。`;
+        ? `Radio silence and I'll auto-stop in ~${fmtDur(later)}. Reply anything if you're still working.`
+        : `Send /halt if you're done and I'll shut it down to save quota.`;
     return {
-      notify: `⏰ 开发机已运行 ${fmtDur(runMin)}，你已 ${fmtDur(idleMin)} 没和我说过话。\n` + tail,
+      notify: `⏰ Dev machine has been up ${fmtDur(runMin)}; you've been quiet for ${fmtDur(idleMin)}.\n` + tail,
       stop: false,
       nextCheck: active + w.autostopMin * MIN,
       markReminded: true,
@@ -220,9 +220,9 @@ export function evalWatch(w: WatchInput): WatchDecision {
       if (!w.capNotified) {
         return {
           notify:
-            `⚠️ 开发机显示「持续活跃」已 ${fmtDur(freshMin)}，但你 ${fmtDur(idleMin)} 没和我说过话。\n` +
-            `这很像 dev server 在刷日志给 GitHub 的活跃信号续命（人已离开但机器一直计费）。\n` +
-            `${fmtDur(w.graceMin)}后我会强制关机；在干活就随便回我一个字，立刻取消。`,
+            `⚠️ GitHub shows 'continuously active' for ${fmtDur(freshMin)}, but you've been quiet for ${fmtDur(idleMin)}.\n` +
+            `This smells like a dev server logging away and keeping the machine billed while you're gone.\n` +
+            `I'll force-stop in ${fmtDur(w.graceMin)}; reply anything if you're actually working and it cancels instantly.`,
           stop: false,
           nextCheck: w.now + Math.max(1, w.graceMin) * MIN,
           markReminded: true,
@@ -236,8 +236,8 @@ export function evalWatch(w: WatchInput): WatchDecision {
       if (waited >= w.graceMin) {
         return {
           notify:
-            `🛑 疑似闲置：GH 显示活跃但你 ${fmtDur(idleMin)} 无互动，已过 ${fmtDur(w.graceMin)} 宽限期，强制关机` +
-            `（本轮共运行 ${fmtDur(runMin)}）。需要时发 /boot 重新开机。`,
+            `🛑 Presumed idle: GitHub shows activity but you've been silent for ${fmtDur(idleMin)}; the ${fmtDur(w.graceMin)} grace period is over, so I'm force-stopping ` +
+            `(this window ran ${fmtDur(runMin)}). Send /boot when you need it again.`,
           stop: true,
           nextCheck: null,
           markReminded: false,
@@ -262,9 +262,9 @@ export function evalWatch(w: WatchInput): WatchDecision {
     if (capHit && !w.capNotified) {
       return {
         notify:
-          `⚠️ 开发机显示「持续活跃」已 ${fmtDur(freshMin)}，但你 ${fmtDur(idleMin)} 没和我说过话` +
-          `（疑似 dev server 刷日志在给 GitHub 的活跃信号续命）。\n` +
-          `当前为「只提醒、不自动关机」模式，我不会动手；不用了请发 /halt 省额度。`,
+          `⚠️ GitHub shows 'continuously active' for ${fmtDur(freshMin)}, but you've been quiet for ${fmtDur(idleMin)}` +
+          `(likely a dev server logging away and keeping the activity signal alive).\n` +
+          `Currently in notify-only mode, so I won't act; send /halt when done to save quota.`,
         stop: false,
         nextCheck: w.now + 60 * MIN,
         markReminded: true,
@@ -289,7 +289,7 @@ export function evalWatch(w: WatchInput): WatchDecision {
   // 4) 双信号都空闲 → 重置 GH 追踪，执行关机策略
   if (w.botStarted && w.autostopEnabled) {
     return {
-      notify: `🛑 闲置超时：已 ${fmtDur(idleMin)} 无互动，自动关机（本轮共运行 ${fmtDur(runMin)}）。需要时发 /boot 重新开机。`,
+      notify: `🛑 Idle timeout: ${fmtDur(idleMin)} without interaction, auto-stopping (this window ran ${fmtDur(runMin)}). Send /boot when you need it again.`,
       stop: true,
       nextCheck: null,
       markReminded: false,
@@ -313,10 +313,10 @@ export function evalWatch(w: WatchInput): WatchDecision {
   }
   return {
     notify:
-      `⏰ 开发机已闲置 ${fmtDur(idleMin)}（本轮运行 ${fmtDur(runMin)}），仍在运行。\n` +
+      `⏰ Dev machine idle for ${fmtDur(idleMin)} (this window: ${fmtDur(runMin)}), still running.\n` +
       (w.autostopEnabled
-        ? `这轮不是通过我开的机，我不敢自动关。不用了请发 /halt。`
-        : `自动关机未启用。不用了请发 /halt。`),
+        ? `This window wasn't started by me, so I won't auto-stop it. Send /halt when done.`
+        : `Auto-stop is disabled. Send /halt when done.`),
     stop: false,
     nextCheck: w.now + 120 * MIN, // 2 小时静默期后再提醒
     markReminded: true,
@@ -331,9 +331,9 @@ export function fmtDur(minutes: number): string {
   const m = Math.max(0, Math.round(minutes));
   const h = Math.floor(m / 60);
   const r = m % 60;
-  if (h === 0) return `${r}分钟`;
-  if (r === 0) return `${h}小时`;
-  return `${h}小时${r}分`;
+  if (h === 0) return `${r}m`;
+  if (r === 0) return `${h}h`;
+  return `${h}h${r}m`;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,13 +417,13 @@ export function evalShellAlert(s: ShellAlertInput): ShellAlertDecision {
 
 function shellAlertText(offMin: number, repeat: boolean): string {
   const head = repeat
-    ? `🔁 shell 仍未连上（已断开 ${fmtDur(offMin)}）`
-    : `⚠️ shell 通道断开：开发机在运行，但里面的 agent 已 ${fmtDur(offMin)} 没心跳`;
+    ? `🔁 Shell still not connected (down for ${fmtDur(offMin)})`
+    : `⚠️ Shell channel down: the machine is running but its agent hasn't pinged in ${fmtDur(offMin)}.`;
   return (
     `${head}\n` +
-    `这个状态下我收不到命令回包，表现就是「发命令没反应」。\n` +
-    `常见原因：agent 进程崩了、机器刚从休眠恢复、或 Worker 刚重载（重载后会自动重连）。\n` +
-    `先发 /cs 看状态；确认一直连不上就 /halt 再 /boot 重启一轮（未提交的工作会丢，先确认）。`
+    `In this state command replies never arrive; it looks like 'commands do nothing'.\n` +
+    `Common causes: the agent crashed, the machine just woke up, or the Worker reloaded (it reconnects on its own).\n` +
+    `Check /cs first; if it stays down, /halt then /boot (unsaved work will be lost, double-check first).`
   );
 }
 

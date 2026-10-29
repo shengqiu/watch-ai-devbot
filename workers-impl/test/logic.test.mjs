@@ -200,10 +200,10 @@ import {
 } from "../src/codespace.js";
 
 // 状态中文化
-check("state Available", describeState("Available"), "运行中");
-check("state Shutdown", describeState("Shutdown"), "已关机");
-check("state Provisioning", describeState("Provisioning"), "启动中");
-check("state ShuttingDown", describeState("ShuttingDown"), "正在关机");
+check("state Available", describeState("Available"), "running");
+check("state Shutdown", describeState("Shutdown"), "shut down");
+check("state Provisioning", describeState("Provisioning"), "starting");
+check("state ShuttingDown", describeState("ShuttingDown"), "shutting down");
 
 // 假 client：注入状态序列与调用记录
 function fakeClient(states, calls = []) {
@@ -224,7 +224,7 @@ function fakeClient(states, calls = []) {
 {
   const c = fakeClient(["Available"]);
   const p1 = await beginBoot(c);
-  check("已开机 reply", p1.reply, "开发机已在运行中 ✓");
+  check("已开机 reply", p1.reply, "Dev machine already running ✓");
   check("已开机不安排二查", p1.scheduleCheck, false);
   check("已开机不 start", c.calls.join(","), "status");
 }
@@ -233,7 +233,7 @@ function fakeClient(states, calls = []) {
 {
   const c = fakeClient(["Shutdown"]);
   const p1 = await beginBoot(c);
-  check("开机阶段1 reply", p1.reply.includes("正在启动"), true);
+  check("开机阶段1 reply", p1.reply.includes("starting"), true);
   check("开机阶段1 安排二查", p1.scheduleCheck, true);
   check("开机阶段1 调用序列", c.calls.join(","), "status,start");
 }
@@ -244,14 +244,14 @@ function fakeClient(states, calls = []) {
   const r = await checkBoot(c);
   check("二查成功 ok", r.ok, true);
   check("二查成功 pending", r.pending, false);
-  check("二查成功 reply", r.reply.includes("启动成功"), true);
+  check("二查成功 reply", r.reply.includes("is up"), true);
 }
 
 // 阶段2：仍 Shutdown → 失败
 {
   const c = fakeClient(["Shutdown"]);
   const r = await checkBoot(c);
-  check("二查失败提示", r.reply.includes("开机失败"), true);
+  check("二查失败提示", r.reply.includes("Boot failed"), true);
   check("二查失败 pending", r.pending, false);
 }
 
@@ -270,23 +270,23 @@ for (const st of ["Provisioning", "Queued", "Creating", "ProvisioningWithWarning
   const p1 = await beginBoot(c);
   check("启动中不重复 start", c.calls.join(","), "status");
   check("启动中仍安排二查", p1.scheduleCheck, true);
-  check("启动中文案含「我会告诉你」", p1.reply.includes("我会告诉你"), true);
+  check("启动中文案含「我会告诉你」", p1.reply.includes("I'll report once it's up"), true);
 }
 
 // 超时收尾文案
-check("超时文案", bootTimeoutReply().includes("2.5 分钟"), true);
+check("超时文案", bootTimeoutReply().includes("2.5 min"), true);
 
 // 阶段2：查询异常 → 手动确认提示
 {
   const c = fakeClient(["ERR"]);
-  check("二查异常提示", (await checkBoot(c)).reply.includes("手动确认"), true);
+  check("二查异常提示", (await checkBoot(c)).reply.includes("check /cs manually"), true);
 }
 
 // 首查异常 → 单跳失败，不安排二查
 {
   const c = fakeClient(["ERR"]);
   const p1 = await beginBoot(c);
-  check("首查失败含错误", p1.reply.includes("查询 codespace 状态失败"), true);
+  check("首查失败含错误", p1.reply.includes("Failed to query codespace state"), true);
   check("首查失败不安排二查", p1.scheduleCheck, false);
 }
 
@@ -299,19 +299,19 @@ check("超时文案", bootTimeoutReply().includes("2.5 分钟"), true);
     async stop() { return "ShuttingDown"; },
   };
   const p1 = await beginBoot(c);
-  check("start 失败提示", p1.reply.includes("启动请求失败"), true);
+  check("start 失败提示", p1.reply.includes("Boot request failed"), true);
   check("start 失败不安排二查", p1.scheduleCheck, false);
 }
 
 // 停机：运行中 → stop；已关机 → 幂等
 {
   const c = fakeClient(["Available"]);
-  check("停机调用 stop", (await stopCodespace(c)).includes("停机指令"), true);
+  check("停机调用 stop", (await stopCodespace(c)).includes("Stop requested"), true);
   check("停机调用序列", c.calls.join(","), "status,stop");
 }
 {
   const c = fakeClient(["Shutdown"]);
-  check("已关机幂等", (await stopCodespace(c)).includes("已经是关机"), true);
+  check("已关机幂等", (await stopCodespace(c)).includes("already shut down"), true);
 }
 
 // ---- 身份验证会话（verify.ts）----
@@ -368,7 +368,7 @@ check("归一化保留中间标点", normalizeAnswer("爸。爸"), "爸。爸");
   check("未配置验证词时老会话仍有效", isVerified({ exp: future, fp: "" }, T0, ""), true);
 }
 check("续期计算", nextExpiry(T0, HALF_H), T0 + HALF_H);
-check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
+check("挑战文案", CHALLENGE_TEXT.includes("who you are"), true);
 
 // ---- 会话窗口 = 10 分钟（2026-10-28 用户要求「严格的 10 分钟不交互就验证」）----
 {
@@ -411,7 +411,7 @@ check("挑战文案", CHALLENGE_TEXT.includes("我要知道你是谁"), true);
   check("像命令 git status", looksLikeCommand("git status"), true);
   check("像命令 cd /tmp", looksLikeCommand("cd /tmp"), true);
   check("像命令 开始开发（已非指令）", looksLikeCommand("开始开发"), false);
-  check("像命令 开发机状态", looksLikeCommand("开发机状态"), true);
+  check("像命令 status", looksLikeCommand("status"), true);
   check("像命令 /boot", looksLikeCommand("/boot"), true);
   check("不像命令 你好", looksLikeCommand("你好"), false);
   check("不像命令 爸爸", looksLikeCommand("爸爸"), false);
@@ -498,7 +498,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
 // 提醒窗口：首次 → 发提醒 + 标记
 {
   const d = evalWatch(W({ now: 10_000_000 + 30 * MIN }));
-  check("30min：发提醒", d.notify !== null && d.notify.includes("没和我说过话"), true);
+  check("30min：发提醒", d.notify !== null && d.notify.includes("quiet for"), true);
   check("30min：标记已提醒", d.markReminded, true);
   check("30min：不关机", d.stop, false);
   check("30min：排到 autostop 点", d.nextCheck, 10_000_000 + 55 * MIN);
@@ -515,7 +515,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
 {
   const d = evalWatch(W({ now: 10_000_000 + 60 * MIN }));
   check("60min：自动关机", d.stop, true);
-  check("60min：通知含说明", d.notify !== null && d.notify.includes("自动关机"), true);
+  check("60min：通知含说明", d.notify !== null && d.notify.includes("auto-stop"), true);
   check("60min：不再排程", d.nextCheck, null);
 }
 
@@ -523,7 +523,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
 {
   const d = evalWatch(W({ now: 10_000_000 + 60 * MIN, botStarted: false }));
   check("observed：不自动关", d.stop, false);
-  check("observed：升级提醒", d.notify !== null && d.notify.includes("不敢自动关"), true);
+  check("observed：升级提醒", d.notify !== null && d.notify.includes("won't auto-stop"), true);
   check("observed：2h 静默复查", d.nextCheck, 10_000_000 + 60 * MIN + 120 * MIN);
 }
 
@@ -580,7 +580,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
     ghFreshSince: 10_000_000 + 60 * MIN,
     reminded: true,
   }));
-  check("cap：reminded 不阻塞上限警告", d.notify !== null && d.notify.includes("持续活跃"), true);
+  check("cap：reminded 不阻塞上限警告", d.notify !== null && d.notify.includes("continuously active"), true);
   check("cap：警告阶段不关机", d.stop, false);
   check("cap：标记 capNotified", d.capNotified, true);
   check("cap：记录警告时刻", d.capNotifiedAt, 10_000_000 + 180 * MIN);
@@ -620,7 +620,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
     ghFreshSince: 10_000_000 + 60 * MIN,
     ghCapAction: "notify",
   }));
-  check("cap：notify 模式提醒", d.notify !== null && d.notify.includes("持续活跃"), true);
+  check("cap：notify 模式提醒", d.notify !== null && d.notify.includes("continuously active"), true);
   check("cap：notify 模式永不关机", d.stop, false);
   check("cap：notify 模式标记", d.capNotified, true);
 }
@@ -645,7 +645,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
     ghFreshSince: 10_000_000 + 60 * MIN,
     autostopEnabled: false,
   }));
-  check("cap：autostop 关 → 只提醒", d.notify !== null && d.notify.includes("只提醒"), true);
+  check("cap：autostop 关 → 只提醒", d.notify !== null && d.notify.includes("notify-only"), true);
   check("cap：autostop 关 → 不关机", d.stop, false);
 }
 {
@@ -677,7 +677,7 @@ check("关机：不动作", evalWatch(W({ running: false })), {
 // 运行时长文案含本轮信息
 {
   const d = evalWatch(W({ now: 10_000_000 + 30 * MIN, bootAt: 10_000_000 - 10 * MIN }));
-  check("提醒含运行时长", d.notify !== null && d.notify.includes("40分钟"), true);
+  check("提醒含运行时长", d.notify !== null && d.notify.includes("40m"), true);
 }
 
 // ---- 联机 shell（shell.ts：输出清洗 / 分块 / marker 解析 / 队列）----
@@ -706,7 +706,7 @@ const {
   check("capOutput 不截断", capOutput("abc", 10), "abc");
   {
     const capped = capOutput("x".repeat(100), 20);
-    check("capOutput 含省略标记", capped.includes("省略"), true);
+    check("capOutput 含省略标记", capped.includes("omitted"), true);
     check("capOutput 保留尾", capped.endsWith("x".repeat(8)), true);
   }
 
@@ -720,7 +720,7 @@ const {
   // 兜底仍在：真超过上限时还是掐头尾（防内存失控），不是悄悄丢
   {
     const capped = capOutput("y".repeat(2_500_000), 2_000_000);
-    check("超 200 万仍有省略标记", capped.includes("省略"), true);
+    check("超 200 万仍有省略标记", capped.includes("omitted"), true);
     check("超 200 万保留头", capped.startsWith("yyy"), true);
   }
   // 大输出分块：4096 物理上限下应该拆成多条，且内容不丢
@@ -762,9 +762,9 @@ const {
   check("verify 已注册", Boolean(verifySpec), true);
   check("verify 进 Telegram 菜单", menuCommands().some((m) => m.command === "verify"), true);
   check("/verify 能被匹配", matchCommand("/verify").spec.name, "verify");
-  check("verify 中文别名能匹配", matchCommand("/验证").spec.name, "verify");
+  check("/verify alias gate 能匹配", matchCommand("/gate").spec.name, "verify");
   check("/verify off 有细节", (renderCommandHelp("verify") ?? "").includes("off"), true);
-  check("verify 帮助写明安全降级", (renderCommandHelp("verify") ?? "").includes("降级"), true);
+  check("verify 帮助写明安全降级", (renderCommandHelp("verify") ?? "").includes("security downgrade"), true);
   check("总帮助列出 /verify", renderHelp().includes("/verify"), true);
   check("总帮助提到 verify 开关", renderHelp().includes("/verify off"), true);
   // verify 不算终端互动（touch 未设）：开关验证不该续命看门狗（纯配置操作）
@@ -838,7 +838,7 @@ const {
   hub2.attach({ enqueue: () => {} });
   const q2 = hub2.enqueue("c1", "yes");
   await hub2.onOutput({ id: q2.id, text: "z".repeat(500), done: true, exit: 0, cwd: "/tmp" });
-  check("超长输出被掐断", sent2.join("").includes("截断"), true);
+  check("超长输出被掐断", sent2.join("").includes("omitted"), true);
 }
 
 // ---- ShellHub 心跳：tick 能恢复在线 ----
@@ -880,7 +880,7 @@ const {
   check("没 ack → 自动重发", frames(), 2);
   await sleep(300); // 30ms → 60ms → 120ms 递增，第 3 次后放弃
   check("重发到上限后解锁", hub.pending(), 0);
-  check("解锁时说明了原因", sent.join("").includes("自动解锁"), true);
+  check("解锁时说明了原因", sent.join("").includes("Auto-unlocked"), true);
   check("解锁提示带命令名", sent.join("").includes("准备 Gemini 环境"), true);
   void q;
 }
@@ -919,21 +919,21 @@ const {
   hub.onPing({ epoch: 201, running: null });
   await new Promise((r) => setTimeout(r, 20));
   check("epoch 变化 → 立刻解锁", hub.pending(), 0);
-  check("说明是 agent 重启导致", sent.join("").includes("agent 重启过"), true);
+  check("说明是 agent 重启导致", sent.join("").includes("agent restarted"), true);
 }
 
 // ---- ShellHub：心跳带 proc 字段 → snapshot/procLine 能答「进程在干什么」----
 {
   const hub = new ShellHub(async () => {}, { staleMs: 600000 });
   hub.attach({ enqueue: () => {} });
-  check("没在跑：procLine 说没有命令", hub.procLine(), "（当前没有命令在跑）");
+  check("没在跑：procLine 说没有命令", hub.procLine(), "(no command running)");
   hub.onPing({ epoch: 300, running: null, proc: null });
   const q = hub.enqueue("c1", "ls");
   hub.onPing({ epoch: 300, running: q.id, proc: "codebuddy[84] S 睡眠（等 IO/网络，正常） · CPU 3.4s" });
   check("proc 报上来", hub.snapshot().proc, "codebuddy[84] S 睡眠（等 IO/网络，正常） · CPU 3.4s");
   check("procLine 用心跳里的", hub.procLine(), "codebuddy[84] S 睡眠（等 IO/网络，正常） · CPU 3.4s");
   hub.onPing({ epoch: 300, running: q.id, proc: null });
-  check("心跳有 proc 字段但为空 → 报「刚启动」而不是「版本太老」", hub.procLine(), "（agent 未报告，可能刚启动）");
+  check("心跳有 proc 字段但为空 → 报「刚启动」而不是「版本太老」", hub.procLine(), "(agent did not report; probably just started)");
 }
 
 // ---- ShellHub：老 agent 不发 proc → 明确提示要升级，而不是含糊的「未知」----
@@ -943,7 +943,7 @@ const {
   hub.onPing({ epoch: 400, running: null });
   const q = hub.enqueue("c1", "ls");
   hub.onPing({ epoch: 400, running: q.id }); // 老 agent：只报 running
-  check("老 agent → 提示升级", hub.procLine(), "进程状态未知（agent 版本太老，需 git pull）");
+  check("老 agent → 提示升级", hub.procLine(), "process state unknown (agent too old; git pull on the machine)");
 }
 
 // ---- ShellHub：幽灵输出 —— 命令登记被清了，但输出还在来 → 至少说一声 ----
@@ -961,7 +961,7 @@ const {
   check("被清理了", hub.pending(), 0);
   // 迟到的输出包：以前直接 return（黑洞），现在要通知到人
   await hub.onOutput({ id: q.id, text: "partial result..." });
-  check("幽灵输出 → 通知到人", sent.some((t) => t.includes("可能还在跑")), true);
+  check("幽灵输出 → 通知到人", sent.some((t) => t.includes("may still be running")), true);
   // 重复的幽灵包只通知一次，不轰炸
   const n = sent.length;
   await hub.onOutput({ id: q.id, text: "more output" });
@@ -997,7 +997,7 @@ const {
   check("失联命令不再阻塞", next.ok, true);
   check("新命令已下发", hub.pending(), 1);
   await sleep(20);
-  check("告知用户已解锁", sent.join("").includes("自动解锁"), true);
+  check("告知用户已解锁", sent.join("").includes("Auto-unlocked"), true);
 }
 
 // ---- ShellHub：SSE 断开时保留「已送达」的命令（bash 里还在跑）----
@@ -1027,10 +1027,10 @@ const {
 }
 
 
-check("fmtDur 0", fmtDur(0), "0分钟");
-check("fmtDur 59", fmtDur(59), "59分钟");
-check("fmtDur 60", fmtDur(60), "1小时");
-check("fmtDur 155", fmtDur(155), "2小时35分");
+check("fmtDur 0", fmtDur(0), "0m");
+check("fmtDur 59", fmtDur(59), "59m");
+check("fmtDur 60", fmtDur(60), "1h");
+check("fmtDur 155", fmtDur(155), "2h35m");
 
 // ---- alarm 队列 ----
 {
@@ -1099,7 +1099,8 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("cmd 开机（已停用）", matchCommand("开机"), null);
   check("cmd 关机（已停用）", matchCommand("关机"), null);
   check("cmd 停止开发（已停用）", matchCommand("停止开发"), null);
-  check("cmd 帮助", matchCommand("帮助")?.spec.name, "help");
+  check("cmd 帮助（中文别名已停用）", matchCommand("帮助"), null);
+  check("cmd commands 是 help 别名", matchCommand("commands")?.spec.name, "help");
   // 验证词/开机口令不能撞上任何指令，否则会被指令派发抢走
   check("cmd 验证词不撞指令", matchCommand("哈哈"), null);
   check("cmd /? 符号别名", matchCommand("/?")?.spec.name, "help");
@@ -1128,11 +1129,11 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   // 帮助渲染
   const h = renderHelp();
   check("help 含全部指令", COMMANDS.every((c) => h.includes(`/${c.name}`)), true);
-  check("help 含 shell 说明", h.includes("直接发文字"), true);
+  check("help 含 shell 说明", h.includes("Plain text = run a command"), true);
   check("help 含分组图标", h.includes("🖥") && h.includes("⌨️"), true);
   const one = renderCommandHelp("boot");
-  check("单条帮助无别名则不显示别名行", one.includes("别名"), false);
-  check("单条帮助有别名则显示", renderCommandHelp("help").includes("别名"), true);
+  check("单条帮助无别名则不显示别名行", one.includes("Aliases"), false);
+  check("单条帮助有别名则显示", renderCommandHelp("help").includes("Aliases:"), true);
   check("单条帮助认斜杠别名", renderCommandHelp("/halt")?.includes("/halt"), true);
   check("单条帮助认斜杠", renderCommandHelp("/halt")?.includes("/halt"), true);
   check("单条帮助不存在 → null", renderCommandHelp("nope"), null);
@@ -1867,7 +1868,7 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   const txt = sa({ now: 10 * MIN, offlineSince: 0 }).notify ?? "";
   check("shell: 告警含 /cs 自查提示", txt.includes("/cs"), true);
   check("shell: 告警含 /halt 重启提示", txt.includes("/halt"), true);
-  check("shell: 告警含断线时长", /已\s*\d+(分钟|小时)/.test(txt), true);
+  check("shell: 告警含断线时长", /(hasn't pinged in|down for)\s*\d+m/.test(txt), true);
 }
 
 // ---- /buddy（CodeBuddy CLI，v4.17）----

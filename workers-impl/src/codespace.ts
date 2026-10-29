@@ -85,25 +85,25 @@ export class CodespaceClient {
 export function describeState(state: CodespaceState): string {
   switch (state) {
     case "Available":
-      return "运行中";
+      return "running";
     case "Shutdown":
-      return "已关机";
+      return "shut down";
     case "ShuttingDown":
-      return "正在关机";
+      return "shutting down";
     case "Provisioning":
     case "ProvisioningWithWarning":
     case "Creating":
-      return "启动中";
+      return "starting";
     case "Queued":
-      return "排队中";
+      return "queued";
     case "Rebuilding":
-      return "重建中";
+      return "rebuilding";
     case "Deleted":
-      return "已删除";
+      return "deleted";
     case "Failed":
-      return "启动失败";
+      return "failed to start";
     default:
-      return `未知(${state})`;
+      return `unknown(${state})`;
   }
 }
 
@@ -147,20 +147,20 @@ export async function beginBoot(client: CodespaceClient): Promise<BootPhase1> {
   try {
     st = await client.status();
   } catch (e) {
-    return { reply: `查询 codespace 状态失败：${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
+    return { reply: `Failed to query codespace state: ${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
   }
 
   if (st.state === "Available") {
-    return { reply: "开发机已在运行中 ✓", scheduleCheck: false, wasAvailable: true };
+    return { reply: "Dev machine already running ✓", scheduleCheck: false, wasAvailable: true };
   }
   if (st.state === "Deleted" || st.state === "Failed") {
-    return { reply: `开发机状态异常（${describeState(st.state)}），需要到 GitHub 页面处理。`, scheduleCheck: false, wasAvailable: false };
+    return { reply: `Dev machine in an odd state (${describeState(st.state)}); handle it on the GitHub page.`, scheduleCheck: false, wasAvailable: false };
   }
   // 已经在启动途中（连发两次 /boot / GitHub 侧刚拉起）：不要再 POST start（会 409），
   // 直接进入观察模式——用户真正想要的是「好了没」的答案。
   if (BOOTING_STATES.has(st.state)) {
     return {
-      reply: `开发机${describeState(st.state)} ⏳ 启动完成后我会告诉你。`,
+      reply: `Dev machine ${describeState(st.state)} ⏳ I'll report once it's up.`,
       scheduleCheck: true,
       wasAvailable: false,
     };
@@ -169,9 +169,9 @@ export async function beginBoot(client: CodespaceClient): Promise<BootPhase1> {
   try {
     await client.start();
   } catch (e) {
-    return { reply: `启动请求失败：${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
+    return { reply: `Boot request failed: ${errBrief(e)}`, scheduleCheck: false, wasAvailable: false };
   }
-  return { reply: "开发机未开机，已发出启动指令，正在启动 ⏳（好了一定告诉你）", scheduleCheck: true, wasAvailable: false };
+  return { reply: "Dev machine was off; boot requested, starting ⏳ (I'll tell you when it's up)", scheduleCheck: true, wasAvailable: false };
 }
 
 export interface BootCheck {
@@ -195,20 +195,20 @@ export async function checkBoot(client: CodespaceClient): Promise<BootCheck> {
   try {
     state = (await client.status()).state;
   } catch {
-    return { reply: "开机确认查询失败，稍后发「开发机状态」手动确认。", ok: false, pending: false };
+    return { reply: "Boot confirmation query failed; check /cs manually in a bit.", ok: false, pending: false };
   }
   if (state === "Available") {
-    return { reply: "开发机启动成功 ✓ 运行中，可以发命令了（shell 大约 10~30 秒内连上）", ok: true, pending: false };
+    return { reply: "Dev machine is up ✓ running; send commands (the shell connects in ~10-30s)", ok: true, pending: false };
   }
   if (BOOTING_STATES.has(state)) {
     return { reply: "", ok: false, pending: true };
   }
-  return { reply: `开机失败：仍为「${describeState(state)}」，可再发一次 /boot。`, ok: false, pending: false };
+  return { reply: `Boot failed: still '${describeState(state)}'; try /boot once more.`, ok: false, pending: false };
 }
 
 /** 等太久仍未好时的收尾文案。 */
 export function bootTimeoutReply(): string {
-  return "开发机还在启动中（已等待约 2.5 分钟）。稍后发「开发机状态」确认，或再发一次 /boot。";
+  return "Dev machine is still starting (~2.5 min waited). Check /cs in a bit, or send /boot once more.";
 }
 
 /** /halt：幂等停机。 */
@@ -217,15 +217,15 @@ export async function stopCodespace(client: CodespaceClient): Promise<string> {
   try {
     st = await client.status();
   } catch (e) {
-    return `查询 codespace 状态失败：${errBrief(e)}`;
+    return `Failed to query codespace state: ${errBrief(e)}`;
   }
-  if (st.state === "Shutdown") return "开发机已经是关机状态 ✓";
-  if (st.state === "Deleted") return "开发机已删除，无需停机。";
+  if (st.state === "Shutdown") return "Dev machine already shut down ✓";
+  if (st.state === "Deleted") return "Dev machine was deleted; nothing to stop.";
   try {
     await client.stop();
-    return "已发出停机指令 ✓（后台约 40 秒内完成，可用「开发机状态」确认）";
+    return "Stop requested ✓ (done in ~40s in the background; confirm with /cs)";
   } catch (e) {
-    return `停机请求失败：${errBrief(e)}`;
+    return `Stop request failed: ${errBrief(e)}`;
   }
 }
 

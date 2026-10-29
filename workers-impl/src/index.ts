@@ -46,7 +46,7 @@ function adminAdmit(ip: string, env: Env, request: Request): Response | null {
   if (g === "deny") {
     adminFailWindow.record(ip);
     return Response.json(
-      { ok: false, error: "需要 Authorization: Bearer <ADMIN_KEY>（或 X-Admin-Key 头）" },
+      { ok: false, error: "Authorization: Bearer <ADMIN_KEY> required (or an X-Admin-Key header)" },
       { status: 403 },
     );
   }
@@ -110,7 +110,7 @@ export default {
         if (d) return d;
         if (!env.TELEGRAM_BOT_TOKEN) {
           return Response.json(
-            { ok: false, error: "TELEGRAM_BOT_TOKEN 未配置。先运行: npx wrangler secret put TELEGRAM_BOT_TOKEN" },
+            { ok: false, error: "TELEGRAM_BOT_TOKEN not configured. Run: npx wrangler secret put TELEGRAM_BOT_TOKEN" },
             { status: 400 },
           );
         }

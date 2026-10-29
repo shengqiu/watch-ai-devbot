@@ -101,7 +101,12 @@ GEMINI_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-flash-lite-latest,gemi
 #   不受影响（它在 Worker secret 里，不在 DO storage），所以按 id 注册过的机器仍能连。
 # 本次 v4.15 改了 shell 鉴权的密钥来源（按 id 查密钥），旧 DO 实例不认识新代码，
 # 故 bump 到 s12 强制换版。平时保持不动。
-DO_KEY = "singleton-s12"
+# v4.24（2026-10-29）：恢复被陈旧工作副本覆盖的 Slack 集成后，线上 BUILD 校验
+# 仍是 v4.23 —— DO 被 agent 的 SSE 长连接钉住，reload 没能换掉老实例。
+# 按本文件既定的处置（见上）bump 到 s13 强制换版：新实例直接跑 v4.24 代码。
+# 代价同前：验证会话要重打一次、/gemini 会话模式与暂存提问清零、
+# agent_keys 运行期覆盖表清空（AGENT_KEYS secret 注册表不受影响）。
+DO_KEY = "singleton-s13"
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）

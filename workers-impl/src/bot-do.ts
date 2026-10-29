@@ -235,7 +235,7 @@ import {
 //       agent/codespace 通信零改动）+ 恢复被陈旧工作副本覆盖的集成。
 // v4.27：全部面向上层的提示改成英文（用户要求）；/buddy、/gemini 脚本内部文案不动
 //       （那是 AI agent 的 scope）。中文别名转为「仍认但不展示」，老输入照样命中。
-const BUILD = "devbot-20261029-v4.28";
+const BUILD = "devbot-20261029-v4.29";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -2525,7 +2525,8 @@ export class AssistantDO extends DurableObject<Env> {
   private async syncMenuOnce(): Promise<void> {
     // 版本化 key：指令表变了就 +1，否则老 DO 里的 true 会永久压住同步、新指令进不了菜单
     // v3：v4.25 新增 /verify（指令表变了，菜单要重同步一次）
-    const key = "menu_synced_v3";
+    // v4：v4.27 描述文案全部改英文（菜单里显示的是 desc，不同步就还是中文）
+    const key = "menu_synced_v4";
     try {
       if (await this.ctx.storage.get<boolean>(key)) return;
       await this.tg.call("setMyCommands", { commands: menuCommands() });

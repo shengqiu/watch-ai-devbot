@@ -43,6 +43,7 @@ import {
   BOOT_RETRY_DELAY_MS,
   BOOT_MAX_ATTEMPTS,
   type CodespaceState,
+  type CodespaceStatus,
 } from "./codespace";
 import {
   isVerified,
@@ -68,6 +69,17 @@ import {
   type ShellAlertDecision,
 } from "./watch";
 import { ShellHub, type ShellOutMsg, type ShellPing } from "./shell";
+import {
+  addDays,
+  dayKey,
+  estimateStop,
+  mergeMax,
+  parseBilling,
+  splitWindowByDay,
+  sumRange,
+  type BillingUsage,
+  type DayMap,
+} from "./usage";
 import { NonceCache, signCommand, timingSafeEq, verifyAgentRequest, parseAgentKeys } from "./agent-auth";
 import { reloadVerdict, reloadErrorResponse } from "./admin-auth";
 import {
@@ -235,7 +247,13 @@ import {
 //       agent/codespace 通信零改动）+ 恢复被陈旧工作副本覆盖的集成。
 // v4.27：全部面向上层的提示改成英文（用户要求）；/buddy、/gemini 脚本内部文案不动
 //       （那是 AI agent 的 scope）。中文别名转为「仍认但不展示」，老输入照样命中。
-const BUILD = "devbot-20261029-v4.29";
+// v4.30：/usage 账本搬到 KV（用户：用量每次部署都归零，但 GitHub 的计费不会）。
+//       根因：账本只存 DO storage，而 DO 实例名由 DO_KEY 决定 —— 换版部署 = 换实例 =
+//       旧 storage 作废。修法四件套：① 明细落 KV（与实例无关），还魂按 max 合并；
+//       ② 窗口起点另存 KV，实例被换掉后由巡检补账；③ 跨零点按 UTC 日切分；
+//       ④ 停机时刻按「最后活动 + 空闲超时」估，不再按「发现时刻」（会白记 30 分钟）。
+//       另：PAT 有 manage_billing:codespaces 时优先显示 GitHub 自己的账单数字。
+const BUILD = "devbot-20261029-v4.30";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -282,6 +300,8 @@ export class AssistantDO extends DurableObject<Env> {
   private readonly shell: ShellHub;
   /** 已用过的请求 nonce（防重放）。DO 驱逐即清空——那时连接也断了，窗口自然关闭。 */
   private readonly nonces = new NonceCache();
+  /** 运行时长账本是否已从 KV 合并过（每个实例一次，见 restoreUsageOnce） */
+  private usageRestored = false;
   /** 鉴权失败计数：同一 IP 短时间连续撞 401 就临时封禁，别让人把密钥试出来。 */
   private readonly authFails = new Map<string, { n: number; first: number; until: number }>();
   /** 最近一次通过鉴权的 agent 连接（诊断用：能看出走的是签名还是旧的明文密钥）。 */
@@ -1095,29 +1115,123 @@ export class AssistantDO extends DurableObject<Env> {
     await this.reply(chatId, `${line}\nToggle: /verify on /verify off`);
   }
 
-  /** 「用量」：本月累计运行时长（cs_runtime 表）+ 当前窗口状态。 */
+  /**
+   * 「用量」：本月累计运行时长 + 当前窗口状态。
+   *
+   * 口径说明（用户在 2026-10-29 提的问题）：账本原来只活在 DO storage 里，
+   * 而 DO 实例名由 DO_KEY 决定 —— 每次「换版部署」就等于换实例，本月用量归零，
+   * 但 GitHub 的计费是连续累加的，两者对不上。现在：
+   *   · 明细落 KV（与实例无关），还魂时按 max 合并，换多少次 DO 都不会丢；
+   *   · 窗口起点另存 KV，实例被换掉后由巡检补账（reconcileUsage）；
+   *   · 跨零点的窗口按 UTC 自然日切开，今日/本月不再串；
+   *   · 如果 PAT 有 manage_billing:codespaces，优先显示 GitHub 自己的账单数字。
+   */
   private async handleUsage(): Promise<string> {
-    const budgetH = this.monthlyBudgetHours();
-    const lines: string[] = [];
-    // 今日 + 本月
-    const today = new Date().toISOString().slice(0, 10);
+    // 先还魂（KV → SQL，幂等），否则新实例看到的还是零
+    await this.restoreUsageOnce();
+    let now = Date.now();
+    const today = dayKey(now);
     const month = today.slice(0, 7);
-    const todayMin = this.runtimeMinutes(today, today);
-    const monthMin = this.runtimeMinutes(`${month}-01`, `${month}-31`);
-    lines.push(`📊 Dev machine usage (${month})`);
-    lines.push(`Total runtime: ${fmtDur(monthMin)} / free allowance ${budgetH} h`);
-    const pct = Math.min(100, Math.round((monthMin / 60 / budgetH) * 100));
-    lines.push(`Allowance used: ${pct}%${pct >= 80 ? " ⚠️ nearing the cap" : ""}`);
+
+    // 换过 DO_KEY / 实例被驱逐：KV 里还躺着上一个实例的窗口起点，但 DO 里没有 episode。
+    // 先把那段补进账本，再展示 —— 否则用户看到的还是「零」。
+    let ep = await this.getEpisode();
+    if (!ep?.running && (await this.readOpenWindow())) {
+      const client = this.codespaceClient();
+      let st: CodespaceStatus | null = null;
+      if (client) {
+        try {
+          st = await client.status();
+        } catch {
+          /* 查不到就按「已停机」估，不阻塞 /usage */
+        }
+      }
+      await this.reconcileUsage(st);
+      now = Date.now();
+      ep = await this.getEpisode();
+    }
+
+    const days = this.readMonthDays(month);
+    const monthClosed = sumRange(days, `${month}-01`, `${month}-31`);
+    const todayClosed = sumRange(days, today, today);
+
+    // 当前窗口还没落账：按天切出来单独算（live），避免「跑到一半看不到」
+    const liveDays = ep?.running ? splitWindowByDay(ep.bootAt, now) : {};
+    const monthLive = sumRange(liveDays, `${month}-01`, `${month}-31`);
+    const todayLive = sumRange(liveDays, today, today);
+
+    const monthMin = Math.round(monthClosed + monthLive);
+    const todayMin = Math.round(todayClosed + todayLive);
+
+    const lines: string[] = [`📊 Codespaces usage (${month})`];
+    const billing = await this.billingUsage();
+    if (billing.value) {
+      const b = billing.value;
+      const pct = b.includedMin > 0 ? Math.round((b.usedMin / b.includedMin) * 100) : 0;
+      lines.push(`GitHub billed: ${fmtDur(b.usedMin)} used / ${fmtDur(b.includedMin)} included (${pct}%)`);
+      lines.push(`  Ubuntu ${fmtDur(b.ubuntuMin)} · over-quota paid ${fmtDur(b.paidMin)}`);
+      lines.push("  (GitHub's own figures — this is what actually gets billed)");
+    } else {
+      const budgetH = this.monthlyBudgetHours();
+      const pct = Math.min(100, Math.round((monthMin / 60 / budgetH) * 100));
+      lines.push(`Running total: ${fmtDur(monthMin)} / ${budgetH} h included (${pct}%)${pct >= 80 ? " ⚠️ nearing the cap" : ""}`);
+      // 说清「这个数从哪来」，别再让人以为它跟 GitHub 完全一致
+      lines.push(
+        billing.error
+          ? `  (my own tally, kept in KV across deploys; GitHub's exact number needs the manage_billing:codespaces scope — ${billing.error})`
+          : "  (my own tally, kept in KV across deploys)",
+      );
+    }
     lines.push(`Today: ${fmtDur(todayMin)}`);
-    // 当前窗口
-    const ep = await this.getEpisode();
     if (ep && ep.running) {
-      lines.push(`Current window: running, ${fmtDur((Date.now() - ep.bootAt) / 60_000)} so far${ep.botStarted ? "" : " (not booted by me)"}`);
+      lines.push(`Current window: running, ${fmtDur((now - ep.bootAt) / 60_000)} so far${ep.botStarted ? "" : " (not booted by me)"}`);
     } else {
       lines.push("Current window: shut down");
     }
     lines.push(`Watchdog: ${this.autostopEnabled() ? `remind/auto-stop at ${this.watchRemindMin()}/${this.watchAutostopMin()} min` : "remind only (auto-stop disabled)"}`);
     return lines.join("\n");
+  }
+
+  /**
+   * GitHub 官方账单（GET /users/{login}/settings/billing/codespaces）。
+   *
+   * 有就显示真数，没有就退回本地账本 —— 这个接口需要 PAT 带
+   * manage_billing:codespaces 权限，没有时 GitHub 返回 404（不是 403，故意的）。
+   * 缓存：成功 10 分钟、失败 6 小时，避免每次 /usage 都去打一次 GitHub。
+   */
+  private async billingUsage(): Promise<{ value: BillingUsage | null; error: string | null }> {
+    const pat = this.env.GH_CODESPACE_PAT;
+    if (!pat) return { value: null, error: "no PAT configured" };
+    const now = Date.now();
+    const cacheKey = "usage_billing";
+    const cached = await this.ctx.storage.get<{ at: number; value: BillingUsage | null; error: string | null }>(cacheKey);
+    if (cached) {
+      const ttl = cached.value ? 10 * 60_000 : 6 * 3_600_000;
+      if (now - cached.at < ttl) return { value: cached.value, error: cached.error };
+    }
+    const login = this.env.GH_LOGIN || "shengqiu";
+    let out: { at: number; value: BillingUsage | null; error: string | null };
+    try {
+      const res = await fetch(`https://api.github.com/users/${encodeURIComponent(login)}/settings/billing/codespaces`, {
+        headers: {
+          Authorization: `Bearer ${pat}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "watch-ai-assistant/1.0",
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) {
+        out = { at: now, value: null, error: `HTTP ${res.status}` };
+      } else {
+        const value = parseBilling(await res.json());
+        out = { at: now, value, error: value ? null : "unexpected response shape" };
+      }
+    } catch (e) {
+      out = { at: now, value: null, error: e instanceof Error ? e.message.slice(0, 60) : "fetch failed" };
+    }
+    await this.ctx.storage.put(cacheKey, out);
+    return { value: out.value, error: out.error };
   }
 
   // ---------------------------------------------------------------- AI 会话（gemini / buddy）
@@ -1639,6 +1753,9 @@ export class AssistantDO extends DurableObject<Env> {
     };
     await this.setEpisode(ep);
     if (chat) await this.putChatId(chat);
+    // 窗口起点同步到 KV：DO 若被换掉（DO_KEY 换版 / 驱逐且 storage 丢失），
+    // 下一个实例靠这个标记把「旧实例没来得及落账的那段」补回来。
+    await this.markWindowOpen({ bootAt: ep.bootAt });
     await pushAlarm(this.alarmStore(), {
       due: now + this.watchRemindMin() * 60_000,
       kind: "watch",
@@ -1664,15 +1781,23 @@ export class AssistantDO extends DurableObject<Env> {
     });
   }
 
-  /** 关闭窗口（停止开发后调用）：落账运行时长、清 episode、撤看门狗 alarm。 */
-  private async closeEpisode(): Promise<void> {
+  /**
+   * 关闭窗口（停止开发后调用）：落账运行时长、清 episode、撤看门狗 alarm。
+   *
+   * endAt 是「机器真正停下来的时刻」：自己调 stop() 的路径传 now；
+   * 巡检发现「已经关了」的路径传 estimateStop()（最后一次活动 + GitHub 空闲超时），
+   * 否则按发现时刻算会白记最多 30 分钟。
+   */
+  private async closeEpisode(endAt?: number): Promise<void> {
     const ep = await this.getEpisode();
-    if (!ep) return;
-    if (ep.running) {
-      const now = Date.now();
-      const day = new Date().toISOString().slice(0, 10);
-      this.addRuntimeDay(day, Math.max(0, (now - ep.bootAt) / 60_000));
+    if (ep?.running) {
+      const end = Math.min(endAt && endAt > ep.bootAt ? endAt : Date.now(), Date.now());
+      await this.addRuntimeWindow(ep.bootAt, end);
+      // 墓碑：删除失败时下一个实例靠 finalizedAt 知道这段已经记过，不会重复补
+      await this.markWindowOpen({ bootAt: ep.bootAt, finalizedAt: end });
     }
+    // 无论 episode 是什么状态，窗口标记都清掉 —— 留着它会让下一个实例误以为还有段没落账
+    await this.markWindowOpen(null);
     await this.setEpisode(null);
     // 从队列撤掉 watch 任务（boot_check 若有则保留）
     const q = (await this.ctx.storage.get<AlarmTask[]>("alarmq")) ?? [];
@@ -1698,11 +1823,15 @@ export class AssistantDO extends DurableObject<Env> {
     if (!client || !ep || !ep.running) return { acted: false, note: "no-episode" };
     let running: boolean;
     let ghLastUsedAt: number | null = null;
+    let idleTimeoutMin = 30;
     try {
       const st = await client.status();
       running = st.state === "Available";
       ghLastUsedAt = st.lastUsedAt ? Date.parse(st.lastUsedAt) : null;
       if (Number.isNaN(ghLastUsedAt as number)) ghLastUsedAt = null;
+      idleTimeoutMin = st.idleTimeoutMin;
+      // 还在跑：刷新 KV 的窗口起点（对账用），顺便让「已跑多久」有个持久依据
+      if (running) await this.markWindowOpen({ bootAt: ep.bootAt });
     } catch (e) {
       // 状态查询失败（GitHub 抖动）：5 分钟后重试，不误判
       console.error("[watch] 状态查询失败", e);
@@ -1757,8 +1886,9 @@ export class AssistantDO extends DurableObject<Env> {
       await this.reply(chat, decision.notify);
     }
     if (!running) {
-      // 机器其实已经关了（GitHub 空闲超时先到）：落账清窗口
-      await this.closeEpisode();
+      // 机器其实已经关了（GitHub 空闲超时先到）：落账清窗口。
+      // 停机时刻用估计值：最后一个活动 + 空闲超时 —— GitHub 也是算到那一刻为止。
+      await this.closeEpisode(estimateStop(Date.now(), ghLastUsedAt, idleTimeoutMin));
       return { acted: true, note: "already-off" };
     }
     if (decision.nextCheck) {
@@ -1778,11 +1908,19 @@ export class AssistantDO extends DurableObject<Env> {
     // 顺手清掉卡死的 shell 命令（agent 崩了 / 命令永不返回）
     const reaped = this.shell.reapStale();
     if (reaped > 0) console.log(`[shell] 巡检清理僵尸命令 ${reaped} 条`);
-    let state: string;
+    let st: CodespaceStatus;
     try {
-      state = (await client.status()).state;
+      st = await client.status();
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    const state = st.state;
+    // 对账：换过 DO_KEY / 实例被驱逐时，旧窗口的起点还在 KV 里 —— 先把那段补进账本，
+    // 否则「部署一次，那一段用量就凭空消失」。放在巡检最前面，避免被后面的分支短路。
+    try {
+      await this.reconcileUsage(st);
+    } catch (e) {
+      console.error("[usage] 对账失败（不影响巡检）", e);
     }
     // shell 离线告警：机器在跑但 agent 没连上 → 主动发 Telegram（否则只能你自己发现）。
     // 兜住异常：告警是「旁路」功能，绝不能因为它出错而毁掉巡检本身（看门狗也走这条路径）。
@@ -1808,9 +1946,12 @@ export class AssistantDO extends DurableObject<Env> {
       const r = await this.runWatchCheck();
       return { ok: true, state, ...r, ...sa };
     }
-    // 机器没跑：若有残留 episode，落账清掉
+    // 机器没跑：若有残留 episode，落账清掉（停机时刻按「最后活动 + 空闲超时」估）
     if (ep?.running) {
-      await this.closeEpisode();
+      const lastUsed = st.lastUsedAt ? Date.parse(st.lastUsedAt) : null;
+      await this.closeEpisode(
+        estimateStop(Date.now(), Number.isNaN(lastUsed as number) ? null : lastUsed, st.idleTimeoutMin),
+      );
       return { ok: true, state, note: "episode-closed", ...sa };
     }
     return { ok: true, state, note: "idle", ...sa };
@@ -1873,26 +2014,171 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------- 运行时长账本
+  //
+  // 三层存储，各管一件事：
+  //   SQL cs_runtime        明细（按 UTC 日分桶）——报表直接读它
+  //   KV  usage:v1:<month>  明细的持久副本，**与 DO 实例无关**
+  //   KV  usage:open        当前窗口起点（DO 被换掉时靠它把这一段接上，不丢也不重记）
+  //
+  // 病根：账本原来只存在 DO storage 里，而 DO 的名字由 DO_KEY 决定 ——
+  // 「换版 = 换个新实例」，旧 storage 连同本月用量一起作废，于是每次部署 /usage 都归零。
+  // 但 GitHub 的计费是按真实开机时间连续累加的，不会因为谁部署了一次就重来。
+  //
+  // 写路径只有两条：关窗（落终值）+ 巡检（只刷新 open 标记）。
+  // 读路径：先 restoreUsageOnce() 把 KV 明细按 max 合并回 SQL（幂等），再读 SQL。
 
-  /** 按日累计运行分钟（cs_runtime 表）。 */
-  private addRuntimeDay(day: string, minutes: number): void {
+  private usageKv(): KVNamespace | null {
+    return this.env.USAGE_KV ?? null;
+  }
+
+  /** KV 里「当前窗口起点」的键（单值，不按机器分：只有一台开发机）。 */
+  private static readonly USAGE_OPEN_KEY = "usage:open";
+
+  private usageMonthKey(month: string): string {
+    return `usage:v1:${month}`;
+  }
+
+  /** SQL 明细 → DayMap（单月）。 */
+  private readMonthDays(month: string): DayMap {
+    const rows = this.ctx.storage.sql
+      .exec<{ day: string; minutes: number }>(
+        "SELECT day, minutes FROM cs_runtime WHERE day >= ? AND day <= ?",
+        `${month}-01`,
+        `${month}-31`,
+      )
+      .toArray();
+    const out: DayMap = {};
+    for (const r of rows) if (Number.isFinite(r.minutes)) out[r.day] = r.minutes;
+    return out;
+  }
+
+  /** 写一天的绝对值（不是累加 —— 累加会和 KV 还魂撞车）。 */
+  private setRuntimeDay(day: string, minutes: number): void {
     this.ctx.storage.sql.exec(
-      "INSERT INTO cs_runtime (day, minutes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET minutes = minutes + ?",
+      "INSERT INTO cs_runtime (day, minutes) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET minutes = ?",
       day,
       minutes,
       minutes,
     );
-    this.ctx.storage.sql.exec("DELETE FROM cs_runtime WHERE day < ?", day.slice(0, 4) + "-01-01"); // 保留当年
   }
 
-  /** 查询日期范围内的累计运行分钟。 */
-  private runtimeMinutes(fromDay: string, toDay: string): number {
-    const rows = this.ctx.storage.sql.exec<{ total: number }>(
-      "SELECT COALESCE(SUM(minutes), 0) AS total FROM cs_runtime WHERE day >= ? AND day <= ?",
-      fromDay,
-      toDay,
-    ).toArray();
-    return Math.round(rows[0]?.total ?? 0);
+  /**
+   * 把 KV 里的持久账本合并回 SQL（每个实例只做一次）。
+   *
+   * 用 max 而不是累加：同一段窗口在 KV、SQL 各存一份，累加会翻倍；
+   * max 天然幂等，重复调用/并发重启都安全。
+   */
+  private async restoreUsageOnce(): Promise<void> {
+    if (this.usageRestored) return;
+    this.usageRestored = true;
+    const kv = this.usageKv();
+    if (!kv) return;
+    const month = dayKey(Date.now()).slice(0, 7);
+    try {
+      const saved = (await kv.get(this.usageMonthKey(month), "json")) as DayMap | null;
+      if (saved && typeof saved === "object") {
+        const cur = this.readMonthDays(month);
+        for (const [day, minutes] of Object.entries(mergeMax(cur, saved))) {
+          if (minutes > (cur[day] ?? 0)) this.setRuntimeDay(day, minutes);
+        }
+      }
+    } catch (e) {
+      console.error("[usage] KV 账本合并失败（不影响本次统计）", e);
+    }
+  }
+
+  /** 明细 → KV（整月覆盖，幂等）。 */
+  private async persistUsage(month: string): Promise<void> {
+    const kv = this.usageKv();
+    if (!kv) return;
+    try {
+      await kv.put(this.usageMonthKey(month), JSON.stringify(this.readMonthDays(month)), {
+        expirationTtl: 400 * 86_400, // 留 13 个月，够跨年看
+      });
+    } catch (e) {
+      console.error("[usage] KV 落盘失败（本实例内仍准确）", e);
+    }
+  }
+
+  /**
+   * 记下/清除「当前窗口起点」。
+   *
+   * 关窗时先写一次 `{bootAt, finalizedAt}` 再删除：万一删除失败（KV 抖动），
+   * 下一个实例看到 finalizedAt 就知道这段已经落过账，不会重复补记。
+   */
+  private async markWindowOpen(v: { bootAt: number; finalizedAt?: number } | null): Promise<void> {
+    const kv = this.usageKv();
+    if (!kv) return;
+    try {
+      if (!v || !(v.bootAt > 0)) await kv.delete(AssistantDO.USAGE_OPEN_KEY);
+      else await kv.put(AssistantDO.USAGE_OPEN_KEY, JSON.stringify(v));
+    } catch (e) {
+      console.error("[usage] open 标记写入失败", e);
+    }
+  }
+
+  private async readOpenWindow(): Promise<{ bootAt: number; finalizedAt?: number } | null> {
+    const kv = this.usageKv();
+    if (!kv) return null;
+    try {
+      const v = (await kv.get(AssistantDO.USAGE_OPEN_KEY, "json")) as
+        | { bootAt?: number; finalizedAt?: number }
+        | null;
+      const bootAt = Number(v?.bootAt);
+      if (!Number.isFinite(bootAt) || bootAt <= 0) return null;
+      const fin = Number(v?.finalizedAt);
+      return Number.isFinite(fin) && fin > 0 ? { bootAt, finalizedAt: fin } : { bootAt };
+    } catch {
+      return null;
+    }
+  }
+
+  /** 落账一段窗口：按天切分后写进 SQL + KV（同窗口只能调一次）。 */
+  private async addRuntimeWindow(bootAt: number, endAt: number): Promise<void> {
+    const days = splitWindowByDay(bootAt, endAt);
+    const keys = Object.keys(days).sort();
+    if (keys.length === 0) return;
+    await this.restoreUsageOnce();
+    for (const month of new Set(keys.map((d) => d.slice(0, 7)))) {
+      const cur = this.readMonthDays(month);
+      for (const [day, add] of Object.entries(days)) {
+        if (!day.startsWith(month)) continue;
+        this.setRuntimeDay(day, (cur[day] ?? 0) + add);
+      }
+      await this.persistUsage(month);
+    }
+    this.ctx.storage.sql.exec("DELETE FROM cs_runtime WHERE day < ?", `${keys[0].slice(0, 4)}-01-01`);
+  }
+
+  /**
+   * 对账：KV 说「有个窗口开着」，但 DO 里没有对应的 episode
+   * （换 DO_KEY / 实例被驱逐且 storage 没了）—— 把丢的这段补进账本。
+   *
+   * 这是「部署清零」真正的补丁：旧实例亡了，但它开的那段机器还在跑，
+   * 不补的话这段就永远消失了。
+   */
+  private async reconcileUsage(st: CodespaceStatus | null): Promise<void> {
+    const open = await this.readOpenWindow();
+    if (!open) return;
+    // 已经落过账（上次删标记失败留下的墓碑）：只清理，不重复记
+    if (open.finalizedAt) {
+      await this.markWindowOpen(null);
+      return;
+    }
+    const ep = await this.getEpisode();
+    if (ep?.running) {
+      // 正常在管：只把标记对齐到当前窗口，别动账本
+      if (ep.bootAt !== open.bootAt) await this.markWindowOpen({ bootAt: ep.bootAt });
+      return;
+    }
+    const now = Date.now();
+    const lastUsed = st?.lastUsedAt ? Date.parse(st.lastUsedAt) : null;
+    const end = st && st.state === "Available"
+      ? now // 还在跑：先记到此刻，随后 patrol 会开新窗口接着记
+      : estimateStop(now, Number.isNaN(lastUsed as number) ? null : lastUsed, st?.idleTimeoutMin ?? 30);
+    await this.addRuntimeWindow(open.bootAt, Math.max(open.bootAt, end));
+    await this.markWindowOpen(null);
+    console.log(`[usage] 补账窗口 ${new Date(open.bootAt).toISOString()} → ${new Date(end).toISOString()}`);
   }
 
   // ---------------------------------------------------------------- chat_id 记忆

@@ -23,6 +23,14 @@ tag = "v2"
 deleted_classes = ["QQBotDO"]
 new_sqlite_classes = ["AssistantDO"]
 
+# 运行时长账本的持久层（/usage）
+# 为什么不用 DO storage：DO 实例名由 DO_KEY 决定，换版部署 = 换实例 = 旧 storage 作废，
+# 本月用量每次部署都归零，而 GitHub 的计费是连续累加的。KV 与实例无关，换多少个 DO 都还在。
+# 建法：npx wrangler kv namespace create watch-ai-usage
+[[kv_namespaces]]
+binding = "USAGE_KV"
+id = "2dd873df38a847308a7fbac25b362abb"
+
 [triggers]
 # 看门狗巡检：每 30 分钟查一次开发机状态（catch 漏网的运行中机器 + 兜底 DO alarm）
 crons = ["*/30 * * * *"]

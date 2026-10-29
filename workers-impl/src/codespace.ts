@@ -33,6 +33,11 @@ export interface CodespaceStatus {
   sshUrl: string | null;
   /** 最近使用时间（ISO8601；VS Code/网页/SSH 连接与交互都会刷新）——看门狗双信号用 */
   lastUsedAt: string | null;
+  /**
+   * 空闲超时（分钟）：GitHub 在这段时间无活动后自动停机。
+   * 用途：估计「真正停机时刻」——最后一个活动 + 这段超时 ≈ 计费终点（见 usage.estimateStop）。
+   */
+  idleTimeoutMin: number;
 }
 
 export class CodespaceClient {
@@ -62,11 +67,14 @@ export class CodespaceClient {
 
   async status(): Promise<CodespaceStatus> {
     const d = await this.call(`/user/codespaces/${this.name}`);
+    const idle = Number(d.idle_timeout_minutes);
     return {
       name: this.name,
       state: (d.state as CodespaceState) ?? "Unknown",
       sshUrl: (d.webshell_url ?? null) as string | null,
       lastUsedAt: (d.last_used_at ?? null) as string | null,
+      // 老账户/字段缺失时按 GitHub 默认 30 分钟兜底
+      idleTimeoutMin: Number.isFinite(idle) && idle > 0 ? idle : 30,
     };
   }
 

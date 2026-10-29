@@ -3,6 +3,16 @@ export interface Env {
   // Durable Object 绑定
   BOT: DurableObjectNamespace<AssistantDO>;
 
+  /**
+   * 运行时长账本的持久层（KV，可选）。
+   *
+   * 为什么不用 DO storage：DO 的名字由 DO_KEY 决定，「换版」就是换个新实例，
+   * 旧 storage（含本月用量）全部作废 —— 这正是 /usage 每次部署后归零的原因。
+   * KV 是账户级、与 DO 实例无关，换多少个 DO 都还在。
+   * 未绑定（本地 dev / 老部署）时自动退回只写 DO storage，功能仍可用。
+   */
+  USAGE_KV?: KVNamespace;
+
   // Telegram 机器人令牌（secret，@BotFather 处获取）
   TELEGRAM_BOT_TOKEN: string;
   // 可选：webhook 防伪密钥（setWebhook 的 secret_token，自定义一串随机串即可）
@@ -84,6 +94,12 @@ export interface Env {
   // Codespace 开发机远程开关（/boot、/halt 指令）
   GH_CODESPACE_PAT?: string; // secret：fine-grained PAT，仅需 Codespaces 用户权限
   GH_CODESPACE_NAME?: string; // var：codespace 名称，默认 24h-977gg5v9vcp5wq
+  /**
+   * var：GitHub 用户名（默认 shengqiu）。
+   * 只有「查官方账单」用得到：GET /users/{login}/settings/billing/codespaces。
+   * PAT 没有 manage_billing:codespaces 权限时该接口 404/403，/usage 会自动退回本地账本。
+   */
+  GH_LOGIN?: string;
 
   // 省额度看门狗（vars）
   CS_WATCH_REMIND_MIN?: string; // 空闲提醒阈值（分钟，默认 25）

@@ -45,6 +45,44 @@ export const DEFAULT_BUDDY_MODELS: string[] = [
   "kimi-k3.1-pro",
   "minimax-m3",
 ];
+
+/**
+ * 免费额度优先链（2026-10-29 实测：16 个模型全部在免费额度内可用，含 pro 级）。
+ *
+ * 设计与 /gemini 的链同构，但机制不同：CodeBuddy 有原生的 `--fallback-model`
+ * （「主模型过载时自动切换」，help 明说 only works with --print —— 正是我们的用法），
+ * 所以链只有「当前首选 → 备选」两跳由 CLI 自己处理；跨多跳的降级由本脚本的外层
+ * 循环完成（见 buildBuddyScript）。
+ *
+ * 排序原则：flash / lite 这类轻模型在前（响应快、免费池大），pro / 大参数殿后。
+ * 顺序 = 自动降级的尝试顺序。
+ */
+export const DEFAULT_BUDDY_CHAIN: string[] = [
+  "deepseek-v4.1-flash",
+  "glm-5.3-flash",
+  "minimax-m3.1-flash",
+  "hy4-preview",
+  "glm-5.3",
+  "kimi-k3.1-pro",
+  "deepseek-v4-pro",
+];
+/** 上次成功的模型（持久卷）。下次从它开始，避免每次都从链头试错。 */
+export const BUDDY_MODEL_FILE = "$HOME/.config/watch-ai/buddy-model";
+
+/**
+ * 解析 `BUDDY_MODELS` 环境变量（逗号/空格分隔）为链；非法名丢弃。
+ * 空或全非法 → 默认链，绝不返回空数组。
+ */
+export function parseBuddyChain(raw: string | undefined): string[] {
+  const out: string[] = [];
+  for (const piece of (raw ?? "").split(/[\s,]+/)) {
+    const m = piece.trim();
+    if (!m) continue;
+    const ok = sanitizeModel(m).replace(/^-m\s+/, "");
+    if (ok && !out.includes(ok)) out.push(ok);
+  }
+  return out.length ? out : [...DEFAULT_BUDDY_CHAIN];
+}
 /**
  * UTF-8 → base64。这里复用 gemini.ts 的实现（Workers 的 btoa 只吃 latin1）。
  * 保留一个本地别名，避免调用处出现 gemini 字样造成误解。
@@ -74,7 +112,9 @@ export function locateLines(): string[] {
  * 生成「准备 + 执行」的 bash 脚本（整体包在子 shell 里，理由同 gemini.ts：
  * 长驻 bash 里顶层 exit 会把整个 shell 干掉）。
  */
-export function buildBuddyScript(opts: { prompt?: string; model?: string; resume?: boolean } = {}): string {
+export function buildBuddyScript(
+  opts: { prompt?: string; model?: string; chain?: string[]; resume?: boolean } = {},
+): string {
   // 注意这里加 `--model` 前缀而不是复用 sanitizeModel 的 `-m`：CodeBuddy 的 help 里
   // 只声明了长选项 `--model`（不像 gemini 有 -m 短选项），短横线写错会被当成 prompt 文本。
   const modelName = opts.model ? sanitizeModel(opts.model).replace(/^-m\s+/, "") : "";
@@ -139,14 +179,47 @@ export function buildBuddyScript(opts: { prompt?: string; model?: string; resume
 
   // -y = 跳过权限确认（无人值守没人按 y）；-c = 续最近一次会话。
   // 顺序按 CLI 的惯例把开关放前面、prompt 跟上，避免 `-p` 把后面的开关当成 prompt 文本。
-  const flags: string[] = [`-y`];
   if (resume) L.push(`C=""; [ -f "${BUDDY_SESSION_MARK}" ] && C="-c"`);
-  if (model) flags.push(model);
-
   L.push(`OUT=/tmp/ws-buddy-out.txt`);
-  L.push(`codebuddy \${C:-} -p "$P" ${flags.join(" ")} </dev/null 2>&1 | tee "$OUT"`);
-  L.push(`rc=\${PIPESTATUS[0]}`);
-  // 成功才建标记：失败的那次没有可续的会话，提前建标记会让下一条报「无会话可续」
+
+  if (model) {
+    // 用户钉了模型：只跑它，不偷偷换（「我明明指定了 X」不能变成谜题）
+    L.push(`codebuddy \${C:-} -y ${model} -p "$P" </dev/null 2>&1 | tee "$OUT"`);
+    L.push(`rc=\${PIPESTATUS[0]}`);
+  } else {
+    // 自动模式：免费额度优先链。每跳 = `--model 当前 --fallback-model 下一跳`
+    // （fallback 是 CLI 原生能力，只在「过载」时触发；外层循环处理跨多跳的降级：
+    // 一跳彻底失败（rc≠0 且输出里没有 fallback 接管的迹象）就换下一跳从头试）。
+    const chain = (opts.chain?.length ? opts.chain : DEFAULT_BUDDY_CHAIN).slice(0, 6);
+    L.push(`CHAIN="${chain.join(" ")}"`);
+    L.push(`MODELF="${BUDDY_MODEL_FILE}"`);
+    // 上次成功的模型提到最前：稳定性靠它，别每条消息都从链头试错
+    L.push(`if [ -f "$MODELF" ]; then`);
+    L.push(`  last="$(cat "$MODELF" 2>/dev/null)"`);
+    L.push(`  case " $CHAIN " in *" $last "*) CHAIN="$last $(printf %s " $CHAIN " | sed "s/ $last / /")" ;; esac`);
+    L.push(`fi`);
+    L.push(`rc=1; tried=""`);
+    L.push(`for m in $CHAIN; do`);
+    L.push(`  : > "$OUT"`);
+    // 第一次尝试才续会话：换模型后旧会话可能属于另一个模型，硬续容易再失败一次
+    L.push(`  G=""; if [ -z "$tried" ] && [ -f "${BUDDY_SESSION_MARK}" ]; then G="-c"; else G=""; fi`);
+    // 下一跳作为本跳的原生 fallback：单次调用内 CLI 自己处理「过载 → 切换」
+    L.push(`  next="$(printf %s " $CHAIN " | sed "s/^ *$m */ /" | awk "{print \\$1}" | grep . || true)"`);
+    L.push(`  FB=""; [ -n "$next" ] && FB="--fallback-model $next"`);
+    L.push(`  codebuddy \${G:-} -y --model "$m" $FB -p "$P" </dev/null 2>&1 | tee "$OUT"`);
+    L.push(`  rc=\${PIPESTATUS[0]}`);
+    L.push(`  if [ $rc -eq 0 ]; then`);
+    L.push(`    mkdir -p "$(dirname "$MODELF")"; printf %s "$m" > "$MODELF"`);
+    L.push(`    [ -n "$tried" ] && echo "" && echo "✅ 本次由 $m 回答（前面试过：$tried）"`);
+    L.push(`    break`);
+    L.push(`  fi`);
+    L.push(`  tried="$tried $m"`);
+    L.push(`  echo ""`);
+    L.push(`  echo "⚠️ $m 不可用，换链上下一个免费模型…"`);
+    L.push(`done`);
+    L.push(`if [ $rc -ne 0 ] && [ -n "$tried" ]; then echo ""; echo "❌ 链上的模型都试过了：$tried"; echo "   可 /buddy model <名字> 手动指定。"; fi`);
+  }
+  // 成功才建会话标记：失败的那次没有可续的会话，提前建标记会让下一条报「无会话可续」
   L.push(`if [ $rc -eq 0 ]; then mkdir -p "$(dirname "${BUDDY_SESSION_MARK}")"; touch "${BUDDY_SESSION_MARK}"; fi`);
   L.push(`exit $rc`);
   L.push(`)`);
@@ -154,8 +227,9 @@ export function buildBuddyScript(opts: { prompt?: string; model?: string; resume
 }
 
 /** 环境自检：装没装 / 目录对不对 / 信任了没 / 有没有可续的会话。 */
-export function buildBuddyStatusScript(model?: string): string {
+export function buildBuddyStatusScript(model?: string, chain?: string[]): string {
   const pinned = model ? sanitizeModel(model).replace(/^-m\s+/, "") : "";
+  const list = chain?.length ? chain : DEFAULT_BUDDY_CHAIN;
   return [
     "(",
     `mkdir -p ${BUDDY_DIR} 2>/dev/null || true`,
@@ -167,26 +241,31 @@ export function buildBuddyStatusScript(model?: string): string {
     // 登录态没法离线判定（token 存在 local_storage 的加密条目里），只能说清「在哪、怎么补」
     `if [ -d "${BUDDY_CONF_DIR}" ]; then echo "认证：✓ 已初始化 ~/.codebuddy（OAuth 登录态；失效时 headless 会直接报鉴权错误）"; else echo "认证：✗ 没登录过（需要在机器里交互式跑一次 codebuddy 完成浏览器授权）"; fi`,
     pinned
-      ? `echo "模型：固定 ${pinned}（不自动切换；/buddy model auto 回到 CLI 默认）"`
-      : `echo "模型：CLI 默认（/buddy model <名字> 可固定）"`,
+      ? `echo "模型：固定 ${pinned}（不自动切换；/buddy model auto 回到免费链）"`
+      : `echo "模型：免费额度优先链（${list.join(" → ")}）"; last="$(cat ${BUDDY_MODEL_FILE} 2>/dev/null)"; echo "优先：\${last:-${list[0]}}（上次成功的提到最前）"`,
     `if [ -f "${BUDDY_SESSION_MARK}" ]; then echo "会话：有（下条会用 -c 续）"; else echo "会话：无（下条开新会话）"; fi`,
     `echo "目录：$(pwd)"`,
     ")",
   ].join("\n");
 }
 
-/** 列出 CLI 支持的模型：优先现查 help（跟版本走），查不到用兜底常量。 */
-export function buildBuddyModelsScript(): string {
+/** 列出 CLI 支持的模型：优先现查 help（跟版本走），查不到用兜底常量；标注哪些在免费链里。 */
+export function buildBuddyModelsScript(chain?: string[]): string {
+  const list = chain?.length ? chain : DEFAULT_BUDDY_CHAIN;
   return [
     "(",
     `export PATH="$HOME/nvm/current/bin:/usr/local/share/nvm/current/bin:$HOME/.local/bin:$PATH"`,
     ...locateLines(),
     `if ! command -v codebuddy >/dev/null 2>&1; then echo "CLI 还没装，发一次 /buddy 会自动装。"; exit 2; fi`,
-    `echo "CLI 支持的模型（来自 codebuddy --help）："`,
+    `echo "免费额度优先链（自动降级顺序）：${list.join(" → ")}"`,
+    `last="$(cat ${BUDDY_MODEL_FILE} 2>/dev/null)"; [ -n "$last" ] && echo "上次成功：$last"`,
+    `echo ""; echo "CLI 支持的模型（来自 codebuddy --help；✅ = 已在链中）："`,
     `LIST=$(codebuddy --help 2>/dev/null | tr ',' '\\n' | sed -n 's/.*Currently supported: *(//; s/[() ]//g' | grep -E '^[a-z0-9._-]+$')`,
     `if [ -z "$LIST" ]; then echo "  （help 里没解析出来，按内置清单显示）"; LIST="${DEFAULT_BUDDY_MODELS.join(" ")}"; fi`,
-    `printf '%s\\n' $LIST | sed 's/^/  · /'`,
-    `echo ""; echo "用法：/buddy model <名字> 固定；/buddy model auto 回到 CLI 默认"`,
+    `printf '%s\\n' $LIST | while read -r m; do`,
+    `      case " ${list.join(" ")} " in *" $m "*) echo "  ✅ $m" ;; *) echo "     $m" ;; esac`,
+    `    done`,
+    `echo ""; echo "用法：/buddy model <名字> 固定；/buddy model auto 回到免费链"`,
     ")",
   ].join("\n");
 }

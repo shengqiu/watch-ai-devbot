@@ -17,30 +17,6 @@ export interface Env {
   // 外部服务地址（可选；默认官方地址，集中解析见 src/config.ts。
   // 换代理 / 换区域端点 / 内网联调时覆盖，无需改代码）
   TELEGRAM_API_BASE?: string; // 默认 https://api.telegram.org
-  SLACK_API_BASE?: string; // 默认 https://slack.com/api（Slack Web API 根）
-
-  // ---- Slack 通道（v4.22；与 Telegram 同一条 DO 流水线，agent 侧零改动）----
-  /**
-   * Slack App 的 Bot User OAuth Token（secret，xoxb-...）。
-   * 未配置 = Slack 通道整体关闭（/slack/* 一律 404 语义的提示），Telegram 不受影响。
-   */
-  SLACK_BOT_TOKEN?: string;
-  /**
-   * Slack App 的 Signing Secret（secret，App Credentials 页）。
-   * 验签 fail-closed：未配置时 /slack/* 一律 403（与 TELEGRAM_WEBHOOK_SECRET 同策略）。
-   */
-  SLACK_SIGNING_SECRET?: string;
-  /**
-   * Slack 通道开关（var）："0" = 关闭（即使配了 token 也不收消息）；
-   * 默认开（配齐 token + secret 才真正生效）。
-   */
-  SLACK_ENABLED?: string;
-  /**
-   * Slack 白名单（var/secret，逗号分隔 user id）。语义与 ALLOWED_USERS 一致，
-   * 但独立配置——两个通道的账号体系不同（Telegram 数字 id vs Slack Uxxxx）。
-   * 空 = 放开（仅建议开发期）。
-   */
-  SLACK_ALLOWED_USERS?: string;
 
   // 模型厂商密钥（secret，按需填；未填的厂商自动跳过）
   GEMINI_API_KEY?: string;
@@ -52,6 +28,13 @@ export interface Env {
    * 不配则用代码里的 DEFAULT_MODEL_CHAIN。
    */
   GEMINI_MODELS?: string;
+  /**
+   * CodeBuddy 免费额度优先链（var；逗号/空格分隔，按顺序降级）。
+   * 2026-10-29 实测 16 个模型全部在免费额度内；链配合 CLI 原生 --fallback-model
+   * （单跳）+ 脚本外层循环（多跳）实现「不可用自动换下一个」。
+   * 不配则用代码里的 DEFAULT_BUDDY_CHAIN。
+   */
+  BUDDY_MODELS?: string;
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
   DEEPSEEK_API_KEY?: string;

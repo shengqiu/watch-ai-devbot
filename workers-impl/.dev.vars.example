@@ -26,12 +26,3 @@ DEEPSEEK_API_KEY=
 # ---- 外部服务地址（可选；留空 = 官方默认值，集中解析见 src/config.ts）----
 # 换代理 / 换区域端点 / 内网联调时取消注释并覆盖，无需改代码：
 # TELEGRAM_API_BASE=https://api.telegram.org
-# SLACK_API_BASE=https://slack.com/api
-
-# ---- Slack 通道（v4.22；可选，不配 = 通道关闭，Telegram 不受影响）----
-# Slack App → OAuth & Permissions → Bot User OAuth Token
-# SLACK_BOT_TOKEN=xoxb-...
-# Slack App → Basic Information → App Credentials → Signing Secret
-# SLACK_SIGNING_SECRET=8f742231b10e...
-# Slack 白名单（逗号分隔 user id；空 = 放开）
-# SLACK_ALLOWED_USERS=U0123ABCDEF

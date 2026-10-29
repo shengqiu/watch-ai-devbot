@@ -53,7 +53,7 @@ Slack App (Events API  ─┘      → 按通道验签 → 统一 Incoming
 
 ```bash
 cd workers-impl && npm install
-npm test          # 700 项逻辑测试（含 Slack 通道 37 项）
+npm test          # 714 项逻辑测试（含 Slack 通道 48 项 + 接线护栏）
 npx wrangler dev  # 本地联调
 npx wrangler deploy
 ```

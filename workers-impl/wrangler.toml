@@ -59,6 +59,16 @@ CS_GH_CAP_GRACE_MIN = "15"         # stop 模式宽限期（分钟）：警告�
 SHELL_ENABLED = "1"                # "0" = 关闭 shell 转发（未识别文本退回 LLM/提示）
 SHELL_FLUSH_MS = "1200"            # 增量输出静默多久就推一条消息（毫秒）
 SHELL_MAX_CHARS = "24000"          # 单条命令输出上限（超出掐头尾）
+# ---- Slack 通道（v4.22；与 Telegram 同一条 DO 流水线，agent/codespace 零改动）----
+# 总开关："0" = 关闭（默认开，但需配齐 secret 才真正生效）。
+# 未配 SLACK_BOT_TOKEN / SLACK_SIGNING_SECRET 时 /slack/* 返回 404，Telegram 不受影响。
+# chatId 状态隔离：DO 内用 `slack:<channel_id>` 前缀（验证/历史/限流/看门狗推送各自独立）。
+SLACK_ENABLED = "1"
+# 密钥用 wrangler secret put 注入（不要写在这里）：
+#   SLACK_BOT_TOKEN      # xoxb-...（Slack App → OAuth & Permissions → Bot User OAuth Token）
+#   SLACK_SIGNING_SECRET # App Credentials 页的 Signing Secret（/slack/* 验签，fail-closed）
+# 白名单（var 或 secret；空 = 放开，仅建议开发期）：
+#   npx wrangler secret put SLACK_ALLOWED_USERS   # 逗号分隔 Slack user id（Uxxxx...，与 Telegram 白名单独立）
 # shell 离线告警：机器在跑但 agent 没连上 → 巡检时主动发 Telegram（否则只能自己发现 bot 不响应）
 CS_SHELL_ALERT = "1"               # "0" = 关闭（只记日志，不打扰）
 CS_SHELL_ALERT_GRACE_MIN = "5"     # 断线宽限（分钟）：躲开 DO 重载 / agent 重启的瞬断

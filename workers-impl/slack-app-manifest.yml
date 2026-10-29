@@ -28,6 +28,12 @@ display_information:
   background_color: "#1a1a2e"
 
 features:
+  # App Home：Messages 标签必须可写，否则**私聊发不出去**（Slack 默认 Messages 标签
+  # 是只读的/隐藏的）。这是最容易漏的一步——漏了表现为「bot 装上了但一句话收不到」。
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   bot_user:
     display_name: watch-ai-devbot
     always_online: false

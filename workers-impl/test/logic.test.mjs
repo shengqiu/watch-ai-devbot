@@ -28,7 +28,9 @@ import {
   buildBuddyNewSessionScript,
   parseBuddyArgs,
   parseBuddyChain,
-  DEFAULT_BUDDY_CHAIN,
+  DEFAULT_FREE_MODELS,
+  DEFAULT_PAID_FALLBACK,
+  buildChain,
   BUDDY_DIR,
   BUDDY_PKG,
   BUDDY_SESSION_MARK,
@@ -1898,11 +1900,12 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("buddy 脚本包子 shell", bPrep.startsWith("("), true);
   check("buddy 脚本以 ) 收尾", bPrep.trimEnd().endsWith(")"), true);
   // 用户要求：直接进入 codebuddy 文件夹
-  check("buddy cd 固定目录", bPrep.includes(`cd ${BUDDY_DIR}`), true);
-  check("buddy 目录不存在时自动建", bPrep.includes(`mkdir -p ${BUDDY_DIR}`), true);
+  check("buddy cd 工作目录", bPrep.includes('cd "$BD"'), true);
+  check("buddy 工作目录默认值", bPrep.includes(`\${BUDDY_WORKDIR:-${BUDDY_DIR}}`), true);
+  check("buddy 目录不存在时自动建", bPrep.includes('mkdir -p "$BD"'), true);
   // 允许该目录 = 写进 CodeBuddy 的 trustedDirectories，避免 headless 卡在信任询问
   check("buddy 自动补信任目录", bPrep.includes("trustedDirectories"), true);
-  check("buddy 信任的就是工作目录", bPrep.includes(`t.add("${BUDDY_DIR}")`), true);
+  check("buddy 信任的就是工作目录", bPrep.includes('t.add(process.env.BUDDY_WORKDIR||"' + BUDDY_DIR + '")'), true);
   // 装错包是常见坑：npm 上的 codebuddy / codebuddy-cli 都是别人的 Hello World 桩
   check("buddy 装的是腾讯官方包", bPrep.includes(BUDDY_PKG), true);
   check("buddy 不装同名假包", bPrep.includes("npm i -g codebuddy </dev/null"), false);
@@ -1932,28 +1935,37 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   // 模型名注入：白名单挡掉（拼进 shell 命令）
   check("buddy 模型注入被拒", buildBuddyScript({ prompt: "x", model: "a; rm -rf /" }).includes("rm -rf"), false);
 
-  // ---- 免费额度优先链（2026-10-29：16 个模型实测全在免费额度内）----
-  // 链解析
-  check("buddy 默认链非空", DEFAULT_BUDDY_CHAIN.length >= 3, true);
-  check("buddy 链首是 flash（轻模型优先）", DEFAULT_BUDDY_CHAIN[0].includes("flash"), true);
-  check("buddy 链无重复", new Set(DEFAULT_BUDDY_CHAIN).size, DEFAULT_BUDDY_CHAIN.length);
-  check("buddy 链解析：空用默认", parseBuddyChain(undefined), [...DEFAULT_BUDDY_CHAIN]);
+  // ---- 免费判定 = 点数倍率 0（来自 /v3/config，运行时现读）----
+  check("buddy 内置免费快照只有 hy3", DEFAULT_FREE_MODELS, ["hy3"]);
+  check("buddy 付费兜底非空", DEFAULT_PAID_FALLBACK.length >= 3, true);
+  check("buddy 付费兜底无重复", new Set(DEFAULT_PAID_FALLBACK).size, DEFAULT_PAID_FALLBACK.length);
+  check("buddy 链解析：空用默认付费", parseBuddyChain(undefined), [...DEFAULT_PAID_FALLBACK]);
   check("buddy 链解析：逗号分隔", parseBuddyChain("glm-5.3, kimi-k3.1-pro")[1], "kimi-k3.1-pro");
   check(
     "buddy 链解析：shell 元字符进不了链",
     parseBuddyChain("a; rm -rf /").some((m) => /[^A-Za-z0-9._-]/.test(m)),
     false,
   );
-  check("buddy 链解析：全非法回默认", parseBuddyChain("!!! ???"), [...DEFAULT_BUDDY_CHAIN]);
+  check("buddy 链解析：全非法回默认", parseBuddyChain("!!! ???"), [...DEFAULT_PAID_FALLBACK]);
 
-  // 自动模式脚本：链 + fallback + 记忆
+  // 链拼接：免费在前、付费在后、去重
+  check("buildChain 免费在前", buildChain(["hy3"], ["a", "b"]).join(","), "hy3,a,b");
+  check("buildChain 去重", buildChain(["hy3", "a"], ["a"]).join(","), "hy3,a");
+  check("buildChain freeOnly 砍掉付费", buildChain(["hy3"], ["a"], true).join(","), "hy3");
+  check("buildChain 空免费只留付费", buildChain([], ["a"], true).join(","), "");
+
+  // 自动模式脚本：现读价格表 → 免费清单 → 付费兜底
   const bAuto = buildBuddyScript({ prompt: "hi" });
-  check("buddy 自动模式有链", bAuto.includes(`CHAIN="${DEFAULT_BUDDY_CHAIN.slice(0, 6).join(" ")}"`), true);
+  check("buddy 自动模式读价格表", bAuto.includes("local_storage"), true);
+  check("buddy 自动模式只用 0 倍率当免费", bAuto.includes("awk -F'|' '$2+0==0{print $1}'"), true);
+  check("buddy 自动模式带付费兜底", bAuto.includes(DEFAULT_PAID_FALLBACK[0]), true);
+  check("buddy 自动模式可关掉付费", bAuto.includes("BUDDY_FREE_ONLY"), true);
   check("buddy 自动模式用原生 fallback", bAuto.includes('--fallback-model $next'), true);
-  check("buddy 自动模式记住上次成功", bAuto.includes("printf %s \"$m\" > \"$MODELF\""), true);
+  check("buddy free→paid 不开静默 fallback", /\[ "\$CR" = "0" \] && \[ "\$CRN" != "0" \]; then FB=""/.test(bAuto), true);
+  check("buddy 自动模式记住上次成功", bAuto.includes('printf %s "$m" > "$MODELF"'), true);
   check("buddy 上次成功提到链头", bAuto.includes('case " $CHAIN " in *" $last "*)'), true);
-  check("buddy 自动模式失败沿链换", bAuto.includes("换链上下一个免费模型"), true);
   check("buddy 换模型后开新会话", /if \[ -z "\$tried" \]/.test(bAuto), true);
+  check("buddy 用付费模型会明说", bAuto.includes("💸"), true);
 
   // 钉死模型：不走链（用户指定优先）
   const bPin = buildBuddyScript({ prompt: "hi", model: "glm-5.3" });
@@ -1963,13 +1975,14 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
 
   // 自检脚本：报链
   const bSt2 = buildBuddyStatusScript(undefined, ["m1", "m2"]);
-  check("buddy 状态报免费链", bSt2.includes("m1 → m2"), true);
-  check("buddy 状态报上次成功", bSt2.includes("优先"), true);
+  check("buddy 状态报付费兜底", bSt2.includes("m1 → m2"), true);
+  check("buddy 状态报免费清单", bSt2.includes("免费优先"), true);
   const bModels = buildBuddyModelsScript(["m1", "m2"]);
   check("buddy models 列出链", bModels.includes("m1 → m2"), true);
-  // ✅ 标注是脚本运行时的 case 判断（✅ 打给 $m），生成期只能断言判定逻辑在
-  check("buddy models 有链内判定", bModels.includes('case " m1 m2 " in *" $m "*)'), true);
-  check("buddy models 标注文案", bModels.includes("✅ = 已在链中"), true);
+  // 「免费」标注是脚本运行时的判定（倍率 0），生成期断言判定逻辑在
+  check("buddy models 按倍率判定免费", bModels.includes('if [ "$cr" = "0" ]'), true);
+  check("buddy models 标注文案", bModels.includes("0 = 免费"), true);
+  check("buddy models 报付费兜底", bModels.includes("m1 → m2"), true);
 
   // 自检脚本
   const bSt = buildBuddyStatusScript();
@@ -1979,7 +1992,7 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("buddy 状态报认证", bSt.includes(".codebuddy"), true);
   check("buddy 状态模型名过白名单", buildBuddyStatusScript("a;rm -rf /").includes("rm -rf"), false);
 
-  check("buddy 模型清单可跑", buildBuddyModelsScript().includes("codebuddy --help"), true);
+  check("buddy 模型清单读价格表", buildBuddyModelsScript().includes("local_storage"), true);
   check("buddy 新会话清标记", buildBuddyNewSessionScript().includes(BUDDY_SESSION_MARK), true);
 
   // 指令注册表：加了指令就必须同步帮助 / 菜单（否则文本和行为分叉）

@@ -253,7 +253,7 @@ import {
 //       ② 窗口起点另存 KV，实例被换掉后由巡检补账；③ 跨零点按 UTC 日切分；
 //       ④ 停机时刻按「最后活动 + 空闲超时」估，不再按「发现时刻」（会白记 30 分钟）。
 //       另：PAT 有 manage_billing:codespaces 时优先显示 GitHub 自己的账单数字。
-const BUILD = "devbot-20261029-v4.31";
+const BUILD = "devbot-20261029-v4.32";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -1389,19 +1389,19 @@ export class AssistantDO extends DurableObject<Env> {
           await this.ctx.storage.delete(`buddy_model:${chatId}`);
           await this.reply(
             chatId,
-            `🧩 Back to the free-quota-first chain: an unavailable model auto-switches to the next.\nChain: ${this.buddyChain().join(" → ")}`,
+            "🧩 Back to free-first: models priced at 0 credits are tried first (read live from CodeBuddy's own price table), and only if none of them works does it fall back to a paid one — and it will tell you when that happens.\nCurrent order: run /buddy models",
           );
           return;
         }
         if (!sanitizeModel(m)) {
           await this.reply(
             chatId,
-            `Invalid model name: ${m}\nUsage: /buddy model deepseek-v4.1-flash (or auto for the free chain)\nList: /buddy models`,
+            `Invalid model name: ${m}\nUsage: /buddy model deepseek-v4.1-flash (or "auto" for the free-first chain)\nList: /buddy models`,
           );
           return;
         }
         await this.ctx.storage.put(`buddy_model:${chatId}`, m);
-        await this.reply(chatId, `🧩 Pinned ${m} (no rotation; /buddy model auto returns to the free chain)`);
+        await this.reply(chatId, `🧩 Pinned ${m} (no rotation; /buddy model auto returns to free-first)`);
         return;
       }
       case "models":

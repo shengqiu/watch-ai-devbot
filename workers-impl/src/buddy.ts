@@ -5,8 +5,14 @@
  * 但认证方式完全不同 —— 这里不需要 API key：
  *   CodeBuddy 用浏览器 OAuth 登录，登录态落在机器的 `~/.codebuddy`（持久卷）。
  *   一次性在那台机器上跑一次交互式登录，之后所有 headless 调用都复用它。
- *   所以本文件里**没有** resolveKey 那套三级 key 兜底，也没有免费模型链
- *   （腾讯侧没有「按模型分桶的免费额度」，配额用尽就是整体不可用，换型号无意义）。
+ *   所以本文件里**没有** resolveKey 那套三级 key 兜底。
+ *
+ * 点数（credits）另说：CLI 自己不报账 —— `--output-format json` 里的
+ * `total_cost_usd` 恒为 0，也没有任何 points 字段（2026-10-29 实测）。
+ * 但它每次启动都会把 `GET https://copilot.tencent.com/v3/config` 的响应
+ * 明文缓存在 `~/.codebuddy/local_storage/*.info` 里，每个模型带一个
+ * `credits` 倍率：`"x0.11 credits"`。**`x0.00 credits` 才是免费的**，
+ * 其余全都扣点数 —— 这就是「哪个模型免费」的唯一可信来源，别再用印象猜。
  *
  * 工作目录固定为 BUDDY_DIR（用户 2026-10-28 要求：单独开一个 codebuddy 文件夹，
  * 让 CodeBuddy 只在这个目录里开发，并且该目录要 pre-trust，免得 headless 卡在
@@ -47,31 +53,100 @@ export const DEFAULT_BUDDY_MODELS: string[] = [
 ];
 
 /**
- * 免费额度优先链（2026-10-29 实测：16 个模型全部在免费额度内可用，含 pro 级）。
- *
- * 设计与 /gemini 的链同构，但机制不同：CodeBuddy 有原生的 `--fallback-model`
- * （「主模型过载时自动切换」，help 明说 only works with --print —— 正是我们的用法），
- * 所以链只有「当前首选 → 备选」两跳由 CLI 自己处理；跨多跳的降级由本脚本的外层
- * 循环完成（见 buildBuddyScript）。
- *
- * 排序原则：flash / lite 这类轻模型在前（响应快、免费池大），pro / 大参数殿后。
- * 顺序 = 自动降级的尝试顺序。
+ * 免费模型的**离线快照**（2026-10-29 取自 copilot.tencent.com/v3/config 全表）：
+ * 29 个按倍率计费的模型里，只有 `hy3` 是 `x0.00 credits`。
+ * 运行时以机器上的实时价格表为准，这里只是「表读不到」时的兜底，会过时会变。
  */
-export const DEFAULT_BUDDY_CHAIN: string[] = [
+export const DEFAULT_FREE_MODELS: string[] = ["hy3"];
+
+/**
+ * 付费兜底顺序（质量优先，不是价格优先）。
+ *
+ * 只在「免费模型全都不通」且没设 `BUDDY_FREE_ONLY=1` 时才会用到；
+ * 每当真的用上付费模型，脚本都会在 Telegram 里明说「这一跳 ×N 点数」，
+ * 不会悄悄花钱。倍率：deepseek-v4.1-flash ×0.11 / glm-5.3-flash ×0.08 /
+ * minimax-m3.1-flash ×0.08 / hy4-preview ×0.29。
+ */
+export const DEFAULT_PAID_FALLBACK: string[] = [
   "deepseek-v4.1-flash",
   "glm-5.3-flash",
   "minimax-m3.1-flash",
   "hy4-preview",
-  "glm-5.3",
-  "kimi-k3.1-pro",
-  "deepseek-v4-pro",
 ];
 /** 上次成功的模型（持久卷）。下次从它开始，避免每次都从链头试错。 */
 export const BUDDY_MODEL_FILE = "$HOME/.config/watch-ai/buddy-model";
 
+/** 机器上的实时价格表：每行 `模型id|点数倍率`（0 = 免费）。 */
+export const BUDDY_CREDITS_TABLE = "/tmp/ws-buddy-credits.tsv";
+
 /**
- * 解析 `BUDDY_MODELS` 环境变量（逗号/空格分隔）为链；非法名丢弃。
- * 空或全非法 → 默认链，绝不返回空数组。
+ * 从 CLI 的本地缓存里抽出「每个模型多少点数」的 node 小程序。
+ *
+ * 为什么读缓存而不是打接口：`/v3/config` 要 OAuth Bearer，那套 token 在
+ * `~/.codebuddy` 里是压缩+编码的，Worker 侧既拿不到也不该碰；而 CLI 每次
+ * 启动都会刷新这个缓存（mtime 就是新鲜度），读它零成本、零凭证。
+ *
+ * 约定：**不许出现单引号**（外面用 `node -e '...'` 包着），只用双引号。
+ * 输出 `id|credits`，拿不到就非零退出，由 bash 侧决定兜底。
+ */
+export const CREDITS_NODE_PROGRAM = [
+  'const fs=require("fs"),path=require("path"),os=require("os");',
+  "const home=process.env.CB_HOME||os.homedir();",
+  'const dir=path.join(home,".codebuddy","local_storage");',
+  "let files=[];try{files=fs.readdirSync(dir);}catch(e){process.exit(3);}",
+  'let best="",bt=-1;',
+  "for(const f of files){",
+  '  if(!f.endsWith(".info"))continue;',
+  "  const p=path.join(dir,f);",
+  "  try{const st=fs.statSync(p);",
+  "    if(st.mtimeMs>bt){const s=fs.readFileSync(p,\"utf8\");",
+  '      if(s.indexOf("credits")<0)continue;',
+  "      best=p;bt=st.mtimeMs;}}catch(e){}",
+  "}",
+  "if(!best)process.exit(4);",
+  "let arr;try{arr=JSON.parse(fs.readFileSync(best,\"utf8\"));}catch(e){process.exit(5);}",
+  "const list=Array.isArray(arr)?arr:[arr];",
+  "let models=null;",
+  "for(const e of list){if(e&&e.data&&Array.isArray(e.data.models))models=e.data.models;}",
+  "if(!models)process.exit(6);",
+  "const out=[];",
+  "for(const m of models){",
+  '  const g=String(m.credits||"").match(/([0-9]+(?:\\.[0-9]+)?)/);',
+  "  if(!m.id||!g)continue;",
+  // 归一化：0.00 → 0（bash 侧只认字符串 "0" 当免费）
+  '  out.push(m.id+"|"+Number(g[1]));',
+  "}",
+  "if(!out.length)process.exit(7);",
+  'process.stdout.write(out.join("\\n")+"\\n");',
+].join("");
+
+/** 探测价格表的 bash 片段：写 `BUDDY_CREDITS_TABLE`，按 id 排序，失败也只是空文件。 */
+export function creditsProbeLines(): string[] {
+  return [
+    `CREDF="${BUDDY_CREDITS_TABLE}"`,
+    `: > "$CREDF"`,
+    `node -e '${CREDITS_NODE_PROGRAM}' 2>/dev/null | sort -t'|' -k1,1 > "$CREDF" || true`,
+  ];
+}
+
+/**
+ * 由「免费清单 + 付费兜底」算出本次尝试顺序（纯函数，单测直接用）。
+ * 免费在前（保持传入顺序），付费在后并去重；`freeOnly` 时只留免费。
+ */
+export function buildChain(free: string[], paid: string[], freeOnly = false): string[] {
+  const out: string[] = [];
+  const push = (m: string) => {
+    const name = m.trim();
+    if (name && !out.includes(name)) out.push(name);
+  };
+  for (const m of free) push(m);
+  if (!freeOnly) for (const m of paid) push(m);
+  return out;
+}
+
+/**
+ * 解析 `BUDDY_MODELS` 环境变量（逗号/空格分隔）为**付费兜底**顺序；非法名丢弃。
+ * 空或全非法 → 默认付费兜底。免费那一段永远由机器上的实时表决定，不从这里来。
  */
 export function parseBuddyChain(raw: string | undefined): string[] {
   const out: string[] = [];
@@ -81,7 +156,7 @@ export function parseBuddyChain(raw: string | undefined): string[] {
     const ok = sanitizeModel(m).replace(/^-m\s+/, "");
     if (ok && !out.includes(ok)) out.push(ok);
   }
-  return out.length ? out : [...DEFAULT_BUDDY_CHAIN];
+  return out.length ? out : [...DEFAULT_PAID_FALLBACK];
 }
 /**
  * UTF-8 → base64。这里复用 gemini.ts 的实现（Workers 的 btoa 只吃 latin1）。
@@ -123,8 +198,10 @@ export function buildBuddyScript(
   const prompt = opts.prompt?.trim() ?? "";
   const L: string[] = ["("];
 
-  L.push(`mkdir -p ${BUDDY_DIR} 2>/dev/null || true`);
-  L.push(`cd ${BUDDY_DIR} 2>/dev/null || { echo "❌ 工作目录建不出来：${BUDDY_DIR}"; exit 1; }`);
+  // 工作目录可用 BUDDY_WORKDIR 覆盖（单测要能在临时目录里跑整条链）
+  L.push(`BD="\${BUDDY_WORKDIR:-${BUDDY_DIR}}"`);
+  L.push(`mkdir -p "$BD" 2>/dev/null || true`);
+  L.push(`cd "$BD" 2>/dev/null || { echo "❌ 工作目录建不出来：$BD"; exit 1; }`);
 
   // 免信任：headless 下虽然不一定弹窗，但 TUI 会；而且「信任」是安全边界，
   // 应该显式、可见地声明（写进 settings.json），而不是靠 --yes 之类偷偷绕过。
@@ -132,12 +209,13 @@ export function buildBuddyScript(
   L.push(`NS="${BUDDY_CONF_DIR}/settings.json"`);
   L.push(`mkdir -p "${BUDDY_CONF_DIR}" 2>/dev/null || true`);
   L.push(
-    `if ! grep -q '${BUDDY_DIR}' "$NS" 2>/dev/null; then ` +
+    `if ! grep -q "$BD" "$NS" 2>/dev/null; then ` +
       `node -e 'const fs=require("fs"),p=process.env.HOME+"/.codebuddy/settings.json";` +
       `let s={};try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){};` +
-      `const t=new Set(s.trustedDirectories||[]);t.add("${BUDDY_DIR}");` +
+      `const t=new Set(s.trustedDirectories||[]);` +
+      `t.add(process.env.BUDDY_WORKDIR||"${BUDDY_DIR}");` +
       `s.trustedDirectories=Array.from(t);fs.writeFileSync(p,JSON.stringify(s,null,2)+"\\n")' 2>/dev/null ` +
-      `&& echo "🔓 已把 ${BUDDY_DIR} 加进 trustedDirectories"; fi`,
+      `&& echo "🔓 已把 $BD 加进 trustedDirectories"; fi`,
   );
 
   L.push(...locateLines());
@@ -187,11 +265,22 @@ export function buildBuddyScript(
     L.push(`codebuddy \${C:-} -y ${model} -p "$P" </dev/null 2>&1 | tee "$OUT"`);
     L.push(`rc=\${PIPESTATUS[0]}`);
   } else {
-    // 自动模式：免费额度优先链。每跳 = `--model 当前 --fallback-model 下一跳`
-    // （fallback 是 CLI 原生能力，只在「过载」时触发；外层循环处理跨多跳的降级：
-    // 一跳彻底失败（rc≠0 且输出里没有 fallback 接管的迹象）就换下一跳从头试）。
-    const chain = (opts.chain?.length ? opts.chain : DEFAULT_BUDDY_CHAIN).slice(0, 6);
-    L.push(`CHAIN="${chain.join(" ")}"`);
+    // 自动模式：**免费优先**。免费清单不再写死在代码里，而是每次现读机器上的
+    // 价格表（CLI 启动时缓存下来的 /v3/config）——只有倍率 0 的算免费。
+    const paid = (opts.chain?.length ? opts.chain : DEFAULT_PAID_FALLBACK).slice(0, 6);
+    L.push(...creditsProbeLines());
+    L.push(`FREE="$(awk -F'|' '$2+0==0{print $1}' "$CREDF" 2>/dev/null | tr '\\n' ' ')"`);
+    L.push(`PAID="${paid.join(" ")}"`);
+    // 免费全挂时要不要动付费模型，由环境变量决定（默认允许，但会明说花了点数）
+    L.push(`[ -n "\${BUDDY_FREE_ONLY:-}" ] && PAID=""`);
+    L.push(
+      `CHAIN="$(printf '%s\\n' $FREE $PAID | awk 'NF&&!seen[$0]++' | tr '\\n' ' ')"`,
+    );
+    // 表读不到（CLI 还没跑过 / 缓存被清）才退回内置快照，并在输出里说明
+    L.push(`if [ -z "$(printf %s "$FREE" | tr -d ' ')" ]; then`);
+    L.push(`  echo "⚠️ 读不到 CodeBuddy 的价格表，先用内置快照：${DEFAULT_FREE_MODELS.join(" ")}"`);
+    L.push(`  CHAIN="$(printf '%s\\n' ${DEFAULT_FREE_MODELS.join(" ")} $CHAIN | awk 'NF&&!seen[$0]++' | tr '\\n' ' ')"`);
+    L.push(`fi`);
     L.push(`MODELF="${BUDDY_MODEL_FILE}"`);
     // 上次成功的模型提到最前：稳定性靠它，别每条消息都从链头试错
     L.push(`if [ -f "$MODELF" ]; then`);
@@ -201,23 +290,35 @@ export function buildBuddyScript(
     L.push(`rc=1; tried=""`);
     L.push(`for m in $CHAIN; do`);
     L.push(`  : > "$OUT"`);
+    // 本跳的点数倍率：0（或读不到）= 免费
+    L.push(`  CR=$(awk -F'|' -v m="$m" '$1==m{print $2; exit}' "$CREDF" 2>/dev/null)`);
+    L.push(`  [ -z "$CR" ] && CR="?"`);
     // 第一次尝试才续会话：换模型后旧会话可能属于另一个模型，硬续容易再失败一次
     L.push(`  G=""; if [ -z "$tried" ] && [ -f "${BUDDY_SESSION_MARK}" ]; then G="-c"; else G=""; fi`);
-    // 下一跳作为本跳的原生 fallback：单次调用内 CLI 自己处理「过载 → 切换」
     L.push(`  next="$(printf %s " $CHAIN " | sed "s/^ *$m */ /" | awk "{print \\$1}" | grep . || true)"`);
-    L.push(`  FB=""; [ -n "$next" ] && FB="--fallback-model $next"`);
+    // 原生 fallback 只在「同一档位」之间开：free→paid 静默切换等于偷偷扣点数，
+    // 那种降级交给外层循环，至少会打一行字告诉你「换成了 ×0.11 的模型」。
+    L.push(`  FB=""`);
+    L.push(`  if [ -n "$next" ]; then`);
+    L.push(`    CRN=$(awk -F'|' -v m="$next" '$1==m{print $2; exit}' "$CREDF" 2>/dev/null)`);
+    L.push(`    [ -z "$CRN" ] && CRN="?"`);
+    L.push(`    if [ "$CR" = "0" ] && [ "$CRN" != "0" ]; then FB=""; else FB="--fallback-model $next"; fi`);
+    L.push(`  fi`);
     L.push(`  codebuddy \${G:-} -y --model "$m" $FB -p "$P" </dev/null 2>&1 | tee "$OUT"`);
     L.push(`  rc=\${PIPESTATUS[0]}`);
     L.push(`  if [ $rc -eq 0 ]; then`);
     L.push(`    mkdir -p "$(dirname "$MODELF")"; printf %s "$m" > "$MODELF"`);
-    L.push(`    [ -n "$tried" ] && echo "" && echo "✅ 本次由 $m 回答（前面试过：$tried）"`);
+    L.push(`    if [ -n "$tried" ]; then echo ""; echo "✅ $m 接住了（前面试过：$tried）"; fi`);
+    L.push(`    if [ "$CR" != "0" ] && [ "$CR" != "?" ]; then echo "💸 这一跳是付费模型：$m ×$CR 点数（免费的都没通）"; fi`);
     L.push(`    break`);
     L.push(`  fi`);
     L.push(`  tried="$tried $m"`);
     L.push(`  echo ""`);
-    L.push(`  echo "⚠️ $m 不可用，换链上下一个免费模型…"`);
+    L.push(`  if [ "$CR" = "0" ]; then echo "⚠️ 免费模型 $m 不可用，换下一个…";`);
+    L.push(`  elif [ "$CR" = "?" ]; then echo "⚠️ $m 不可用，换下一个…";`);
+    L.push(`  else echo "⚠️ $m 不可用（×$CR 点数），换下一个…"; fi`);
     L.push(`done`);
-    L.push(`if [ $rc -ne 0 ] && [ -n "$tried" ]; then echo ""; echo "❌ 链上的模型都试过了：$tried"; echo "   可 /buddy model <名字> 手动指定。"; fi`);
+    L.push(`if [ $rc -ne 0 ] && [ -n "$tried" ]; then echo ""; echo "❌ 链上的都试过了：$tried"; echo "   /buddy model <名字> 手动指定；/buddy models 看点数倍率。"; fi`);
   }
   // 成功才建会话标记：失败的那次没有可续的会话，提前建标记会让下一条报「无会话可续」
   L.push(`if [ $rc -eq 0 ]; then mkdir -p "$(dirname "${BUDDY_SESSION_MARK}")"; touch "${BUDDY_SESSION_MARK}"; fi`);
@@ -226,46 +327,59 @@ export function buildBuddyScript(
   return L.join("\n");
 }
 
-/** 环境自检：装没装 / 目录对不对 / 信任了没 / 有没有可续的会话。 */
+/** 环境自检：装没装 / 目录对不对 / 信任了没 / 有没有可续的会话 / 当前哪些模型免费。 */
 export function buildBuddyStatusScript(model?: string, chain?: string[]): string {
   const pinned = model ? sanitizeModel(model).replace(/^-m\s+/, "") : "";
-  const list = chain?.length ? chain : DEFAULT_BUDDY_CHAIN;
+  const paid = chain?.length ? chain : DEFAULT_PAID_FALLBACK;
   return [
     "(",
-    `mkdir -p ${BUDDY_DIR} 2>/dev/null || true`,
-    `cd ${BUDDY_DIR} 2>/dev/null || echo "⚠️ 工作目录不存在：${BUDDY_DIR}"`,
+    `BD="\${BUDDY_WORKDIR:-${BUDDY_DIR}}"`,
+    `mkdir -p "$BD" 2>/dev/null || true`,
+    `cd "$BD" 2>/dev/null || echo "⚠️ 工作目录不存在：$BD"`,
     `export PATH="$HOME/nvm/current/bin:/usr/local/share/nvm/current/bin:$HOME/.local/bin:$PATH"`,
     ...locateLines(),
     `if command -v codebuddy >/dev/null 2>&1; then echo "CLI：✓ $(codebuddy --version 2>/dev/null | tail -1)（$(command -v codebuddy)）"; else echo "CLI：✗ 未安装（发 /buddy 自动装）"; fi`,
-    `if grep -q '${BUDDY_DIR}' "${BUDDY_CONF_DIR}/settings.json" 2>/dev/null; then echo "信任：✓ ${BUDDY_DIR} 已在 trustedDirectories"; else echo "信任：✗ 未声明（下次调用会自动补上）"; fi`,
+    `if grep -q "$BD" "${BUDDY_CONF_DIR}/settings.json" 2>/dev/null; then echo "信任：✓ $BD 已在 trustedDirectories"; else echo "信任：✗ 未声明（下次调用会自动补上）"; fi`,
     // 登录态没法离线判定（token 存在 local_storage 的加密条目里），只能说清「在哪、怎么补」
     `if [ -d "${BUDDY_CONF_DIR}" ]; then echo "认证：✓ 已初始化 ~/.codebuddy（OAuth 登录态；失效时 headless 会直接报鉴权错误）"; else echo "认证：✗ 没登录过（需要在机器里交互式跑一次 codebuddy 完成浏览器授权）"; fi`,
+    ...creditsProbeLines(),
+    `FREE="$(awk -F'|' '$2+0==0{print $1}' "$CREDF" 2>/dev/null | tr '\\n' ' ')"`,
     pinned
-      ? `echo "模型：固定 ${pinned}（不自动切换；/buddy model auto 回到免费链）"`
-      : `echo "模型：免费额度优先链（${list.join(" → ")}）"; last="$(cat ${BUDDY_MODEL_FILE} 2>/dev/null)"; echo "优先：\${last:-${list[0]}}（上次成功的提到最前）"`,
+      ? `echo "模型：固定 ${pinned}（不自动切换；/buddy model auto 回到免费优先）"`
+      : `echo "模型：免费优先（免费清单现读价格表：\${FREE:-读不到，用内置快照 ${DEFAULT_FREE_MODELS.join(" ")}））"`,
+    pinned ? null : `echo "免费等于倍率 0；免费全挂才试：${paid.join(" → ")}"`,
+    `last="$(cat ${BUDDY_MODEL_FILE} 2>/dev/null)"; [ -n "$last" ] && echo "上次成功：$last"`,
+    `if [ -s "$CREDF" ]; then echo "点数表：$(wc -l < "$CREDF" | tr -d ' ') 个模型（缓存 $(( ( $(date +%s) - $(stat -c %Y "$CREDF" 2>/dev/null || echo 0) ) / 60 )) 分钟前刷新）"; else echo "点数表：✗ 读不到（发一条 /buddy 会重新生成）"; fi`,
     `if [ -f "${BUDDY_SESSION_MARK}" ]; then echo "会话：有（下条会用 -c 续）"; else echo "会话：无（下条开新会话）"; fi`,
     `echo "目录：$(pwd)"`,
     ")",
-  ].join("\n");
+  ]
+    .filter((x): x is string => x !== null)
+    .join("\n");
 }
 
 /** 列出 CLI 支持的模型：优先现查 help（跟版本走），查不到用兜底常量；标注哪些在免费链里。 */
 export function buildBuddyModelsScript(chain?: string[]): string {
-  const list = chain?.length ? chain : DEFAULT_BUDDY_CHAIN;
+  const paid = chain?.length ? chain : DEFAULT_PAID_FALLBACK;
   return [
     "(",
     `export PATH="$HOME/nvm/current/bin:/usr/local/share/nvm/current/bin:$HOME/.local/bin:$PATH"`,
     ...locateLines(),
     `if ! command -v codebuddy >/dev/null 2>&1; then echo "CLI 还没装，发一次 /buddy 会自动装。"; exit 2; fi`,
-    `echo "免费额度优先链（自动降级顺序）：${list.join(" → ")}"`,
-    `last="$(cat ${BUDDY_MODEL_FILE} 2>/dev/null)"; [ -n "$last" ] && echo "上次成功：$last"`,
-    `echo ""; echo "CLI 支持的模型（来自 codebuddy --help；✅ = 已在链中）："`,
-    `LIST=$(codebuddy --help 2>/dev/null | tr ',' '\\n' | sed -n 's/.*Currently supported: *(//; s/[() ]//g' | grep -E '^[a-z0-9._-]+$')`,
-    `if [ -z "$LIST" ]; then echo "  （help 里没解析出来，按内置清单显示）"; LIST="${DEFAULT_BUDDY_MODELS.join(" ")}"; fi`,
-    `printf '%s\\n' $LIST | while read -r m; do`,
-    `      case " ${list.join(" ")} " in *" $m "*) echo "  ✅ $m" ;; *) echo "     $m" ;; esac`,
-    `    done`,
-    `echo ""; echo "用法：/buddy model <名字> 固定；/buddy model auto 回到免费链"`,
+    ...creditsProbeLines(),
+    `if [ -s "$CREDF" ]; then`,
+    `  echo "点数倍率（来自 CodeBuddy 自己的价格表 /v3/config，0 = 免费）："`,
+    `  sort -t'|' -k2,2g "$CREDF" | while IFS='|' read -r id cr; do`,
+    `    if [ "$cr" = "0" ]; then tag="free  "; else tag="×$cr"; fi`,
+    `    printf '  %-8s %s\\n' "$tag" "$id"`,
+    `  done`,
+    `else`,
+    `  echo "⚠️ 读不到价格表（CLI 还没在这台机器上跑过？随手发一条 /buddy 就会生成）"`,
+    `fi`,
+    `last="$(cat ${BUDDY_MODEL_FILE} 2>/dev/null)"; [ -n "$last" ] && echo "" && echo "上次成功：$last"`,
+    `echo ""`,
+    `echo "免费优先；免费全挂时才按这个顺序试付费：${paid.join(" → ")}"`,
+    `echo "用法：/buddy model <名字> 固定；/buddy model auto 回到免费优先"`,
     ")",
   ].join("\n");
 }

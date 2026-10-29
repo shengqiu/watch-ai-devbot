@@ -63,10 +63,12 @@ export interface Env {
    */
   GEMINI_MODELS?: string;
   /**
-   * CodeBuddy 免费额度优先链（var；逗号/空格分隔，按顺序降级）。
-   * 2026-10-29 实测 16 个模型全部在免费额度内；链配合 CLI 原生 --fallback-model
-   * （单跳）+ 脚本外层循环（多跳）实现「不可用自动换下一个」。
-   * 不配则用代码里的 DEFAULT_BUDDY_CHAIN。
+   * CodeBuddy **付费兜底**顺序（var；逗号/空格分隔）。
+   *
+   * 免费清单不在这里配：那是运行时从机器上的价格表（CLI 缓存的 /v3/config）
+   * 现读的，只有 `credits` 倍率为 0 的才算免费（2026-10-29 全表 29 个模型里
+   * 只有 hy3）。这里只决定「免费全挂之后按什么顺序试付费模型」。
+   * 不配则用代码里的 DEFAULT_PAID_FALLBACK。
    */
   BUDDY_MODELS?: string;
   ANTHROPIC_API_KEY?: string;

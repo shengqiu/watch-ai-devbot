@@ -221,12 +221,19 @@ import {
 //       (chatId, text) => ...，第三个参数 opts（含 markdown 标志）被当场丢弃，
 //       AI 输出实际仍是纯文本（逻辑测试全绿：它们直接 new ShellHub，不走这条
 //       真机接线）。现改为三参原样转发，并加源码文本断言护栏（谁改丢谁红）。
-// v4.24：Slack 通道（与 Telegram 同一条 DO 流水线，chatId `slack:` 前缀隔离状态；
+// v4.24：/buddy 免费额度优先链（用户要求「尽量优先选择免费的额度」）。
+//       实测推翻旧判断：16 个模型全部在免费额度内可用（含 pro 级），CLI 还有
+//       原生 --fallback-model（过载自动切换，only works with --print —— 正合用法）。
+//       机制：链（flash 系优先，BUDDY_MODELS 可覆盖）+ 每跳 --model X
+//       --fallback-model 下一跳 + 外层循环跨多跳降级 + 上次成功模型记忆
+//       （持久卷 buddy-model 文件，提到链头）。/buddy model auto 回链。
+// v4.25：/verify 验证挑战总闸（用户要求「在 telegram 里 slash 打开或关上验证」）。
+//       /verify 看状态（含会话剩余分钟）、on 开启（默认）、off 关闭（安全降级开关，
+//       按 chat 持久，DO storage）。off 时白名单消息直达流水线；验证词开机口令不受
+//       影响（5.7 在闸门外）。on 回来时旧会话作废、立即重新挑战。
+// v4.26：Slack 通道（与 Telegram 同一条 DO 流水线，chatId `slack:` 前缀隔离状态；
 //       agent/codespace 通信零改动）+ 恢复被陈旧工作副本覆盖的集成。
-//       同期并入 /buddy 免费额度优先链：16 模型实测全免费 + CLI 原生
-//       --fallback-model 单跳 + 外层循环多跳降级 + 上次成功模型记忆
-//       （链由 BUDDY_MODELS 覆盖，/buddy model auto 回链）。
-const BUILD = "devbot-20261029-v4.24";
+const BUILD = "devbot-20261029-v4.26";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -692,47 +699,53 @@ export class AssistantDO extends DurableObject<Env> {
     //     下一条消息重新走验证（2026-10-28 用户要求「严格 10 分钟」，原为 30）。
     //   - 答案 VERIFY_ANSWER 走 secret（不在公开源码里）；未配置 = 服务锁定（默认安全）。
     //   - 设备限制由「白名单账号」达成（Telegram 不提供设备信息）。
+    //   - /verify off 可整体关掉验证挑战（v4.25，按 chat 持久）：这是用户自己权衡的
+    //     降级开关，关掉后所有消息直达流水线（仍受 ALLOWED_USERS 白名单约束）。
     const now = Date.now();
     const verifyAnswer = this.env.VERIFY_ANSWER;
     const sessionMs = this.verifySessionMs();
     const fp = verifyAnswer ? answerFingerprint(verifyAnswer) : "";
-    const state = await this.getVerify(m.chatId);
-    if (!isVerified(state, now, fp)) {
-      if (verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
-        await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
-        const pending = await this.takePendingCmd(m.chatId, now);
-        if (!pending) {
-          await this.reply(m.chatId, "验证通过 ✓（10 分钟内互动免验证）");
-          // 「哈哈」同时是开机口令（用户 2026-10-27 定）：验证完顺手把机器拉起来
-          await this.bootOnPassword(m.chatId);
+    const verifyOff = await this.verifyGateOff(m.chatId);
+    if (!verifyOff) {
+      const state = await this.getVerify(m.chatId);
+      if (!isVerified(state, now, fp)) {
+        if (verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
+          await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
+          const pending = await this.takePendingCmd(m.chatId, now);
+          if (!pending) {
+            await this.reply(m.chatId, "验证通过 ✓（10 分钟内互动免验证）");
+            // 「哈哈」同时是开机口令（用户 2026-10-27 定）：验证完顺手把机器拉起来
+            await this.bootOnPassword(m.chatId);
+            return;
+          }
+          // 有暂存命令：告知 + 落回正常流水线执行（不 return）
+          await this.reply(
+            m.chatId,
+            `验证通过 ✓（10 分钟内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
+          );
+          text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
+          source = `${source}+replay`;
+          console.log(`[${channel}] 验证通过后补执行暂存命令 chat=${m.chatId} cmd=${previewCmd(pending, 60)}`);
+        } else {
+          // 未通过：像命令的才记下来（输错的验证词不该在验证后被当成命令执行）
+          const remember = looksLikeCommand(text);
+          if (remember) await this.rememberPendingCmd(m.chatId, text, now);
+          await this.setVerify(m.chatId, 0); // 保持未验证
+          await this.reply(
+            m.chatId,
+            verifyAnswer
+              ? remember
+                ? `${CHALLENGE_TEXT}\n\n（你这条我记着了，回验证词后自动执行）`
+                : CHALLENGE_TEXT
+              : `${CHALLENGE_TEXT}\n（管理员未配置验证答案，服务锁定中）`,
+          );
           return;
         }
-        // 有暂存命令：告知 + 落回正常流水线执行（不 return）
-        await this.reply(
-          m.chatId,
-          `验证通过 ✓（10 分钟内互动免验证）\n▶ 执行你刚才那条：${previewCmd(pending)}`,
-        );
-        text = pending; // 后面所有分支（开发机指令 / shell / 控制词）照常处理它
-        source = `${source}+replay`;
-        console.log(`[${channel}] 验证通过后补执行暂存命令 chat=${m.chatId} cmd=${previewCmd(pending, 60)}`);
-      } else {
-        // 未通过：像命令的才记下来（输错的验证词不该在验证后被当成命令执行）
-        const remember = looksLikeCommand(text);
-        if (remember) await this.rememberPendingCmd(m.chatId, text, now);
-        await this.setVerify(m.chatId, 0); // 保持未验证
-        await this.reply(
-          m.chatId,
-          verifyAnswer
-            ? remember
-              ? `${CHALLENGE_TEXT}\n\n（你这条我记着了，回验证词后自动执行）`
-              : CHALLENGE_TEXT
-            : `${CHALLENGE_TEXT}\n（管理员未配置验证答案，服务锁定中）`,
-        );
-        return;
+
       }
+      // 已验证（或刚验证通过）→ 滑动延续
+      await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
     }
-    // 已验证（或刚验证通过）→ 滑动延续
-    await this.setVerify(m.chatId, nextExpiry(now, sessionMs), fp);
 
     // 5.6) 终端级互动续命（在 text 就绪后判定）：只有开发机相关消息才刷新看门狗，
     //      纯聊天不续命——防止将来接 LLM 后「聊天把机器聊到永不关机」。
@@ -821,6 +834,9 @@ export class AssistantDO extends DurableObject<Env> {
           // chatId 带 slack: 前缀时，Telegram 的 sendMessage 会拿 "slack:C123"
           // 当 chat_id 去 Telegram 发，必然失败（v4.23 修）。
           await this.diagnose(m.chatId, (t) => this.sendPlain(m.chatId, t));
+          return;
+        case "verify":
+          await this.handleVerify(m.chatId, args);
           return;
       }
     }
@@ -1037,6 +1053,44 @@ export class AssistantDO extends DurableObject<Env> {
     } catch (e) {
       return `查询失败：${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
     }
+  }
+
+  /**
+   * /verify：验证挑战总闸（v4.25）。
+   * 无参 = 看状态；on/off = 开关。状态里附带「本次会话何时过期」，让 10 分钟滑动窗口可见。
+   */
+  private async handleVerify(chatId: string, args: string): Promise<void> {
+    const key = args.trim().toLowerCase();
+    if (key === "off" || key === "关") {
+      await this.setVerifyGate(chatId, true);
+      await this.reply(
+        chatId,
+        "🔓 验证挑战已关闭：白名单账号的消息直达所有功能，不再要验证词。\n（安全降级开关：关闭期间任何登录该账号的设备都能用；/verify on 立即恢复）",
+      );
+      return;
+    }
+    if (key === "on" || key === "开") {
+      await this.setVerifyGate(chatId, false);
+      await this.reply(
+        chatId,
+        "🔒 验证挑战已开启：闲置 10 分钟后要重新回答验证词（每次互动滑动延续）。\n下一条消息立即生效。",
+      );
+      return;
+    }
+    // 无参或未知参数 = 状态
+    if (key && key !== "status" && key !== "状态") {
+      await this.reply(chatId, `参数不认识：${key}\n用法：/verify（看状态）/verify on /verify off`);
+      return;
+    }
+    const off = await this.verifyGateOff(chatId);
+    const state = await this.getVerify(chatId);
+    const remainMin = state && state.exp > Date.now() ? Math.ceil((state.exp - Date.now()) / 60_000) : 0;
+    const line = off
+      ? "验证挑战：关（消息直达，不需要验证词）"
+      : state && state.exp > Date.now()
+        ? `验证挑战：开（本次会话已验证，约 ${remainMin} 分钟后过期）`
+        : "验证挑战：开（当前未验证，下一条消息会要验证词）";
+    await this.reply(chatId, `${line}\n开关：/verify on /verify off`);
   }
 
   /** 「用量」：本月累计运行时长（cs_runtime 表）+ 当前窗口状态。 */
@@ -2370,6 +2424,23 @@ export class AssistantDO extends DurableObject<Env> {
     return (Number.isFinite(min) && min > 0 ? min : VERIFY_SESSION_DEFAULT_MIN) * 60_000;
   }
 
+  // ---- /verify：验证挑战的总闸（v4.25，按 chat 持久） ----
+  // 默认开启（没有存储记录 = on，绝不把「没配置」当成「关」）。
+  // 关闭是用户自己权衡的安全降级：关掉后白名单账号的所有消息直达流水线，
+  // 不再回答验证词。重新开启立即恢复挑战。
+  private async verifyGateOff(chatId: string): Promise<boolean> {
+    return (await this.ctx.storage.get<boolean>(`verify_off:${chatId}`)) === true;
+  }
+
+  private async setVerifyGate(chatId: string, off: boolean): Promise<void> {
+    const key = `verify_off:${chatId}`;
+    if (off) await this.ctx.storage.put(key, true);
+    else await this.ctx.storage.delete(key);
+    // 状态切换时清理会话残留：off → 给一个已验证的长会话（省得 on 回来立刻要词）；
+    // on → 旧会话作废，下一条消息重新挑战（关闭期间谁都可能用过这个 chat）
+    await this.setVerify(chatId, off ? nextExpiry(Date.now(), this.verifySessionMs()) : 0, "");
+  }
+
   // 看门狗配置（vars）
   /** 空闲提醒阈值（分钟，默认 25） */
   private watchRemindMin(): number {
@@ -2451,7 +2522,8 @@ export class AssistantDO extends DurableObject<Env> {
    */
   private async syncMenuOnce(): Promise<void> {
     // 版本化 key：指令表变了就 +1，否则老 DO 里的 true 会永久压住同步、新指令进不了菜单
-    const key = "menu_synced_v2";
+    // v3：v4.25 新增 /verify（指令表变了，菜单要重同步一次）
+    const key = "menu_synced_v3";
     try {
       if (await this.ctx.storage.get<boolean>(key)) return;
       await this.tg.call("setMyCommands", { commands: menuCommands() });

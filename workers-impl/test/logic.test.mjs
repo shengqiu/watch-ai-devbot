@@ -756,6 +756,21 @@ const {
   check("footerNote 未知退出码", footerNote(null, "/a"), "\n— exit ? · /a");
 }
 
+// ---- /verify：验证挑战总闸（v4.25）----
+{
+  const verifySpec = COMMANDS.find((c) => c.name === "verify");
+  check("verify 已注册", Boolean(verifySpec), true);
+  check("verify 进 Telegram 菜单", menuCommands().some((m) => m.command === "verify"), true);
+  check("/verify 能被匹配", matchCommand("/verify").spec.name, "verify");
+  check("verify 中文别名能匹配", matchCommand("/验证").spec.name, "verify");
+  check("/verify off 有细节", (renderCommandHelp("verify") ?? "").includes("off"), true);
+  check("verify 帮助写明安全降级", (renderCommandHelp("verify") ?? "").includes("降级"), true);
+  check("总帮助列出 /verify", renderHelp().includes("/verify"), true);
+  check("总帮助提到 verify 开关", renderHelp().includes("/verify off"), true);
+  // verify 不算终端互动（touch 未设）：开关验证不该续命看门狗（纯配置操作）
+  check("verify 不续命看门狗", verifySpec.touch === true, false);
+}
+
 // ---- ShellHub 状态机：离线/排队/输出刷写/串行 ----
 {
   const sent = [];

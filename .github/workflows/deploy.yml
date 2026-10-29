@@ -68,6 +68,11 @@ jobs:
       # 这道检查只读源码文本，放在 workflow 里（对方不会碰这个文件），
       # 任何人把 Slack 接线删掉都会在这里卡红，阻止上线。
       - name: Wiring guard（Slack 接线必须存在）
+        # 注意：这个 job 的默认 working-directory 是 workers-impl，
+        # 而下面的路径按「仓库根」写 —— 必须用 step 级 working-directory 切回根目录，
+        # 否则会把 workers-impl/workers-impl/... 找空（第一次跑就踩了这个坑：
+        # 护栏正确地拦下了部署，但原因是路径写错而不是接线真的缺失）。
+        working-directory: .
         run: |
           fail=0
           check_present() {

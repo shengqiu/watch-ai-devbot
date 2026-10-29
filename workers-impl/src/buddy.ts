@@ -370,8 +370,9 @@ export function buildBuddyModelsScript(chain?: string[]): string {
     `if [ -s "$CREDF" ]; then`,
     `  echo "点数倍率（来自 CodeBuddy 自己的价格表 /v3/config，0 = 免费）："`,
     `  sort -t'|' -k2,2g "$CREDF" | while IFS='|' read -r id cr; do`,
-    `    if [ "$cr" = "0" ]; then tag="free  "; else tag="×$cr"; fi`,
-    `    printf '  %-8s %s\\n' "$tag" "$id"`,
+    `    if [ "$cr" = "0" ]; then tag="✅ free"; else tag="×$cr"; fi`,
+    // 模型名是 ASCII，按名字补齐才对齐（printf 的宽度算字节，中文标签会歪）
+    `    printf '  %-22s %s\\n' "$id" "$tag"`,
     `  done`,
     `else`,
     `  echo "⚠️ 读不到价格表（CLI 还没在这台机器上跑过？随手发一条 /buddy 就会生成）"`,

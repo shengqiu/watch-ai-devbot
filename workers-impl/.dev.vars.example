@@ -35,3 +35,10 @@ DEEPSEEK_API_KEY=
 # SLACK_SIGNING_SECRET=8f742231b10e...
 # Slack 白名单（逗号分隔 user id；空 = 放开）
 # SLACK_ALLOWED_USERS=U0123ABCDEF
+
+# ---- Codespace 开发机（/boot /halt /cs /usage）----
+# classic PAT，需要 codespace 权限；额外加 manage_billing:codespaces 才能让 /usage
+# 直接显示 GitHub 官方账单数字（不加也能用：退回本地账本，跨部署不丢）
+# GH_CODESPACE_PAT=ghp_...
+# GH_CODESPACE_NAME=24h-977gg5v9vcp5wq
+# GH_LOGIN=shengqiu

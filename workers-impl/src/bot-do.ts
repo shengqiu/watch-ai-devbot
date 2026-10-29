@@ -253,7 +253,7 @@ import {
 //       ② 窗口起点另存 KV，实例被换掉后由巡检补账；③ 跨零点按 UTC 日切分；
 //       ④ 停机时刻按「最后活动 + 空闲超时」估，不再按「发现时刻」（会白记 30 分钟）。
 //       另：PAT 有 manage_billing:codespaces 时优先显示 GitHub 自己的账单数字。
-const BUILD = "devbot-20261029-v4.30";
+const BUILD = "devbot-20261029-v4.31";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；

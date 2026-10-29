@@ -11,14 +11,11 @@ import type { Env } from "./env";
 export interface Endpoints {
   /** Telegram Bot API 根（不含 /bot<token>） */
   telegramApiBase: string;
-  /** Slack Web API 根（chat.postMessage 等方法的前缀） */
-  slackApiBase: string;
 }
 
 /** 官方默认值。覆盖方式见 wrangler.toml [vars] 注释块 */
 export const DEFAULT_ENDPOINTS = {
   telegramApiBase: "https://api.telegram.org",
-  slackApiBase: "https://slack.com/api",
 } as const;
 
 /** 去空白 + 去尾部斜杠；空值回退默认 */
@@ -30,6 +27,5 @@ function clean(u: string | undefined, fallback: string): string {
 export function endpoints(env: Env): Endpoints {
   return {
     telegramApiBase: clean(env.TELEGRAM_API_BASE, DEFAULT_ENDPOINTS.telegramApiBase),
-    slackApiBase: clean(env.SLACK_API_BASE, DEFAULT_ENDPOINTS.slackApiBase),
   };
 }

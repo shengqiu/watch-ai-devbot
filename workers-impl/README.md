@@ -183,26 +183,20 @@ npx wrangler secret list                       # 查看已注入的密钥名
 ## 文件地图
 
 ```
-src/index.ts            Worker 入口（路由转发 + /setup 注册 webhook + /slack/* 验签转发）
-src/config.ts           外部服务地址集中解析（Telegram/Slack 端点，默认官方地址、环境变量可覆盖）
-src/bot-do.ts           ★ Durable Object：消息流水线/意图路由/回包/状态存储（Telegram+Slack 共用）
+src/index.ts            Worker 入口（路由转发 + /setup 注册 webhook）
+src/config.ts           外部服务地址集中解析（Telegram 端点，默认官方地址、环境变量可覆盖）
+src/bot-do.ts           ★ Durable Object：消息流水线/意图路由/回包/状态存储
 src/telegram/client.ts  Telegram Bot API 客户端（setWebhook/sendMessage/getFile/下载）
-src/telegram/update.ts  Update → Incoming 提取（chat_id/text/voice）+ 通道判定（channelOf）
+src/telegram/update.ts  Update → Incoming 提取（chat_id/text/voice）
 src/telegram/types.ts   Telegram 类型（Update/Message/Voice/File）
 src/telegram/markdown.ts LLM markdown → MarkdownV2 安全转换（代码块渲染 + 防 400）
-src/slack/client.ts     Slack Web API 客户端（chat.postMessage + mrkdwn + 429 退避）
-src/slack/update.ts     Events/Slash → SlackIncoming 提取（chatId `slack:` 前缀 + bot 过滤）
-src/slack/verify.ts     Slack 请求验签（v0 HMAC + 时间窗，fail-closed）
-src/slack/markdown.ts   LLM markdown → Slack mrkdwn 安全转换
-src/slack/types.ts      Slack 类型（事件包装/指令表单/握手）
 src/router/intent.ts    意图解析（厂商别名 / 档位 / fallback 链）
 src/router/providers.ts 厂商配置加载 + 统一 chat/chatChain（fallback）
 src/asr.ts              语音转写（OpenAI 兼容 STT）+ 长文本分段
 src/env.ts              环境绑定类型
 providers.json          厂商配置（模型档位/base_url/headers；${ENV} 占位）
-slack-app-manifest.yml  Slack App 一键配置清单（Events API + Slash Commands）
 wrangler.toml           DO 绑定 / SQLite 迁移 / vars
-test/logic.test.mjs     纯逻辑单测（意图/分段/提取/Slack 通道/验签）
+test/logic.test.mjs     纯逻辑单测（意图/分段/Update 提取）
 ```
 
 ## 已知边界（诚实清单）

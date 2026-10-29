@@ -10,8 +10,6 @@
  *   GET  /shell/stream            → agent 下行命令通道（SSE 长连接，需 HMAC 签名头）
  *   POST /shell/out               → agent 回传命令输出（需 HMAC 签名头）
  *   GET  /shell/status            → shell 通道诊断（需 X-Admin-Key 头）
- *   POST /slack/events            → Slack Events API 入口（X-Slack-Signature 验签）
- *   POST /slack/commands          → Slack Slash Commands 入口（同上验签）
  *   管理端点鉴权一律走请求头（Authorization: Bearer <ADMIN_KEY> 或 X-Admin-Key），
  *   绝不接受 ?key= 查询串——避免密钥被访问日志 / 代理遥测记录（安全审查 #8）。
  */
@@ -21,7 +19,6 @@ import { TelegramClient } from "./telegram/client";
 import { guardMode, webhookVerdict } from "./telegram-ip";
 import { adminGate, reloadGate, reloadVerdict, reloadErrorResponse, rateLimitedResponse, clientIp, ADMIN_FAIL_LIMIT, ADMIN_FAIL_WINDOW_MS } from "./admin-auth";
 import { FailWindow } from "./agent-auth";
-import { verifySlackRequest } from "./slack/verify";
 
 // Durable Object 必须从入口导出（wrangler 据此注册绑定）
 export { AssistantDO } from "./bot-do";
@@ -71,7 +68,6 @@ function isAdminProxy(pathname: string): boolean {
     pathname === "/send" ||
     pathname === "/patrol" ||
     pathname === "/shell/status" ||
-    pathname === "/slackstatus" ||
     pathname === "/admin/agents" ||
     pathname.startsWith("/admin/agents/")
   );
@@ -143,33 +139,6 @@ export default {
             method: "POST",
             headers: request.headers,
             body: request.body,
-          }),
-        );
-      }
-
-      // Slack 通道（Events API + Slash Commands）：与 Telegram 同一条 DO 流水线，
-      // chatId 用 `slack:<channel>` 前缀隔离状态命名空间；agent/codespace 侧零改动。
-      // 验签必须在读原始 body 后做（签名覆盖逐字节请求体），所以这里先 text() 再透传。
-      if (url.pathname === "/slack/events" || url.pathname === "/slack/commands") {
-        if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
-        // 通道总开关（SLACK_ENABLED="0" = 关闭；token/secret 未配也等于关闭）
-        if (env.SLACK_ENABLED === "0" || !env.SLACK_BOT_TOKEN || !env.SLACK_SIGNING_SECRET) {
-          return new Response("slack channel not configured", { status: 404 });
-        }
-        const raw = await request.text();
-        const bad = await verifySlackRequest(
-          env.SLACK_SIGNING_SECRET,
-          request.headers.get("X-Slack-Signature"),
-          request.headers.get("X-Slack-Request-Timestamp"),
-          raw,
-        );
-        if (bad) return bad;
-        // 验签通过后把原始文本透传给 DO（DO 内做握手/提取/流水线处理）
-        return stub.fetch(
-          new Request(`http://do${url.pathname}`, {
-            method: "POST",
-            headers: { "Content-Type": request.headers.get("Content-Type") ?? "application/json" },
-            body: raw,
           }),
         );
       }

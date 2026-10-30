@@ -423,7 +423,7 @@ function shellAlertText(offMin: number, repeat: boolean): string {
     `${head}\n` +
     `In this state command replies never arrive; it looks like 'commands do nothing'.\n` +
     `Common causes: the agent crashed, the machine just woke up, or the Worker reloaded (it reconnects on its own).\n` +
-    `Check /cs first; if it stays down, /halt then /boot (unsaved work will be lost, double-check first).`
+    `Check /status first; if it stays down, /halt then /boot (unsaved work will be lost, double-check first).`
   );
 }
 

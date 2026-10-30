@@ -203,7 +203,7 @@ export async function checkBoot(client: CodespaceClient): Promise<BootCheck> {
   try {
     state = (await client.status()).state;
   } catch {
-    return { reply: "Boot confirmation query failed; check /cs manually in a bit.", ok: false, pending: false };
+    return { reply: "Boot confirmation query failed; check /status manually in a bit.", ok: false, pending: false };
   }
   if (state === "Available") {
     return { reply: "Dev machine is up ✓ running; send commands (the shell connects in ~10-30s)", ok: true, pending: false };
@@ -216,7 +216,7 @@ export async function checkBoot(client: CodespaceClient): Promise<BootCheck> {
 
 /** 等太久仍未好时的收尾文案。 */
 export function bootTimeoutReply(): string {
-  return "Dev machine is still starting (~2.5 min waited). Check /cs in a bit, or send /boot once more.";
+  return "Dev machine is still starting (~2.5 min waited). Check /status in a bit, or send /boot once more.";
 }
 
 /** /halt：幂等停机。 */
@@ -231,7 +231,7 @@ export async function stopCodespace(client: CodespaceClient): Promise<string> {
   if (st.state === "Deleted") return "Dev machine was deleted; nothing to stop.";
   try {
     await client.stop();
-    return "Stop requested ✓ (done in ~40s in the background; confirm with /cs)";
+    return "Stop requested ✓ (done in ~40s in the background; confirm with /status)";
   } catch (e) {
     return `Stop request failed: ${errBrief(e)}`;
   }

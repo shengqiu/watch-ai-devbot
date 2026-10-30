@@ -278,8 +278,10 @@ import {
 //       · 状态只查一次并传给用量那一半（对账要用），省一次往返；
 //       · 顺带修一处自相矛盾：机器已被空闲超时关掉、本地窗口还挂着时，先按估计停机时刻收尾，
 //         否则同一条消息上面写 shut down、下面写 running。
-// v4.38：按用户要求「精简」，把上一步留下的 usage / quota 两个别名也删掉，/cs 只保留 status。
-const BUILD = "devbot-20261030-v4.38";
+// v4.38：按用户要求「精简」，把上一步留下的 usage / quota 两个别名也删掉，cs 只保留 status。
+// v4.39：指令名从 /cs 改成 /status（用户：status 留着，cs 去掉）。cs 不再作为别名存在，
+//       发 /cs 会走「打错的斜杠指令」提示；菜单 key 升到 v6 让 Telegram 那条跟着换名字。
+const BUILD = "devbot-20261030-v4.39";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -297,7 +299,7 @@ type AiProvider = "gemini" | "buddy";
 /**
  * GitHub 明确表示「机器已经不在计费」的状态。
  *
- * 用途：/cs 发现本地还挂着运行窗口、而机器其实已停 —— 先收尾再展示，
+ * 用途：/status 发现本地还挂着运行窗口、而机器其实已停 —— 先收尾再展示，
  * 免得同一条消息自相矛盾，也免得这段一直按 live 虚增到巡检才发现。
  * 不包含 Queued/Provisioning 这类「正在起来」的状态：那会儿还没开始计费但也没关。
  */
@@ -640,7 +642,7 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /**
-   * Slash Commands（/boot /halt /cs …）。
+   * Slash Commands（/boot /halt /status …）。
    * 表单编码；command 去斜杠后与 text 拼成一条指令文本，走同一张指令注册表。
    * 同步 200 空回（处理放 waitUntil）——Slack 要求 3 秒内应答，慢了会重发。
    */
@@ -849,8 +851,9 @@ export class AssistantDO extends DurableObject<Env> {
           await this.reply(m.chatId, reply);
           return;
         }
-        case "cs":
+        case "status":
           // v4.37：并入原 /usage —— 机器状态与本月额度都不用开机就能查，没必要分两条
+          // v4.39：指令名定为 /status（用户：status 留着，cs 去掉）
           await this.reply(m.chatId, await this.handleStatus());
           return;
         case "ctrlc": {
@@ -916,7 +919,7 @@ export class AssistantDO extends DurableObject<Env> {
     }
 
     // 6.6b) AI 会话模式：普通文本 = 问当前 provider（gemini / buddy）；行首 `!` = 仍然走 shell。
-    //       位置在指令派发之后 —— 会话模式里 /halt、/cs 这些指令照样能用。
+    //       位置在指令派发之后 —— 会话模式里 /halt、/status 这些指令照样能用。
     if (!parsed) {
       const mode = await this.aiMode(m.chatId);
       if (mode) {
@@ -1098,7 +1101,7 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /**
-   * /cs：机器状态 + 本月额度，一条指令回答两个问题（v4.37 并入原 /usage）。
+   * /status：机器状态 + 本月额度，一条指令回答两个问题（v4.37 并入原 /usage）。
    *
    * 为什么合并：这两半都**不需要开机**就能出结果 —— 状态来自 GitHub 的 codespace API，
    * 额度来自 GitHub 的用量报表 + KV 里的账本，都是「查一次 HTTP」，不是「上机跑一次」。
@@ -1192,7 +1195,7 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /**
-   * 「用量」：本月累计运行时长 + 当前窗口状态（由 /cs 拼在状态头下面，v4.37 起不再单独成指令）。
+   * 「用量」：本月累计运行时长 + 当前窗口状态（由 /status 拼在状态头下面，v4.37 起不再单独成指令）。
    *
    * 口径说明（用户在 2026-10-29 提的问题）：账本原来只活在 DO storage 里，
    * 而 DO 实例名由 DO_KEY 决定 —— 每次「换版部署」就等于换实例，本月用量归零，
@@ -1814,7 +1817,7 @@ export class AssistantDO extends DurableObject<Env> {
           payload: { chat_id: chatId, attempt: attempt + 1 },
         });
       } else {
-        await this.reply(chatId, `The dev machine never came up. Check /cs, or retry ${cmd} in a bit.`);
+        await this.reply(chatId, `The dev machine never came up. Check /status, or retry ${cmd} in a bit.`);
       }
       return;
     }
@@ -1840,7 +1843,7 @@ export class AssistantDO extends DurableObject<Env> {
           chatId,
           "Machine is up but the shell channel hasn't connected in 5 minutes.\n" +
             "Run bash .devcontainer/post-start.sh in the codespace terminal, then resend " +
-            `${cmd}; or check /cs.`,
+            `${cmd}; or check /status.`,
         );
       }
       return;
@@ -2982,8 +2985,9 @@ export class AssistantDO extends DurableObject<Env> {
     // 版本化 key：指令表变了就 +1，否则老 DO 里的 true 会永久压住同步、新指令进不了菜单
     // v3：v4.25 新增 /verify（指令表变了，菜单要重同步一次）
     // v4：v4.27 描述文案全部改英文（菜单里显示的是 desc，不同步就还是中文）
-    // v5：v4.37 /usage 并入 /cs（菜单里那条 /usage 要撤掉，不换 key 会一直留着）
-    const key = "menu_synced_v5";
+    // v5：v4.37 /usage 并入 cs（菜单里那条 /usage 要撤掉，不换 key 会一直留着）
+    // v6：v4.39 指令从 cs 改名 status（菜单里那条 cs 要换成 status）
+    const key = "menu_synced_v6";
     try {
       if (await this.ctx.storage.get<boolean>(key)) return;
       await this.tg.call("setMyCommands", { commands: menuCommands() });

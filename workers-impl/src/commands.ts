@@ -51,7 +51,7 @@ export const COMMANDS: CommandSpec[] = [
     desc: "Shut down the dev machine (save quota)",
     detail: [
       "Shut down the dev machine, done in ~40s (idempotent, repeats are no-ops).",
-      "Closes this session's runtime; see /cs for the monthly total.",
+      "Closes this session's runtime; see /status for the monthly total.",
       "After shutdown the shell drops; further commands will say 'not connected'.",
       "Only /halt shuts down; Chinese phrases no longer work.",
     ],
@@ -60,10 +60,10 @@ export const COMMANDS: CommandSpec[] = [
     menu: true,
   },
   {
-    name: "cs",
-    // 2026-10-30 用户要求：/cs 与 /usage 合并成一条（两者都不用开机，分两条只是多一次选择题）。
-    // 同日再要求「精简」：不再保留 usage / quota 这两个老写法，只留 status 这一个短别名。
-    aliases: ["status"],
+    // 主名就是 status（2026-10-30 用户：「status 留着 cs 去掉」）——/cs 这个缩写不再存在，
+    // 所以这里没有别名可留。
+    name: "status",
+    aliases: [],
     desc: "Machine status + this month's quota",
     detail: [
       "One answer to two questions: is the machine up, and how much of the monthly allowance is left.",

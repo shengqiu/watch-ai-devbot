@@ -373,7 +373,7 @@ export class ShellHub {
   }
 
   /**
-   * 当前命令的进程状态说明（给 /cs 用）。
+   * 当前命令的进程状态说明（给 /status 用）。
    * 区分三种「不知道」：没在跑、agent 太老、真的读不到 —— 别混成一句话。
    */
   procLine(): string {
@@ -557,7 +557,7 @@ export class ShellHub {
       g.chatId,
       `⚠️ The record for '${g.label}' is gone (timeout cleanup or DO eviction), but it **may still be running on the machine** — ` +
         `just got ${chars} bytes of its output with nowhere to deliver it.\n` +
-        `Check /cs for the process state; /ctrlc if it's stuck, or just resend.`,
+        `Check /status for the process state; /ctrlc if it's stuck, or just resend.`,
     );
   }
 

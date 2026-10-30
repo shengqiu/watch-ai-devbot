@@ -46,11 +46,8 @@ features:
     - command: /halt
       description: 关机（省免费额度）
       url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
-    - command: /cs
-      description: 机器状态 + shell 通道
-      url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
-    - command: /usage
-      description: 本月运行时长 / 免费额度
+    - command: /status
+      description: 机器状态 + 本月额度（不用开机就能查）
       url: https://watch-ai-devbot.shengqiu-purdue.workers.dev/slack/commands
     - command: /gemini
       description: Gemini 编程会话

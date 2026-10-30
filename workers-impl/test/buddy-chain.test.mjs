@@ -6,7 +6,7 @@
  * 为什么不用字符串断言：上一版就是「注释写着免费优先、代码里链头是付费模型」，
  * 单测全绿也没拦住。这里让脚本跑一遍，看它实际按什么顺序调用 CLI。
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -72,6 +72,33 @@ function run(box, extra = {}) {
     });
   } catch (e) {
     return `${e.stdout ?? ""}${e.stderr ?? ""}`;
+  }
+}
+
+/** 跑任意一段生成的脚本（打开/登录路径没有 prompt，不能复用 run）。 */
+function runScript(box, script) {
+  try {
+    return execFileSync("bash", ["-c", script], {
+      env: {
+        ...process.env,
+        HOME: box.home,
+        BUDDY_WORKDIR: box.work,
+        PATH: `${box.bin}:${dirname(process.execPath)}:/usr/bin:/bin`,
+      },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    return `${e.stdout ?? ""}${e.stderr ?? ""}`;
+  }
+}
+
+/** 读沙箱里的 settings.json（不存在就给空对象）。 */
+function settings(box) {
+  try {
+    return JSON.parse(readFileSync(join(box.home, ".codebuddy", "settings.json"), "utf8"));
+  } catch {
+    return {};
   }
 }
 
@@ -154,6 +181,42 @@ const PRICEY = { id: "glm-5.3", credits: "x0.69 credits" };
 
 // ---- 7. 付费兜底默认顺序仍然来自配置 ----
 check("付费兜底默认非空", DEFAULT_PAID_FALLBACK.length > 0, true);
+
+// ---- 8. 打开/登录：默认模型 = 当前免费的，权限 = bypassPermissions ----
+// 用户 2026-10-30：「登录 buddy 时选默认免费模型」「启动时自动获得全局权限」。
+{
+  const box = sandbox([FREE, PAID, PRICEY]);
+  runScript(box, buildBuddyScript({}));
+  const s = settings(box);
+  check("默认模型落在免费模型上", s.model, "hy3");
+  check("全局权限已开", s.permissions?.defaultMode, "bypassPermissions");
+  rmSync(box.root, { recursive: true, force: true });
+}
+
+// ---- 9. 表里换免费模型：登录时默认模型跟着换；但普通提问不覆盖人手选的值 ----
+{
+  const box = sandbox([{ id: "glm-5.3-flash", credits: "x0.00 credits" }, PAID]);
+  // 先模拟用户手选过付费模型
+  writeFileSync(
+    join(box.home, ".codebuddy", "settings.json"),
+    JSON.stringify({ model: "deepseek-v4.1-flash" }),
+  );
+  run(box); // 普通提问（force=false）：不许动
+  check("普通提问不覆盖手选模型", settings(box).model, "deepseek-v4.1-flash");
+  runScript(box, buildBuddyScript({})); // 打开/登录（force=true）：拉回免费模型
+  check("登录时拉回免费模型", settings(box).model, "glm-5.3-flash");
+  rmSync(box.root, { recursive: true, force: true });
+}
+
+// ---- 10. 钉死模型时只保证权限，不把钉的值写成默认 ----
+{
+  const box = sandbox([FREE, PAID]);
+  runScript(box, buildBuddyScript({ prompt: "hi", model: "glm-5.3" }));
+  const s = settings(box);
+  check("钉死模型不写默认", s.model, undefined);
+  check("钉死模型也开全局权限", s.permissions?.defaultMode, "bypassPermissions");
+  rmSync(box.root, { recursive: true, force: true });
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

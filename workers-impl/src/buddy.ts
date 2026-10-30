@@ -80,6 +80,44 @@ export const BUDDY_MODEL_FILE = "$HOME/.config/watch-ai/buddy-model";
 export const BUDDY_CREDITS_TABLE = "/tmp/ws-buddy-credits.tsv";
 
 /**
+ * 把「默认模型 + 全局权限」写进 `~/.codebuddy/settings.json` 的 node 程序。
+ *
+ * 这两个键都是 CLI 自己的 user 级设置（见 dist-server/types/.../settings-protocol.d.ts）：
+ *   · `model`                        —— 默认模型；不写就得每次 `--model`，交互式打开时还会
+ *                                       落到账号默认（可能是付费的），这正是用户要改的。
+ *   · `permissions.defaultMode`      —— 'default' | 'acceptEdits' | 'bypassPermissions' |
+ *                                       'plan' | 'dontAsk' | 'auto'。写 bypassPermissions
+ *                                       才是真正的「全局权限」，`-y` 只管 headless 那一次。
+ *
+ * 约定：**不许出现单引号**（外面用 `node -e '...'` 包着）。
+ * 只在真的改了东西时才写盘并输出，避免每条消息都重写文件。
+ */
+export const SETTINGS_NODE_PROGRAM = [
+  'const fs=require("fs"),p=process.env.HOME+"/.codebuddy/settings.json";',
+  "let s={},ok=true;",
+  // 文件存在但解析不了（有人手改坏了 / 带注释）：宁可不动，也不能把人家的配置覆盖成 {}
+  'try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){if(e.code!=="ENOENT")ok=false}',
+  "if(!ok)process.exit(7);",
+  'if(!s||typeof s!=="object"||Array.isArray(s))s={};',
+  "const out=[];",
+  'const want=process.env.BUDDY_DEFAULT_MODEL||"";',
+  'const force=process.env.BUDDY_FORCE_MODEL==="1";',
+  'if(want&&(force||!s.model)){',
+  "  if(s.model!==want){s.model=want;out.push(\"model=\"+want)}",
+  "}",
+  "s.permissions=(s.permissions&&typeof s.permissions===\"object\"&&!Array.isArray(s.permissions))?s.permissions:{};",
+  "if(s.permissions.defaultMode!==\"bypassPermissions\"){",
+  '  s.permissions.defaultMode="bypassPermissions";',
+  '  out.push("permissions.defaultMode=bypassPermissions");',
+  "}",
+  "if(out.length){",
+  '  try{fs.mkdirSync(process.env.HOME+"/.codebuddy",{recursive:true})}catch(e){}',
+  '  fs.writeFileSync(p,JSON.stringify(s,null,2)+"\\n");',
+  '  process.stdout.write(out.join(" "));',
+  "}",
+].join("");
+
+/**
  * 从 CLI 的本地缓存里抽出「每个模型多少点数」的 node 小程序。
  *
  * 为什么读缓存而不是打接口：`/v3/config` 要 OAuth Bearer，那套 token 在
@@ -119,6 +157,21 @@ export const CREDITS_NODE_PROGRAM = [
   "if(!out.length)process.exit(7);",
   'process.stdout.write(out.join("\\n")+"\\n");',
 ].join("");
+
+/**
+ * 写入全局设置的 bash 片段。
+ *
+ * `modelExpr` 是**shell 表达式**（`"$SETMODEL"` 或 `""`），不是字面量 —— 免费模型是运行时
+ * 从价格表现读的，不能在生成脚本时写死。`force` 为真时覆盖已有的 model（登录/打开时用，
+ * 免得机器上留着上次手选的付费模型）。
+ */
+export function globalSettingsLines(modelExpr: string, force = false): string[] {
+  return [
+    `BUDDY_DEFAULT_MODEL=${modelExpr} BUDDY_FORCE_MODEL=${force ? "1" : "0"} node -e '${SETTINGS_NODE_PROGRAM}' >/tmp/ws-buddy-settings.txt 2>/dev/null || true`,
+    `SCHG="$(cat /tmp/ws-buddy-settings.txt 2>/dev/null)"`,
+    `[ -n "$SCHG" ] && echo "🔐 全局设置已生效（~/.codebuddy/settings.json）：$SCHG"`,
+  ];
+}
 
 /** 探测价格表的 bash 片段：写 `BUDDY_CREDITS_TABLE`，按 id 排序，失败也只是空文件。 */
 export function creditsProbeLines(): string[] {
@@ -211,7 +264,8 @@ export function buildBuddyScript(
   L.push(
     `if ! grep -q "$BD" "$NS" 2>/dev/null; then ` +
       `node -e 'const fs=require("fs"),p=process.env.HOME+"/.codebuddy/settings.json";` +
-      `let s={};try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){};` +
+      `let s={},ok=true;try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){if(e.code!=="ENOENT")ok=false};` +
+      `if(!ok)process.exit(7);` +
       `const t=new Set(s.trustedDirectories||[]);` +
       `t.add(process.env.BUDDY_WORKDIR||"${BUDDY_DIR}");` +
       `s.trustedDirectories=Array.from(t);fs.writeFileSync(p,JSON.stringify(s,null,2)+"\\n")' 2>/dev/null ` +
@@ -244,7 +298,14 @@ export function buildBuddyScript(
   L.push(`fi`);
 
   if (!prompt) {
+    // 打开/登录这一步就把「默认免费模型 + 全局权限」钉进 settings.json：
+    // 之后不管是我 headless 调，还是人直接在机器上开 TUI，起点都是免费模型、不弹权限框。
+    L.push(...creditsProbeLines());
+    L.push(`SETMODEL="$(awk -F'|' '$2+0==0{print $1; exit}' "$CREDF" 2>/dev/null)"`);
+    L.push(`[ -z "$SETMODEL" ] && SETMODEL="${DEFAULT_FREE_MODELS[0]}"`);
+    L.push(...globalSettingsLines(`"$SETMODEL"`, true));
     L.push(`echo "✅ $(codebuddy --version 2>/dev/null | tail -1) 已就绪"`);
+    L.push(`echo "默认模型：$(node -e 'const fs=require("fs");let s={};try{s=JSON.parse(fs.readFileSync(process.env.HOME+"/.codebuddy/settings.json","utf8"))}catch(e){};process.stdout.write((s.model||"未设")+"（免费）+ 权限 "+(((s.permissions||{}).defaultMode)||"默认"))' 2>/dev/null)"`);
     L.push(`echo "目录：$(pwd)"`);
     L.push(`exit 0`);
     L.push(`)`);
@@ -261,7 +322,9 @@ export function buildBuddyScript(
   L.push(`OUT=/tmp/ws-buddy-out.txt`);
 
   if (model) {
-    // 用户钉了模型：只跑它，不偷偷换（「我明明指定了 X」不能变成谜题）
+    // 用户钉了模型：只跑它，不偷偷换（「我明明指定了 X」不能变成谜题）。
+    // 默认模型不动（填了空才补），但全局权限照样保证。
+    L.push(...globalSettingsLines(`""`, false));
     L.push(`codebuddy \${C:-} -y ${model} -p "$P" </dev/null 2>&1 | tee "$OUT"`);
     L.push(`rc=\${PIPESTATUS[0]}`);
   } else {
@@ -281,6 +344,9 @@ export function buildBuddyScript(
     L.push(`  echo "⚠️ 读不到 CodeBuddy 的价格表，先用内置快照：${DEFAULT_FREE_MODELS.join(" ")}"`);
     L.push(`  CHAIN="$(printf '%s\\n' ${DEFAULT_FREE_MODELS.join(" ")} $CHAIN | awk 'NF&&!seen[$0]++' | tr '\\n' ' ')"`);
     L.push(`fi`);
+    // 默认模型跟着「当前免费的」走（只在没设过时才填，绝不覆盖人手选的值）
+    L.push(`SETMODEL="\${FREE%% *}"; [ -z "$SETMODEL" ] && SETMODEL="${DEFAULT_FREE_MODELS[0]}"`);
+    L.push(...globalSettingsLines(`"$SETMODEL"`, false));
     L.push(`MODELF="${BUDDY_MODEL_FILE}"`);
     // 上次成功的模型提到最前：稳定性靠它，别每条消息都从链头试错
     L.push(`if [ -f "$MODELF" ]; then`);
@@ -342,6 +408,8 @@ export function buildBuddyStatusScript(model?: string, chain?: string[]): string
     `if grep -q "$BD" "${BUDDY_CONF_DIR}/settings.json" 2>/dev/null; then echo "信任：✓ $BD 已在 trustedDirectories"; else echo "信任：✗ 未声明（下次调用会自动补上）"; fi`,
     // 登录态没法离线判定（token 存在 local_storage 的加密条目里），只能说清「在哪、怎么补」
     `if [ -d "${BUDDY_CONF_DIR}" ]; then echo "认证：✓ 已初始化 ~/.codebuddy（OAuth 登录态；失效时 headless 会直接报鉴权错误）"; else echo "认证：✗ 没登录过（需要在机器里交互式跑一次 codebuddy 完成浏览器授权）"; fi`,
+    // 用户 2026-10-30 要求：登录时就选默认免费模型、启动即有全局权限 —— 这里如实报盘上的值
+    `node -e 'const fs=require("fs");let s={};try{s=JSON.parse(fs.readFileSync(process.env.HOME+"/.codebuddy/settings.json","utf8"))}catch(e){};const m=s.model||"未设";const d=((s.permissions||{}).defaultMode)||"默认";process.stdout.write("默认模型："+m+" ｜ 权限："+d)' 2>/dev/null || echo "默认模型：读不到 settings.json"`,
     ...creditsProbeLines(),
     `FREE="$(awk -F'|' '$2+0==0{print $1}' "$CREDF" 2>/dev/null | tr '\\n' ' ')"`,
     pinned

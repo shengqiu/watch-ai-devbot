@@ -88,39 +88,135 @@ export function estimateStop(now: number, lastUsedAt: number | null, idleTimeout
   return est;
 }
 
-/** GitHub Codespaces 计费接口返回（字段名照抄官方，单位见 parseBilling 注释）。 */
+/** Codespaces 计算的单价：$0.09 / core-hour（2 核机器 $0.18/小时 = 2 core-hour）。 */
+export const CORE_HOUR_USD = 0.09;
+
+/**
+ * GitHub 官方用量（enhanced billing platform 口径）。
+ *
+ * 单位说明：compute 与 storage 是**两种 SKU**，数字不可相加 —— compute 按小时，
+ * storage 按 GB-小时。所以分两个字段返回，展示时也分开写，别合成一个「总量」。
+ */
 export interface BillingUsage {
-  /** 已用（GitHub 口径的分钟数，见下方 unit 说明） */
-  usedMin: number;
-  /** 本月包含额度（同口径） */
-  includedMin: number;
-  /** 超出部分计费分钟 */
-  paidMin: number;
-  /** 其中 Ubuntu 机器 */
-  ubuntuMin: number;
+  /** 本月 Codespaces 计算用量（GitHub 报表里的 quantity，单位看 unitType） */
+  computeHours: number;
+  /**
+   * 折算成 core-hour 的计算用量 —— 只有它能把「免费额度」减明白。
+   *
+   * 为什么要用金额折：报表的 quantity 是「这台机器跑了几小时」，而免费额度是
+   * core-hour（2 核跑 1 小时 = 2 core-hour）。GitHub 文档没有写明 quantity 的单位，
+   * 但 grossAmount = quantity × pricePerUnit 一定成立，而 core-hour 单价是 $0.09，
+   * 所以 grossAmount / 0.09 一定是 core-hour，与机器几核无关。
+   */
+  computeCoreHours: number;
+  /** 本月 Codespaces 存储用量（GB-小时） */
+  storageGbHours: number;
+  /** 被包含额度抵掉的金额（美元） */
+  includedUsd: number;
+  /** 实付金额（美元） */
+  netUsd: number;
+  /** 本月计费用的金额（美元，抵扣前） */
+  grossUsd: number;
+  /** 命中的明细条数（0 = 本月还没有用量） */
+  items: number;
 }
 
 /**
- * 解析 `GET /users/{login}/settings/billing/codespaces`。
+ * 解析 `GET /users/{login}/settings/billing/usage`。
  *
- * 注意单位：GitHub 这个接口把「包含额度」按 core-hours 报（Free=120 / Pro=180），
- * 而 total_minutes_used 是 core-minutes。两者口径不同，所以这里**不做换算**，
- * 只把原始值交给上层展示，并在文案里写明「GitHub 口径」，避免二次算错。
- * 字段缺失（接口被拒/改版）时返回 null，上层退回本地账本。
+ * 为什么不是 `/settings/billing/codespaces`：那个路径**不存在**。
+ * 2026-10-29 实测（任何 token 都一样）返回的是「找不到路由」的 404，
+ * 和随手编一个 `/settings/billing/nope` 完全同一个响应体 —— 换句话说，
+ * 以前那个接口不是「没权限」，而是压根没这个 URL，永远不会成功。
+ *
+ * 现在走 enhanced billing platform 的 usage 报表，形状是
+ * `{ usageItems: [{ product, sku, quantity, unitType, discountAmount, netAmount }] }`。
+ * 只保留 product 里含 codespace 的行；字段缺失/改版时返回 null，上层退回本地账本。
  */
 export function parseBilling(raw: unknown): BillingUsage | null {
   if (!raw || typeof raw !== "object") return null;
-  const d = raw as Record<string, unknown>;
-  const used = Number(d.total_minutes_used);
-  if (!Number.isFinite(used)) return null;
-  const included = Number(d.included_minutes);
-  const paid = Number(d.total_paid_minutes_used);
-  const breakdown = (d.minutes_used_breakdown ?? {}) as Record<string, unknown>;
-  const ubuntu = Number(breakdown.UBUNTU);
-  return {
-    usedMin: used,
-    includedMin: Number.isFinite(included) ? included : 0,
-    paidMin: Number.isFinite(paid) ? paid : 0,
-    ubuntuMin: Number.isFinite(ubuntu) ? ubuntu : 0,
-  };
+  const items = (raw as Record<string, unknown>).usageItems;
+  if (!Array.isArray(items)) return null;
+
+  let computeHours = 0;
+  let computeSpend = 0;
+  let storageGbHours = 0;
+  let includedUsd = 0;
+  let netUsd = 0;
+  let grossUsd = 0;
+  let hits = 0;
+
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    const row = it as Record<string, unknown>;
+    if (!String(row.product ?? "").toLowerCase().includes("codespace")) continue;
+    const qty = Number(row.quantity);
+    if (!Number.isFinite(qty)) continue;
+    const unit = String(row.unitType ?? "").toLowerCase();
+    const sku = String(row.sku ?? "").toLowerCase();
+    // 存储的 unitType 是 GB-hours，会被下面的 unit 判断带偏，必须先分流
+    if (unit.includes("gb") || sku.includes("storage")) {
+      storageGbHours += qty;
+    } else {
+      computeHours += unit.includes("minute") ? qty / 60 : qty;
+      computeSpend += Number(row.grossAmount) || 0;
+    }
+    includedUsd += Number(row.discountAmount) || 0;
+    netUsd += Number(row.netAmount) || 0;
+    grossUsd += Number(row.grossAmount) || 0;
+    hits++;
+  }
+
+  // 金额有值就按金额折（不受「几核」影响）；全 0 时退回 quantity，权当它本来就是 core-hour
+  const computeCoreHours = computeSpend > 0 ? computeSpend / CORE_HOUR_USD : computeHours;
+
+  return { computeHours, computeCoreHours, storageGbHours, includedUsd, netUsd, grossUsd, items: hits };
+}
+
+/**
+ * 每月免费计算额度（core-hours）。GitHub 没有接口能读这个数，只能按 plan 名映射：
+ * Free = 120，Pro = 180（含学生包）。取不到 plan 时按 Free 算 —— 宁可早报警。
+ */
+export function includedCoreHours(planName: string | null | undefined): number {
+  const p = String(planName ?? "").toLowerCase();
+  if (p.includes("pro")) return 180;
+  return 120;
+}
+
+/**
+ * 下一次额度重置的时刻：UTC 每月 1 日 00:00。
+ *
+ * 依据 GitHub《Billing cycles》：metered 产品的计费周期「starts at 00:00:00 UTC on
+ * the first day of each month」，包含额度在周期起点回满 —— 不是「账号注册日」。
+ */
+export function nextResetAt(ts: number): number {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+}
+
+/**
+ * 把失败响应翻译成「下一步该做什么」。
+ *
+ * GitHub 对计费接口的拒绝很吝啬：没权限时给 404 而不是 403，光看状态码会以为是
+ * 路由写错了。真正有用的是响应头，而且**两种 token 的头不一样**：
+ *   · fine-grained → `x-accepted-github-permissions: plan=read`
+ *   · classic/OAuth → `x-accepted-oauth-scopes: user`
+ * 2026-10-29 实测：classic token 少的是 `user`，不是 manage_billing:codespaces
+ * （那个 scope 是给旧的 codespaces 账单接口的，而那个接口已经不存在了）。
+ */
+export function billingError(
+  status: number,
+  h: { permissions?: string | null; oauthScopes?: string | null } = {},
+): string {
+  const need = h.permissions
+    ? `, needs ${h.permissions} (fine-grained)`
+    : h.oauthScopes
+      ? `, needs the '${h.oauthScopes}' scope (classic)`
+      : "";
+  if (status === 401) return "HTTP 401 — PAT rejected (expired or revoked)";
+  if (status === 403) return `HTTP 403 — token lacks billing permission${need}`;
+  if (status === 404) {
+    return `HTTP 404 — GitHub hides billing from this token${need}; fine-grained: Plan read-only, classic: user scope`;
+  }
+  return `HTTP ${status}${need}`;
 }

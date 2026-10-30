@@ -98,16 +98,25 @@ export interface Env {
   GH_CODESPACE_NAME?: string; // var：codespace 名称，默认 24h-977gg5v9vcp5wq
   /**
    * var：GitHub 用户名（默认 shengqiu）。
-   * 只有「查官方账单」用得到：GET /users/{login}/settings/billing/codespaces。
-   * PAT 没有 manage_billing:codespaces 权限时该接口 404/403，/usage 会自动退回本地账本。
+   * 只有「查官方用量」用得到：GET /users/{login}/settings/billing/usage。
    */
   GH_LOGIN?: string;
+  /**
+   * secret（可选）：只用来读计费的 PAT。设了就优先用它，否则退回 GH_CODESPACE_PAT。
+   *
+   * 为什么要单独一张：跑 codespace 的可以是 fine-grained，而 GitHub 对计费接口
+   * 卡得很死（fine-grained 要 Plan:read，classic 要 `user` scope —— 实测要的是
+   * `user`，不是 manage_billing:codespaces），拆开就不用为看用量放大跑机器那张的权限。
+   */
+  GH_BILLING_PAT?: string;
 
   // 省额度看门狗（vars）
   CS_WATCH_REMIND_MIN?: string; // 空闲提醒阈值（分钟，默认 25）
   CS_WATCH_AUTOSTOP_MIN?: string; // 自动关机阈值（分钟，默认 55）
   CS_WATCH_AUTOSTOP?: string; // "0" = 只提醒不自动关（默认开）
   CS_MONTHLY_BUDGET_HOURS?: string; // 月免费额度小时数（默认 60；2 核 = 120 core-h ÷ 2）
+  /** 覆盖免费计算额度（core-hours）：Free=120 / Pro=180，不设则按账号 plan 自动判断 */
+  CS_INCLUDED_CORE_HOURS?: string;
   CS_GH_CAP_MIN?: string; // GH 连续活跃上限（分钟，默认 180）：防 dev server 刷日志无限续命
   CS_GH_CAP_ACTION?: string; // 触达上限后的动作：stop（默认，警告+宽限后关机）| notify（只提醒）
   CS_GH_CAP_GRACE_MIN?: string; // stop 模式下的宽限期（分钟，默认 15）

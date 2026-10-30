@@ -37,8 +37,16 @@ DEEPSEEK_API_KEY=
 # SLACK_ALLOWED_USERS=U0123ABCDEF
 
 # ---- Codespace 开发机（/boot /halt /cs /usage）----
-# classic PAT，需要 codespace 权限；额外加 manage_billing:codespaces 才能让 /usage
-# 直接显示 GitHub 官方账单数字（不加也能用：退回本地账本，跨部署不丢）
-# GH_CODESPACE_PAT=ghp_...
+# 跑机器那张：fine-grained 就行（Codespaces 读写）
+# GH_CODESPACE_PAT=github_pat_...
 # GH_CODESPACE_NAME=24h-977gg5v9vcp5wq
 # GH_LOGIN=shengqiu
+
+# 看用量那张（可选，只给 /usage 用）：GitHub 的计费接口对 token 要求更严 ——
+# fine-grained 要勾 Account permissions → Plan: read（且必须是它的所有者本人）；
+# classic 实测要 `user` scope（gh auth refresh -s user），manage_billing:codespaces
+# 对 usage 接口没用。不配就退回 GH_CODESPACE_PAT，再不行显示本地账本（跨部署不丢）。
+# GH_BILLING_PAT=ghp_...
+
+# 注意：旧的 /users/{login}/settings/billing/codespaces 这个路径并不存在，
+# 任何 token 都只会拿到 404 —— 已改为 /settings/billing/usage?year=&month=。

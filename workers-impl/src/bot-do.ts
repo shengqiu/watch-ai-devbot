@@ -71,9 +71,12 @@ import {
 import { ShellHub, type ShellOutMsg, type ShellPing } from "./shell";
 import {
   addDays,
+  billingError,
   dayKey,
   estimateStop,
+  includedCoreHours,
   mergeMax,
+  nextResetAt,
   parseBilling,
   splitWindowByDay,
   sumRange,
@@ -252,8 +255,30 @@ import {
 //       旧 storage 作废。修法四件套：① 明细落 KV（与实例无关），还魂按 max 合并；
 //       ② 窗口起点另存 KV，实例被换掉后由巡检补账；③ 跨零点按 UTC 日切分；
 //       ④ 停机时刻按「最后活动 + 空闲超时」估，不再按「发现时刻」（会白记 30 分钟）。
-//       另：PAT 有 manage_billing:codespaces 时优先显示 GitHub 自己的账单数字。
-const BUILD = "devbot-20261029-v4.33";
+//       另：PAT 能读计费时优先显示 GitHub 自己的用量报表。
+// v4.34：/usage 的「官方数字」一直是死的。查 `/settings/billing/codespaces` 这个路径
+//       根本不存在（和编造的路径返回同一个 404），什么 token 都不可能成功。
+//       改为 enhanced billing 的 `/settings/billing/usage?year=&month=`，按 SKU 汇总
+//       （compute 与 storage 单位不同，分开算）；计费可单独配 GH_BILLING_PAT；
+//       失败时把 GitHub 的 x-accepted-* 响应头翻成人话（fine-grained: Plan read，
+//       classic: user scope），不用再猜。
+// v4.35：/usage 直接答「还剩多少免费时长、什么时候回满」。
+//       ① 口径统一到 core-hour（2 核跑 1 小时 = 2 core-h，免费额度也是这个口径）——
+//          机器小时直接减 120 会正好差一倍；报表里机器小时÷core-hour 就是核数。
+//       ② 免费额度按账号 plan 映射（Free 120 / Pro 180，可用 CS_INCLUDED_CORE_HOURS 覆盖），
+//          因为 GitHub 没有「查额度」的接口。
+//       ③ 重置时刻按 Billing cycles：UTC 每月 1 日 00:00，不是注册日。
+// v4.36：/buddy 打开（= 登录那一步）就把两个 user 级默认写进 ~/.codebuddy/settings.json：
+//       ① model = 当前免费的模型（现读价格表，读不到用 hy3），交互式 TUI 也不会落到付费默认；
+//       ② permissions.defaultMode = bypassPermissions（真正的「全局权限」，`-y` 只管 headless 一次）。
+//       普通提问只在 model 为空时补，不覆盖人手选的值；settings.json 解析失败时宁可不写。
+// v4.37：/cs 与 /usage 合并成一条（用户：两者都不用开机就能出结果，就合成一个）。
+//       · 状态来自 GitHub codespace API、额度来自 billing 报表 + KV 账本，都不依赖机器在跑；
+//       · /usage、/quota 转为 /cs 的别名，老输入照样命中，只是菜单里只留一条；
+//       · 状态只查一次并传给用量那一半（对账要用），省一次往返；
+//       · 顺带修一处自相矛盾：机器已被空闲超时关掉、本地窗口还挂着时，先按估计停机时刻收尾，
+//         否则同一条消息上面写 shut down、下面写 running。
+const BUILD = "devbot-20261030-v4.37";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -267,6 +292,20 @@ const BUILD = "devbot-20261029-v4.33";
  * 待发提问暂存和 prep alarm，只在生成脚本处按 provider 分叉。
  */
 type AiProvider = "gemini" | "buddy";
+
+/**
+ * GitHub 明确表示「机器已经不在计费」的状态。
+ *
+ * 用途：/cs 发现本地还挂着运行窗口、而机器其实已停 —— 先收尾再展示，
+ * 免得同一条消息自相矛盾，也免得这段一直按 live 虚增到巡检才发现。
+ * 不包含 Queued/Provisioning 这类「正在起来」的状态：那会儿还没开始计费但也没关。
+ */
+const CS_STOPPED_STATES: ReadonlySet<CodespaceState> = new Set<CodespaceState>([
+  "Shutdown",
+  "ShuttingDown",
+  "Deleted",
+  "Failed",
+]);
 
 /** provider → 等通道用的 alarm kind（两种各自独立，避免互相覆盖）。 */
 const aiPrepKind = (p: AiProvider): "gemini_prep" | "buddy_prep" =>
@@ -810,10 +849,8 @@ export class AssistantDO extends DurableObject<Env> {
           return;
         }
         case "cs":
-          await this.reply(m.chatId, await this.handleDevStatus());
-          return;
-        case "usage":
-          await this.reply(m.chatId, await this.handleUsage());
+          // v4.37：并入原 /usage —— 机器状态与本月额度都不用开机就能查，没必要分两条
+          await this.reply(m.chatId, await this.handleStatus());
           return;
         case "ctrlc": {
           const err = this.shell.sendCtrlC();
@@ -1059,22 +1096,60 @@ export class AssistantDO extends DurableObject<Env> {
     return stopCodespace(client);
   }
 
-  private async handleDevStatus(): Promise<string> {
+  /**
+   * /cs：机器状态 + 本月额度，一条指令回答两个问题（v4.37 并入原 /usage）。
+   *
+   * 为什么合并：这两半都**不需要开机**就能出结果 —— 状态来自 GitHub 的 codespace API，
+   * 额度来自 GitHub 的用量报表 + KV 里的账本，都是「查一次 HTTP」，不是「上机跑一次」。
+   * 既然如此，分成两条指令只是让人多做一次选择题；而真要问的时候，两个答案通常一起要
+   * （「它还开着吗 + 这个月还剩多少」）。
+   *
+   * 容错：两半互不依赖 —— 状态查询失败仍然出额度，额度拿不到仍然出状态。
+   * 状态只查一次，随后传给 handleUsage（对账/收尾都要用它），省一次 GitHub 往返。
+   */
+  private async handleStatus(): Promise<string> {
     const client = this.codespaceClient();
-    if (!client) return "GH_CODESPACE_PAT not configured; cannot query the dev machine.";
-    try {
-      const st = await client.status();
-      // 状态查询 = 互动：机器在跑时刷新看门狗起点（你刚看过，说明在用）
-      if (st.state === "Available") await this.ensureWatch(null, "bot");
-      // 顺带报联机通道：用户看完「运行中」的下一句必然是「那我能发命令了吗」
-      const shell = this.shell.online() ? "connected ✓ send commands right away" : "not connected (auto-connects ~10-30s after boot)";
-      const s = this.shell.snapshot();
-      // 有命令在跑时把进程状态一并报出来：这才是「到底在等 / 被挂起 / 已死」的答案
-      const proc = s.agentRunning ? `\nRunning command: ${this.shell.procLine()}` : "";
-      return `Dev machine: ${describeState(st.state)}\nShell channel: ${shell}${proc}`;
-    } catch (e) {
-      return `Query failed: ${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
+    let st: CodespaceStatus | null = null;
+    let statusErr = "GH_CODESPACE_PAT not configured; cannot query the dev machine.";
+    if (client) {
+      try {
+        st = await client.status();
+      } catch (e) {
+        statusErr = `query failed: ${e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)}`;
+      }
     }
+    // 状态查询 = 互动：机器在跑时刷新看门狗起点（你刚看过，说明在用）
+    if (st?.state === "Available") {
+      try {
+        await this.ensureWatch(null, "bot");
+      } catch (e) {
+        console.error("[watch] 刷新看门狗失败（不影响本次回复）", e);
+      }
+    }
+    const lines = this.machineLines(st, statusErr);
+    // 额度那一半独立兜底：账本/KV 出问题不能把「机器开没开」也一起吞掉
+    try {
+      lines.push("", ...(await this.handleUsage(st)));
+    } catch (e) {
+      console.error("[usage] 统计失败（状态照常回）", e);
+      lines.push("", "📊 Codespaces usage: unavailable this time (ledger read failed; the state above is still live)");
+    }
+    return lines.join("\n");
+  }
+
+  /** 状态头：机器在不在跑、联机通道通不通（查不到状态也要给一句人话）。 */
+  private machineLines(st: CodespaceStatus | null, err: string): string[] {
+    if (!st) return [`🖥 Dev machine: ${err}`];
+    // 顺带报联机通道：用户看完「运行中」的下一句必然是「那我能发命令了吗」
+    const shell = this.shell.online()
+      ? "shell connected ✓"
+      : st.state === "Available"
+        ? "shell not connected yet (~10-30s after boot)"
+        : "shell disconnected";
+    const out = [`🖥 Dev machine: ${describeState(st.state)} · ${shell}`];
+    // 有命令在跑时把进程状态一并报出来：这才是「到底在等 / 被挂起 / 已死」的答案
+    if (this.shell.snapshot().agentRunning) out.push(`Running command: ${this.shell.procLine()}`);
+    return out;
   }
 
   /**
@@ -1116,7 +1191,7 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   /**
-   * 「用量」：本月累计运行时长 + 当前窗口状态。
+   * 「用量」：本月累计运行时长 + 当前窗口状态（由 /cs 拼在状态头下面，v4.37 起不再单独成指令）。
    *
    * 口径说明（用户在 2026-10-29 提的问题）：账本原来只活在 DO storage 里，
    * 而 DO 实例名由 DO_KEY 决定 —— 每次「换版部署」就等于换实例，本月用量归零，
@@ -1124,9 +1199,13 @@ export class AssistantDO extends DurableObject<Env> {
    *   · 明细落 KV（与实例无关），还魂时按 max 合并，换多少次 DO 都不会丢；
    *   · 窗口起点另存 KV，实例被换掉后由巡检补账（reconcileUsage）；
    *   · 跨零点的窗口按 UTC 自然日切开，今日/本月不再串；
-   *   · 如果 PAT 有 manage_billing:codespaces，优先显示 GitHub 自己的账单数字。
+   *   · 如果 PAT 能读计费（classic + user scope，或 fine-grained + Plan:read），
+   *     优先显示 GitHub 自己的用量报表；读不到就说清为什么读不到。
+   *
+   * 入参 st 是调用方已经查到的机器状态（可能为 null）：对账和「窗口该不该收尾」要用它，
+   * 再查一次只是多花一次 GitHub 往返，还可能和上面那行状态对不上。
    */
-  private async handleUsage(): Promise<string> {
+  private async handleUsage(st: CodespaceStatus | null): Promise<string[]> {
     // 先还魂（KV → SQL，幂等），否则新实例看到的还是零
     await this.restoreUsageOnce();
     let now = Date.now();
@@ -1137,16 +1216,17 @@ export class AssistantDO extends DurableObject<Env> {
     // 先把那段补进账本，再展示 —— 否则用户看到的还是「零」。
     let ep = await this.getEpisode();
     if (!ep?.running && (await this.readOpenWindow())) {
-      const client = this.codespaceClient();
-      let st: CodespaceStatus | null = null;
-      if (client) {
-        try {
-          st = await client.status();
-        } catch {
-          /* 查不到就按「已停机」估，不阻塞 /usage */
-        }
-      }
       await this.reconcileUsage(st);
+      now = Date.now();
+      ep = await this.getEpisode();
+    }
+
+    // 反过来：DO 说窗口还开着，GitHub 说机器早关了（多是被空闲超时停掉的）。
+    // 不在这里收尾，同一条消息就会自相矛盾（上面「shut down」、下面「running」），
+    // 而且这段会一直挂在 live 里虚增，直到巡检才发现。收尾时刻按巡检同一口径估。
+    if (ep?.running && st && CS_STOPPED_STATES.has(st.state)) {
+      const lastUsed = st.lastUsedAt ? Date.parse(st.lastUsedAt) : NaN;
+      await this.closeEpisode(estimateStop(now, Number.isNaN(lastUsed) ? null : lastUsed, st.idleTimeoutMin));
       now = Date.now();
       ep = await this.getEpisode();
     }
@@ -1164,13 +1244,21 @@ export class AssistantDO extends DurableObject<Env> {
     const todayMin = Math.round(todayClosed + todayLive);
 
     const lines: string[] = [`📊 Codespaces usage (${month})`];
-    const billing = await this.billingUsage();
+    const money = (n: number) => `$${n.toFixed(2)}`;
+    const billing = await this.billingUsage(month);
     if (billing.value) {
       const b = billing.value;
-      const pct = b.includedMin > 0 ? Math.round((b.usedMin / b.includedMin) * 100) : 0;
-      lines.push(`GitHub billed: ${fmtDur(b.usedMin)} used / ${fmtDur(b.includedMin)} included (${pct}%)`);
-      lines.push(`  Ubuntu ${fmtDur(b.ubuntuMin)} · over-quota paid ${fmtDur(b.paidMin)}`);
-      lines.push("  (GitHub's own figures — this is what actually gets billed)");
+      if (b.items === 0) {
+        lines.push(`GitHub billed: no Codespaces usage recorded for ${month} yet`);
+      } else {
+        // compute 与 storage 是两个 SKU，单位不同，不能加在一起
+        lines.push(
+          `GitHub billed: ${b.computeHours.toFixed(1)} h compute (${b.computeCoreHours.toFixed(1)} core-h, ${money(b.grossUsd)})` +
+            ` · ${b.storageGbHours.toFixed(1)} GB-h storage` +
+            (b.netUsd > 0 ? ` · net ${money(b.netUsd)}` : ` · fully covered (${money(b.includedUsd)} discounted)`),
+        );
+      }
+      lines.push(...(await this.freeAllowanceLines(b, now)));
     } else {
       const budgetH = this.monthlyBudgetHours();
       const pct = Math.min(100, Math.round((monthMin / 60 / budgetH) * 100));
@@ -1178,41 +1266,49 @@ export class AssistantDO extends DurableObject<Env> {
       // 说清「这个数从哪来」，别再让人以为它跟 GitHub 完全一致
       lines.push(
         billing.error
-          ? `  (my own tally, kept in KV across deploys; GitHub's exact number needs the manage_billing:codespaces scope — ${billing.error})`
+          ? `  (my own tally, kept in KV across deploys; GitHub's report unavailable — ${billing.error})`
           : "  (my own tally, kept in KV across deploys)",
       );
     }
-    lines.push(`Today: ${fmtDur(todayMin)}`);
-    if (ep && ep.running) {
-      lines.push(`Current window: running, ${fmtDur((now - ep.bootAt) / 60_000)} so far${ep.botStarted ? "" : " (not booted by me)"}`);
-    } else {
-      lines.push("Current window: shut down");
-    }
+    // 今日/本次窗口是本地账本的数，和上面 GitHub 的数字不是一个来源 —— 有官方数字时点明一下，
+    // 别让人拿 20 分钟去质疑 20 小时（账本是 10-29 才开始记的）。
+    const tally = billing.value ? " · my tally" : "";
+    lines.push(
+      ep && ep.running
+        ? `Session: ${fmtDur((now - ep.bootAt) / 60_000)} so far · today ${fmtDur(todayMin)}${ep.botStarted ? "" : " (not booted by me)"}${tally}`
+        : `Session: none running · today ${fmtDur(todayMin)}${tally}`,
+    );
     lines.push(`Watchdog: ${this.autostopEnabled() ? `remind/auto-stop at ${this.watchRemindMin()}/${this.watchAutostopMin()} min` : "remind only (auto-stop disabled)"}`);
-    return lines.join("\n");
+    return lines;
   }
 
   /**
-   * GitHub 官方账单（GET /users/{login}/settings/billing/codespaces）。
+   * GitHub 官方用量（GET /users/{login}/settings/billing/usage?year=&month=）。
    *
-   * 有就显示真数，没有就退回本地账本 —— 这个接口需要 PAT 带
-   * manage_billing:codespaces 权限，没有时 GitHub 返回 404（不是 403，故意的）。
-   * 缓存：成功 10 分钟、失败 6 小时，避免每次 /usage 都去打一次 GitHub。
+   * 以前这里写的是 `/settings/billing/codespaces` —— 那个 URL 不存在，
+   * 连编造的路径都返回一模一样的 404，所以无论 PAT 是什么类型都不可能成功。
+   * 现在改成 enhanced billing platform 的 usage 报表，按 SKU 明细汇总。
+   *
+   * token：优先 GH_BILLING_PAT（可以专门给一张 classic PAT，带 `user` scope，
+   * 不跟跑 codespace 的那张混用），否则退回 GH_CODESPACE_PAT。
+   * 缓存：成功 10 分钟、失败 6 小时；key 带月份，跨月不会拿到上个月的缓存。
    */
-  private async billingUsage(): Promise<{ value: BillingUsage | null; error: string | null }> {
-    const pat = this.env.GH_CODESPACE_PAT;
+  private async billingUsage(month: string): Promise<{ value: BillingUsage | null; error: string | null }> {
+    const pat = this.env.GH_BILLING_PAT || this.env.GH_CODESPACE_PAT;
     if (!pat) return { value: null, error: "no PAT configured" };
     const now = Date.now();
-    const cacheKey = "usage_billing";
+    const cacheKey = `usage_billing:${month}`;
     const cached = await this.ctx.storage.get<{ at: number; value: BillingUsage | null; error: string | null }>(cacheKey);
     if (cached) {
       const ttl = cached.value ? 10 * 60_000 : 6 * 3_600_000;
       if (now - cached.at < ttl) return { value: cached.value, error: cached.error };
     }
     const login = this.env.GH_LOGIN || "shengqiu";
+    const [year, mon] = month.split("-");
+    const url = `https://api.github.com/users/${encodeURIComponent(login)}/settings/billing/usage?year=${year}&month=${Number(mon)}`;
     let out: { at: number; value: BillingUsage | null; error: string | null };
     try {
-      const res = await fetch(`https://api.github.com/users/${encodeURIComponent(login)}/settings/billing/codespaces`, {
+      const res = await fetch(url, {
         headers: {
           Authorization: `Bearer ${pat}`,
           Accept: "application/vnd.github+json",
@@ -1222,7 +1318,14 @@ export class AssistantDO extends DurableObject<Env> {
         signal: AbortSignal.timeout(10_000),
       });
       if (!res.ok) {
-        out = { at: now, value: null, error: `HTTP ${res.status}` };
+        out = {
+          at: now,
+          value: null,
+          error: billingError(res.status, {
+            permissions: res.headers.get("x-accepted-github-permissions"),
+            oauthScopes: res.headers.get("x-accepted-oauth-scopes"),
+          }),
+        };
       } else {
         const value = parseBilling(await res.json());
         out = { at: now, value, error: value ? null : "unexpected response shape" };
@@ -1232,6 +1335,72 @@ export class AssistantDO extends DurableObject<Env> {
     }
     await this.ctx.storage.put(cacheKey, out);
     return { value: out.value, error: out.error };
+  }
+
+  /**
+   * 「还剩多少免费时长、什么时候回满」。
+   *
+   * 一律用 core-hour 减：「2 核跑 1 小时 = 2 core-hour」，而免费额度
+   * （Free 120 / Pro 180）本身就是 core-hour 口径。用机器小时减会正好差一倍。
+   * 重置时刻按 GitHub《Billing cycles》—— UTC 每月 1 日 00:00。
+   */
+  private async freeAllowanceLines(b: BillingUsage, now: number): Promise<string[]> {
+    const override = Number(this.env.CS_INCLUDED_CORE_HOURS);
+    const plan = override > 0 ? null : await this.billingPlan();
+    const included = Number.isFinite(override) && override > 0 ? override : includedCoreHours(plan);
+    const used = b.computeCoreHours;
+    const left = included - used;
+    const pct = included > 0 ? Math.round((used / included) * 100) : 0;
+    const reset = nextResetAt(now);
+
+    const out: string[] = [];
+    out.push(
+      left >= 0
+        ? `Free compute: ${left.toFixed(1)} / ${included} core-h left (${pct}% used${plan ? `, plan ${plan}` : ""})`
+        : `Free compute: exhausted — ${Math.abs(left).toFixed(1)} core-h over, billed $0.09/core-h`,
+    );
+    out.push(`  resets ${new Date(reset).toISOString().slice(0, 16).replace("T", " ")} UTC · in ${fmtDur((reset - now) / 60_000)}`);
+    // 折成「这台机器还能开多久」才有体感。核数不靠猜：同一份报表里
+    // 机器小时 ÷ core-hour 就是核数（20 机器小时 = 40 core-h → 2 核）。
+    // 混合机型时这个比值不是整数，那就不写这一行，别编一个平均数。
+    const ratio =
+      b.computeHours > 0 && b.computeCoreHours > 0
+        ? b.computeHours / b.computeCoreHours
+        : included / this.monthlyBudgetHours();
+    const cores = Math.round(ratio);
+    if (left > 0 && cores >= 1 && Math.abs(ratio - cores) < 0.1) {
+      out.push(`  ≈ ${(left / cores).toFixed(1)} h of machine time at ${cores} cores`);
+    }
+    return out;
+  }
+
+  /**
+   * 读账号 plan 名（free / pro），用来定免费额度：120 还是 180 core-h。
+   * GitHub 没有「查额度」的接口，只能这样映射；读不到就按 Free 算（宁可早报警）。
+   */
+  private async billingPlan(): Promise<string | null> {
+    const pat = this.env.GH_BILLING_PAT || this.env.GH_CODESPACE_PAT;
+    if (!pat) return null;
+    const cached = await this.ctx.storage.get<{ at: number; plan: string }>("usage_plan");
+    if (cached && Date.now() - cached.at < 24 * 3_600_000) return cached.plan;
+    try {
+      const res = await fetch("https://api.github.com/user", {
+        headers: {
+          Authorization: `Bearer ${pat}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "watch-ai-assistant/1.0",
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) return null;
+      const j = (await res.json()) as { plan?: { name?: string } };
+      const plan = j?.plan?.name ?? null;
+      if (plan) await this.ctx.storage.put("usage_plan", { at: Date.now(), plan });
+      return plan;
+    } catch {
+      return null;
+    }
   }
 
   // ---------------------------------------------------------------- AI 会话（gemini / buddy）
@@ -2812,7 +2981,8 @@ export class AssistantDO extends DurableObject<Env> {
     // 版本化 key：指令表变了就 +1，否则老 DO 里的 true 会永久压住同步、新指令进不了菜单
     // v3：v4.25 新增 /verify（指令表变了，菜单要重同步一次）
     // v4：v4.27 描述文案全部改英文（菜单里显示的是 desc，不同步就还是中文）
-    const key = "menu_synced_v4";
+    // v5：v4.37 /usage 并入 /cs（菜单里那条 /usage 要撤掉，不换 key 会一直留着）
+    const key = "menu_synced_v5";
     try {
       if (await this.ctx.storage.get<boolean>(key)) return;
       await this.tg.call("setMyCommands", { commands: menuCommands() });

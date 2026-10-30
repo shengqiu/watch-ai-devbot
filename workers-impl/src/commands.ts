@@ -62,8 +62,8 @@ export const COMMANDS: CommandSpec[] = [
   {
     name: "cs",
     // 2026-10-30 用户要求：/cs 与 /usage 合并成一条（两者都不用开机，分两条只是多一次选择题）。
-    // 老写法保留为别名，肌肉记忆和之前发过的菜单都还能用。
-    aliases: ["status", "usage", "quota"],
+    // 同日再要求「精简」：不再保留 usage / quota 这两个老写法，只留 status 这一个短别名。
+    aliases: ["status"],
     desc: "Machine status + this month's quota",
     detail: [
       "One answer to two questions: is the machine up, and how much of the monthly allowance is left.",

@@ -1095,9 +1095,9 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("cmd /boot", matchCommand("/boot")?.spec.name, "boot");
   check("cmd /BOOT 大小写", matchCommand("/BOOT")?.spec.name, "boot");
   check("cmd /cs", matchCommand("/cs")?.spec.name, "cs");
-  // v4.37：/usage 并入 /cs（两者都不用开机，没必要分两条）；老写法保留为别名
-  check("cmd /usage 已并入 cs", matchCommand("/usage")?.spec.name, "cs");
-  check("cmd /quota 已并入 cs", matchCommand("/quota")?.spec.name, "cs");
+  // v4.37：/usage 并入 /cs；v4.38 按「精简」把 usage / quota 两个别名也删了
+  check("cmd /usage 已删除", matchCommand("/usage"), null);
+  check("cmd /quota 已删除", matchCommand("/quota"), null);
   check("cmd /status 别名仍是 cs", matchCommand("/status")?.spec.name, "cs");
   // 中文口语形式
   // 中文开关机口语已停用（2026-10-27 用户要求：只有 /boot 能开机）
@@ -1153,6 +1153,8 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   const allTokens = COMMANDS.flatMap((c) => [c.name, ...c.aliases]).map((s) => s.toLowerCase());
   check("名字与别名全局唯一", new Set(allTokens).size, allTokens.length);
   check("每条都有详情", COMMANDS.every((c) => c.detail.length > 0), true);
+  // v4.38「精简」：cs 只留 status 一个别名，别再把 usage / quota 加回来
+  check("cs 只留 status 一个别名", JSON.stringify(COMMANDS.find((c) => c.name === "cs").aliases), '["status"]');
 
   // Telegram 菜单：命名必须符合 ^[a-z0-9_]{1,32}$
   const menu = menuCommands();
@@ -1160,10 +1162,10 @@ check("重试总时长 150s", 30 + BOOT_MAX_ATTEMPTS * (BOOT_RETRY_DELAY_MS / 10
   check("菜单命名合法", menu.every((m) => /^[a-z0-9_]{1,32}$/.test(m.command)), true);
   check("菜单描述非空", menu.every((m) => m.description.length > 0 && m.description.length <= 256), true);
   check("菜单无重复", new Set(menu.map((m) => m.command)).size, menu.length);
-  // v4.37 合并：菜单里只留 /cs，但 /usage 作为别名仍要能查到详情（否则老用户点进来一片空白）
+  // v4.37 合并 / v4.38 精简：只剩 /cs，连 usage 这个别名也不留（/help usage 应查不到）
   check("菜单里没有独立的 usage 条", menu.some((m) => m.command === "usage"), false);
   check("菜单里保留 cs", menu.some((m) => m.command === "cs"), true);
-  check("/help usage 落到 /cs", renderCommandHelp("usage")?.startsWith("/cs"), true);
+  check("/help usage 已查不到", renderCommandHelp("usage"), null);
   check("cs 详情提到不用开机", renderCommandHelp("cs").includes("shut down"), true);
 }
 

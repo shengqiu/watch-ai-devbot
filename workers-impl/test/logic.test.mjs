@@ -20,6 +20,7 @@ import {
   b64Utf8,
   resolveKeyLines,
   GEMINI_SECRETS_FILE,
+  GEMINI_QUOTA_SENTINEL,
 } from "../src/gemini.js";
 import {
   buildBuddyScript,
@@ -768,6 +769,7 @@ const {
   check("/verify 中文别名仍认（界面不展示）", matchCommand("/验证").spec.name, "verify");
   check("/verify off 有细节", (renderCommandHelp("verify") ?? "").includes("off"), true);
   check("verify 帮助写明安全降级", (renderCommandHelp("verify") ?? "").includes("security downgrade"), true);
+  check("verify 帮助写明默认关闭", (renderCommandHelp("verify") ?? "").includes("off by default"), true);
   check("总帮助列出 /verify", renderHelp().includes("/verify"), true);
   check("总帮助提到 verify 开关", renderHelp().includes("/verify off"), true);
   // verify 不算终端互动（touch 未设）：开关验证不该续命看门狗（纯配置操作）
@@ -842,6 +844,47 @@ const {
   const q2 = hub2.enqueue("c1", "yes");
   await hub2.onOutput({ id: q2.id, text: "z".repeat(500), done: true, exit: 0, cwd: "/tmp" });
   check("超长输出被掐断", sent2.join("").includes("omitted"), true);
+}
+
+// ---- Gemini 免费额度哨兵（v4.40）----
+{
+  const s = buildGeminiScript({ prompt: "hello" });
+  check("自动链脚本含哨兵行", s.includes(GEMINI_QUOTA_SENTINEL), true);
+  check("哨兵只在「全链配额失败」分支打", s.includes('[ "$allQuota" = "1" ]'), true);
+  check("非配额失败会把 allQuota 置 0", s.includes("allQuota=0; break"), true);
+  // 固定模型（钉死）不走 free chain 循环，脚本里不该出现哨兵
+  const pinned = buildGeminiScript({ prompt: "hi", model: "gemini-3.6-flash" });
+  check("固定模型不含哨兵", pinned.includes(GEMINI_QUOTA_SENTINEL), false);
+}
+
+// ---- ShellHub：silent + onDone（v4.40 免费额度探测）----
+{
+  const sent = [];
+  const dones = [];
+  const hub = new ShellHub(
+    async (chatId, text, opts) => sent.push({ chatId, text, markdown: opts?.markdown === true }),
+    { flushMs: 5, onDone: (chatId, id, exit, text, tag) => dones.push({ chatId, id, exit, text, tag }) },
+  );
+  hub.attach({ enqueue: () => {} });
+
+  // 普通命令：照常回显，且完成时也进 onDone
+  const q1 = hub.enqueue("c1", "echo ok", { label: "普通" });
+  await hub.onOutput({ id: q1.id, text: "ok\n", done: true, exit: 0, cwd: "/tmp" });
+  check("普通命令回显给用户", sent.some((s) => s.text.includes("ok")), true);
+  check("普通命令 done 也进 onDone", dones.length, 1);
+  check("onDone 拿到 exit 与文本", dones[0].exit === 0 && dones[0].text.includes("ok"), true);
+
+  // 沉默命令：不回显给用户，但 onDone 仍被调用并透传 tag
+  const q2 = hub.enqueue("c1", "echo probe", { label: "⟳ quota check", tag: "gemini-quota-probe", silent: true, hideCwd: true });
+  await hub.onOutput({ id: q2.id, text: "pong\n", done: true, exit: 0, cwd: "/tmp" });
+  check("沉默命令不回显", sent.some((s) => s.text.includes("pong")), false);
+  check("沉默命令仍触发 onDone", dones.length, 2);
+  check("onDone 透传 tag", dones[1].tag, "gemini-quota-probe");
+
+  // 沉默命令产出哨兵（配额仍耗尽）：onDone 能拿到，供置位判定
+  const q3 = hub.enqueue("c1", "echo exhausted", { tag: "gemini-quota-probe", silent: true });
+  await hub.onOutput({ id: q3.id, text: `${GEMINI_QUOTA_SENTINEL}\n`, done: true, exit: 0, cwd: null });
+  check("onDone 拿到哨兵文本", dones[2].text.includes(GEMINI_QUOTA_SENTINEL), true);
 }
 
 // ---- ShellHub 心跳：tick 能恢复在线 ----

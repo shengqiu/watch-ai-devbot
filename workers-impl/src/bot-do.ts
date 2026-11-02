@@ -90,6 +90,7 @@ import {
   buildStatusScript,
   buildModelsScript,
   buildNewSessionScript,
+  GEMINI_QUOTA_SENTINEL,
   parseGeminiArgs,
   parseModelChain,
   previewPrompt,
@@ -281,7 +282,10 @@ import {
 // v4.38：按用户要求「精简」，把上一步留下的 usage / quota 两个别名也删掉，cs 只保留 status。
 // v4.39：指令名从 /cs 改成 /status（用户：status 留着，cs 去掉）。cs 不再作为别名存在，
 //       发 /cs 会走「打错的斜杠指令」提示；菜单 key 升到 v6 让 Telegram 那条跟着换名字。
-const BUILD = "devbot-20261030-v4.39";
+// v4.40：① 验证挑战默认关闭（「爸爸」验证词不再被追问，也不再当开机口令；/verify on 可重新开启）；
+//       ② Gemini 免费额度闸门：免费链整体因配额/过载耗尽时告知用户并硬拦转发，直到额度恢复
+//         （沉默探测自动解除，见 onShellDone）。
+const BUILD = "devbot-20261102-v4.40";
 
 /**
  * 流程记录：2026-10-28 起两个仓库的 main 分支均开启保护（禁 force push / 删除；
@@ -379,6 +383,8 @@ export class AssistantDO extends DurableObject<Env> {
       // 下行命令签名：agent 只执行签名对得上的命令，见 src/agent-auth.ts。
       // 按「当前已连接机器」的密钥签名（每台机器独立密钥），不再用共享密钥。
       signer: (cmdId, cmd) => this.signDownlink(cmdId, cmd),
+      // 命令结束回调：Gemini 免费额度哨兵判定（v4.40）。沉默探测也不回显给用户。
+      onDone: (chatId, id, exit, text, tag) => void this.onShellDone(chatId, id, exit, text, tag),
     });
     // SQLite 建表（幂等）；schema 版本标记避免每次唤醒都跑 DDL。
     // v1→v2：新增 cs_runtime 表（看门狗运行时长账本）。DDL 全部 IF NOT EXISTS，
@@ -817,9 +823,9 @@ export class AssistantDO extends DurableObject<Env> {
     const parsed = matchCommand(text);
     if (parsed?.spec.touch) await this.touchWatchActivity(m.chatId, true);
 
-    // 5.7) 已验证状态下单独发验证词 = 开机口令（用户 2026-10-27 定：
-    //      「哈哈」是除 /boot 外唯一能开机的方式）。机器在跑就只回一句确认。
-    if (!parsed && verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
+    // 5.7) 验证词当开机口令（用户 2026-10-27 定）：仅当验证挑战开启时才生效。
+    //      验证默认关闭后，「爸爸」只是普通一句话，不再触发开机（v4.40）。
+    if (!parsed && !verifyOff && verifyAnswer && isAnswerMatch(text, verifyAnswer)) {
       await this.bootOnPassword(m.chatId);
       return;
     }
@@ -1473,6 +1479,50 @@ export class AssistantDO extends DurableObject<Env> {
     return list;
   }
 
+  // ---- Gemini 免费额度闸门（v4.40） ----
+  // 免费链整体因配额 / 过载耗尽时，暂停转发用户的 gemini 提问，直到额度恢复。
+  // 按 chat 隔离（同一 key，但每条会话独立记）；置位只记时间戳，便于将来调窗口。
+  private async geminiBlockedAt(chatId: string): Promise<number | null> {
+    return (await this.ctx.storage.get<number>(`gem_blocked:${chatId}`)) ?? null;
+  }
+  private async setGeminiBlocked(chatId: string): Promise<void> {
+    await this.ctx.storage.put(`gem_blocked:${chatId}`, Date.now());
+  }
+  private async clearGeminiBlocked(chatId: string): Promise<void> {
+    await this.ctx.storage.delete(`gem_blocked:${chatId}`);
+  }
+
+  /**
+   * shell 命令结束回调：判定 Gemini 免费额度是否耗尽 / 恢复。
+   *   · 输出含 WS_GEMINI_QUOTA_EXHAUSTED（且不是探测）→ 免费链整体失败 → 置位 + 告知一次；
+   *   · tag=gemini-quota-probe 且成功（退出 0、无哨兵）→ 额度回来了 → 清除 + 告知恢复。
+   * 探测是沉默的（silent），不回显给用户；只在它成功时才解除闸门。
+   */
+  private async onShellDone(
+    chatId: string,
+    _id: string,
+    exit: number | null,
+    text: string,
+    tag?: string,
+  ): Promise<void> {
+    if (tag === "gemini-quota-probe") {
+      if (exit === 0 && !text.includes(GEMINI_QUOTA_SENTINEL)) {
+        if (await this.geminiBlockedAt(chatId)) {
+          await this.clearGeminiBlocked(chatId);
+          await this.reply(chatId, "✅ Gemini free quota is back — forwarding your questions again.");
+        }
+      }
+      return;
+    }
+    if (text.includes(GEMINI_QUOTA_SENTINEL) && !(await this.geminiBlockedAt(chatId))) {
+      await this.setGeminiBlocked(chatId);
+      await this.reply(
+        chatId,
+        "🚫 Gemini's free quota is exhausted (every model in the free chain is out). I'll stop forwarding your Gemini questions until it resets, and let you know the moment it's back.",
+      );
+    }
+  }
+
   /**
    * CodeBuddy 的免费额度优先链（2026-10-29 起 /buddy 默认走链）：
    * `BUDDY_MODELS`（逗号/空格分隔）> 代码里的默认链。与 gemini 同构，
@@ -1739,6 +1789,23 @@ export class AssistantDO extends DurableObject<Env> {
    */
   private async startGemini(chatId: string, prompt?: string): Promise<void> {
     const modeHint = prompt ? null : "🤖 Gemini session on: just send your question (/gemini off to leave, leading ! still runs shell)";
+
+    // v4.40：免费额度耗尽闸门 —— 有提问且处于封禁态时，硬拦住，不再转发；
+    // 机器在线就默默探一下（silent，不打扰），额度回来自动解除并通知。
+    if (prompt && (await this.geminiBlockedAt(chatId))) {
+      await this.reply(
+        chatId,
+        "🚫 Gemini free quota is still exhausted — I'm not forwarding your questions until it resets. I'll ping you the moment it's back.",
+      );
+      if (this.shell.online()) {
+        this.shell.enqueue(
+          chatId,
+          buildGeminiScript({ prompt: "ping", chain: this.geminiChain() }),
+          { label: "⟳ quota check", tag: "gemini-quota-probe", silent: true, hideCwd: true },
+        );
+      }
+      return;
+    }
 
     if (this.shell.online()) {
       const model = await this.geminiPin(chatId);
@@ -2886,17 +2953,17 @@ export class AssistantDO extends DurableObject<Env> {
   }
 
   // ---- /verify：验证挑战的总闸（v4.25，按 chat 持久） ----
-  // 默认开启（没有存储记录 = on，绝不把「没配置」当成「关」）。
-  // 关闭是用户自己权衡的安全降级：关掉后白名单账号的所有消息直达流水线，
-  // 不再回答验证词。重新开启立即恢复挑战。
+  // 默认关闭（用户 2026-11-02 要求关掉「爸爸」验证：没有存储记录 = off）。
+  // 即白名单账号的消息直达流水线，不再回答验证词，也不再拿验证词当开机口令。
+  // /verify on 显式存 false → 重新开启挑战；/verify off 存 true → 关闭。
   private async verifyGateOff(chatId: string): Promise<boolean> {
-    return (await this.ctx.storage.get<boolean>(`verify_off:${chatId}`)) === true;
+    return (await this.ctx.storage.get<boolean>(`verify_off:${chatId}`)) !== false;
   }
 
-  private async setVerifyGate(chatId: string, off: boolean): Promise<void> {
+  private async setVerifyGate(chatId: string, off:boolean): Promise<void> {
     const key = `verify_off:${chatId}`;
-    if (off) await this.ctx.storage.put(key, true);
-    else await this.ctx.storage.delete(key);
+    // 显式存布尔：undefined（从没设过）= 默认 off；false = 用户开回来；true = 用户关掉
+    await this.ctx.storage.put(key, off);
     // 状态切换时清理会话残留：off → 给一个已验证的长会话（省得 on 回来立刻要词）；
     // on → 旧会话作废，下一条消息重新挑战（关闭期间谁都可能用过这个 chat）
     await this.setVerify(chatId, off ? nextExpiry(Date.now(), this.verifySessionMs()) : 0, "");

@@ -49,6 +49,12 @@ export const DEFAULT_MODEL_CHAIN: string[] = [
 /** 上次成功的模型（持久卷）。下次优先从它开始，避免每次都从链头试错。 */
 export const GEMINI_MODEL_FILE = "$HOME/.config/watch-ai/gemini-model";
 /**
+ * 免费额度耗尽哨兵：自动链把「所有免费模型都因配额/过载/下线而失败」时，
+ * 在输出末尾打这一行。Worker 侧据此判定「免费额度没了」，进而告知用户并暂停转发，
+ * 直到额度恢复。用固定字符串而非依赖翻译，避免人话改动把判定搞挂。
+ */
+export const GEMINI_QUOTA_SENTINEL = "WS_GEMINI_QUOTA_EXHAUSTED";
+/**
  * 解析 `GEMINI_MODELS` 环境变量（逗号/空格分隔）为链；非法名直接丢弃。
  * 空或全非法 → 返回默认链，绝不返回空数组（空数组等于「没有模型可跑」）。
  */
@@ -246,7 +252,7 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
   L.push(`  case " $CHAIN " in *" $last "*) CHAIN="$last $(printf %s " $CHAIN " | sed "s/ $last / /")" ;; esac`);
   L.push(`fi`);
   L.push(`OUT=/tmp/ws-gemini-out.txt`);
-  L.push(`rc=1; tried=""`);
+  L.push(`rc=1; tried=""; allQuota=1`);
   L.push(`for m in $CHAIN; do`);
   L.push(`  : > "$OUT"`);
   // 第一次尝试才续会话：换模型后旧 session 可能属于另一个模型，硬续容易再失败一次
@@ -270,9 +276,9 @@ export function buildGeminiScript(opts: GeminiRunOpts = {}): string {
   L.push(`    echo "⚠️ $m 不可用（配额 / 过载 / 下线），换下一个免费模型…"`);
   L.push(`    continue`);
   L.push(`  fi`);
-  L.push(`  break`);
+  L.push(`  allQuota=0; break`);
   L.push(`done`);
-  L.push(`if [ $rc -ne 0 ] && [ -n "$tried" ]; then echo ""; echo "❌ 链上的免费模型都试过了：$tried"; echo "   过一会儿再试，或 /gemini model <名字> 指定一个。"; fi`);
+  L.push(`if [ $rc -ne 0 ] && [ -n "$tried" ] && [ "$allQuota" = "1" ]; then echo ""; echo "❌ 链上的免费模型都试过了：$tried"; echo "   过一会儿再试，或 /gemini model <名字> 指定一个。"; echo "${GEMINI_QUOTA_SENTINEL}"; fi`);
   L.push(`exit $rc`);
   L.push(`)`);
   return L.join("\n");

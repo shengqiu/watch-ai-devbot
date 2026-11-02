@@ -173,6 +173,10 @@ export interface ShellCmd {
    * 缺省 = 没配 signer（老实例/单测），此时不下发 sig 字段，agent 按兼容模式处理。
    */
   sig?: string;
+  /** 业务标签（如 "gemini-quota-probe"），仅透传给 onDone 做判定，不影响下发。 */
+  tag?: string;
+  /** true = 输出不回显给用户（仅用于让 onDone 做判定，如免费额度探测）。 */
+  silent?: boolean;
 }
 
 export interface ShellOpts {
@@ -186,6 +190,10 @@ export interface ShellOpts {
   hideCwd?: boolean;
   /** 输出按 markdown 渲染（AI 会话），见 ShellCmd.markdown */
   markdown?: boolean;
+  /** 业务标签，见 ShellCmd.tag */
+  tag?: string;
+  /** 静默：输出不回显给用户，仅交给 onDone 判定，见 ShellCmd.silent */
+  silent?: boolean;
 }
 
 export interface ShellOutMsg {
@@ -248,6 +256,11 @@ export interface ShellHubOpts {
    * Cloudflare secret 里，agent 侧只需同一个密钥算出来的结果对得上。
    */
   signer?: (id: string, cmd: string) => Promise<string>;
+  /**
+   * 命令结束回调：一条命令 done 时调用（chatId, id, exit, 完整输出文本, tag）。
+   * 用于业务侧判定（如 Gemini 免费额度耗尽哨兵），不依赖把输出回显给用户。
+   */
+  onDone?: (chatId: string, id: string, exit: number | null, text: string, tag?: string) => void;
 }
 
 /**
@@ -313,6 +326,7 @@ export class ShellHub {
   private readonly maxTries: number;
   private readonly idleMs: number;
   private readonly signer?: (id: string, cmd: string) => Promise<string>;
+  private readonly onDone?: (chatId: string, id: string, exit: number | null, text: string, tag?: string) => void;
   /** 下行帧串行化：签名是异步的，若并发写会让帧乱序（attach 重发多条时尤其明显）。 */
   private chain: Promise<void> = Promise.resolve();
 
@@ -331,6 +345,7 @@ export class ShellHub {
     this.maxTries = opts.maxTries ?? 3;
     this.idleMs = opts.idleMs ?? 45_000;
     this.signer = opts.signer;
+    this.onDone = opts.onDone;
   }
 
   /** agent 是否在线（有 SSE 连接 + 心跳未超时）。 */
@@ -476,6 +491,8 @@ export class ShellHub {
     if (opts.quiet) rec.quiet = true;
     if (opts.hideCwd) rec.hideCwd = true;
     if (opts.markdown) rec.markdown = true;
+    if (opts.tag) rec.tag = opts.tag;
+    if (opts.silent) rec.silent = true;
     this.queue.set(id, rec);
     this.buf.set(id, { parts: [], chars: 0, timer: null, echoed: false });
     this.push(rec);
@@ -811,9 +828,19 @@ export class ShellHub {
     }
     if (done) {
       out += footerNote(exit, cwd, cmd.hideCwd === true);
+      // 业务判定（如 Gemini 免费额度哨兵）：在可能清缓冲之前，把完整文本交出去
+      this.onDone?.(cmd.chatId, id, exit, out, cmd.tag);
+    }
+    // 静默命令：不回显给用户，但仍跑完 onDone 判定后清理
+    if (cmd.silent) {
+      this.clearAck(id);
+      this.buf.delete(id);
+      this.queue.delete(id);
+      return;
     }
     if (!out.trim()) {
       if (done) {
+        this.clearAck(id);
         this.buf.delete(id);
         this.queue.delete(id);
       }

@@ -114,7 +114,12 @@ GEMINI_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-flash-lite-latest,gemi
 # 按本文件既定的处置（见上）bump 到 s13 强制换版：新实例直接跑 v4.24 代码。
 # 代价同前：验证会话要重打一次、/gemini 会话模式与暂存提问清零、
 # agent_keys 运行期覆盖表清空（AGENT_KEYS secret 注册表不受影响）。
-DO_KEY = "singleton-s13"
+# v4.40（2026-11-02）：验证挑战改为默认关闭，但线上老实例仍按旧逻辑追问「爸爸」
+# 验证词——reload 后 CI 虽报 v4.40，用户这个 chat 此前被 /verify on 存过
+# verify_off:<chatId>=false，且老实例态未清。bump 到 s14 强制换全新实例：
+# 新实例跑 v4.40 代码且存储为空，默认关闭生效、无残留标记，验证彻底消失。
+# 代价同前：验证会话/暂存提问/运行期覆盖表清零（AGENT_KEYS 注册表不受影响）。
+DO_KEY = "singleton-s14"
 
 # 密钥用 wrangler secret put 注入（不要写在这里）：
 #   TELEGRAM_BOT_TOKEN（必需，@BotFather 为 devbot 单独创建）
